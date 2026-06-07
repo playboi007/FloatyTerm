@@ -35,10 +35,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     // MARK: - Windows
 
+    /// Creates a new floating window.
+    /// - Parameter initialDirectory: Starting directory for the new window's
+    ///   first terminal tab. Pass nil to use $HOME (the default).
     @discardableResult
-    private func makeWindow() -> TerminalWindowController {
-        let wc = TerminalWindowController()
-        wc.onNewWindow = { [weak self] in self?.makeWindow() }
+    private func makeWindow(initialDirectory: String? = nil) -> TerminalWindowController {
+        let wc = TerminalWindowController(initialDirectory: initialDirectory)
+        wc.onNewWindow = { [weak self] in
+            // When the user requests a new window from this wc, inherit its cwd.
+            self?.makeWindow(initialDirectory: wc.activeTerminalWorkingDirectory)
+        }
         wc.onClosed = { [weak self] closed in
             self?.windows.removeAll { $0 === closed }
         }

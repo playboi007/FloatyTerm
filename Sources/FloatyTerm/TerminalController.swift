@@ -1,4 +1,5 @@
 import AppKit
+import Darwin
 import SwiftTerm
 
 /// Hosts one SwiftTerm terminal session (i.e. one tab) and launches the user's
@@ -27,7 +28,15 @@ final class TerminalController: NSObject, LocalProcessTerminalViewDelegate, TabC
     /// Called when the terminal title changes, so the tab label can update.
     var onTitleChanged: (() -> Void)?
 
-    override init() {
+    /// The directory to start the shell in. nil means $HOME (the default).
+    private let startDirectory: String?
+
+    /// Designated initialiser.
+    /// - Parameter startDirectory: If provided and it exists as a directory on
+    ///   disk, the new shell starts there. Pass nil (the default) to start in
+    ///   $HOME, which preserves the original behaviour.
+    init(startDirectory: String? = nil) {
+        self.startDirectory = startDirectory
         terminalView = FloatyTerminalView(frame: NSRect(x: 0, y: 0, width: 720, height: 440))
         super.init()
         terminalView.processDelegate = self
@@ -39,6 +48,37 @@ final class TerminalController: NSObject, LocalProcessTerminalViewDelegate, TabC
         terminalView.nativeBackgroundColor = .black
 
         startShell()
+    }
+
+    // MARK: - Current working directory
+
+    /// Returns the shell process's current working directory by calling
+    /// `proc_pidinfo(PROC_PIDVNODEPATHINFO)` on the shell's pid.  This works
+    /// because the shell is our own child process — no special entitlement is
+    /// needed.  Returns nil when the process is not running or the call fails.
+    var currentWorkingDirectory: String? {
+        guard let process = terminalView.process, process.running else { return nil }
+        let pid = process.shellPid
+        guard pid > 0 else { return nil }
+        return Self.workingDirectory(ofPID: pid)
+    }
+
+    /// Reads the cwd of `pid` via proc_pidinfo / PROC_PIDVNODEPATHINFO.
+    private static func workingDirectory(ofPID pid: pid_t) -> String? {
+        var info = proc_vnodepathinfo()
+        let sz = Int32(MemoryLayout<proc_vnodepathinfo>.size)
+        guard proc_pidinfo(pid, PROC_PIDVNODEPATHINFO, 0, &info, sz) == sz else { return nil }
+        let path = withUnsafeBytes(of: &info.pvi_cdir.vip_path) { raw -> String? in
+            guard let base = raw.baseAddress else { return nil }
+            return String(cString: base.assumingMemoryBound(to: CChar.self))
+        }
+        // Validate that the path is a non-empty existing directory.
+        guard let p = path, !p.isEmpty else { return nil }
+        var isDir: ObjCBool = false
+        guard FileManager.default.fileExists(atPath: p, isDirectory: &isDir), isDir.boolValue else {
+            return nil
+        }
+        return p
     }
 
     // MARK: - TabContent
@@ -82,10 +122,24 @@ final class TerminalController: NSObject, LocalProcessTerminalViewDelegate, TabC
         vars["LANG"] = vars["LANG"] ?? "en_US.UTF-8"
         let env = vars.map { "\($0.key)=\($0.value)" }
 
-        // Start in the user's home directory. The child shell inherits the
-        // app's current directory, which would otherwise be "/" when launched
-        // via `open`.
-        FileManager.default.changeCurrentDirectoryPath(NSHomeDirectory())
+        // Determine start directory: honour the requested directory when it is a
+        // valid existing directory; otherwise fall back to $HOME.
+        // NOTE: changeCurrentDirectoryPath is process-global — it affects the whole
+        // app until the child shell executes.  SwiftTerm's startProcess forks
+        // immediately, so the window is very small, but callers should be aware.
+        let targetDir: String
+        if let requested = startDirectory {
+            var isDir: ObjCBool = false
+            if FileManager.default.fileExists(atPath: requested, isDirectory: &isDir),
+               isDir.boolValue {
+                targetDir = requested
+            } else {
+                targetDir = NSHomeDirectory()
+            }
+        } else {
+            targetDir = NSHomeDirectory()
+        }
+        FileManager.default.changeCurrentDirectoryPath(targetDir)
 
         // The leading "-" on execName makes this a LOGIN shell, so .zprofile /
         // .zshrc (and therefore Oh My Zsh) are sourced.

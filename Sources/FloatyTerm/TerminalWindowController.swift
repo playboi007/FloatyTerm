@@ -44,11 +44,18 @@ final class TerminalWindowController: NSObject, NSWindowDelegate {
     private var tabs: [any TabContent] = []
     private var activeIndex = 0
 
+    /// Held only during init so the first addTerminalTab() call can use it.
+    /// Cleared after the first tab is created.
+    private var pendingInitialDirectory: String?
+
     var onNewWindow: (() -> Void)?
     var onClosed: ((TerminalWindowController) -> Void)?
     var onOpenPreferences: (() -> Void)?
 
-    override init() {
+    /// - Parameter initialDirectory: The directory in which to open the first
+    ///   terminal tab. nil → $HOME (the default / original behaviour).
+    init(initialDirectory: String? = nil) {
+        self.pendingInitialDirectory = initialDirectory
         let initial = NSRect(x: 0, y: 0, width: 720, height: 460)
         panel = FloatingPanel(contentRect: initial)
         super.init()
@@ -212,6 +219,18 @@ final class TerminalWindowController: NSObject, NSWindowDelegate {
         selectTab((activeIndex + delta + tabs.count) % tabs.count)
     }
 
+    // MARK: - Working-directory inheritance
+
+    /// Returns the current working directory of the active terminal tab when the
+    /// "Inherit working directory" setting is ON and the active tab is a terminal.
+    /// Returns nil otherwise (callers should fall back to $HOME).
+    var activeTerminalWorkingDirectory: String? {
+        guard Settings.shared.inheritWorkingDirectory else { return nil }
+        guard let tc = tabs.indices.contains(activeIndex)
+                ? tabs[activeIndex] as? TerminalController : nil else { return nil }
+        return tc.currentWorkingDirectory
+    }
+
     // MARK: - Convenience type checks
 
     private var activeTabIsTerminal: Bool {
@@ -253,7 +272,19 @@ final class TerminalWindowController: NSObject, NSWindowDelegate {
     // MARK: - Tabs (heterogeneous)
 
     private func addTerminalTab() {
-        let tab = TerminalController()
+        // For the very first tab (created during init) use the initialDirectory
+        // that was passed to init(); for all subsequent tabs, inherit from the
+        // currently-active terminal when the setting is ON.
+        let startDir: String?
+        if tabs.isEmpty, let pending = pendingInitialDirectory {
+            startDir = pending
+            pendingInitialDirectory = nil   // consume so later tabs use normal logic
+        } else {
+            // Capture the active terminal's cwd before creating the new controller
+            // (once the new tab is inserted it becomes active, so read now).
+            startDir = activeTerminalWorkingDirectory
+        }
+        let tab = TerminalController(startDirectory: startDir)
         tab.onTerminated = { [weak self, weak tab] in
             guard let self, let tab,
                   let idx = self.tabs.firstIndex(where: { $0 === tab }) else { return }

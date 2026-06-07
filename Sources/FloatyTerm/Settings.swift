@@ -25,7 +25,8 @@ final class Settings {
             "unfocusedOpacity": 0.6,
             "hotKeyCode": Int(kVK_ANSI_7),
             "hotKeyModifiers": Int(cmdKey | optionKey),
-            "hotKeyDisplay": "⌥⌘7"
+            "hotKeyDisplay": "⌥⌘7",
+            "inheritWorkingDirectory": true
         ])
     }
 
@@ -86,6 +87,13 @@ final class Settings {
     var hotKeyDisplay: String {
         get { d.string(forKey: "hotKeyDisplay") ?? "⌥⌘7" }
         set { d.set(newValue, forKey: "hotKeyDisplay"); notify() }
+    }
+
+    /// When true, new terminal tabs and new windows inherit the working directory
+    /// of the currently-active terminal tab instead of always opening in $HOME.
+    var inheritWorkingDirectory: Bool {
+        get { d.bool(forKey: "inheritWorkingDirectory") }
+        set { d.set(newValue, forKey: "inheritWorkingDirectory"); notify() }
     }
 
     private func notify() {

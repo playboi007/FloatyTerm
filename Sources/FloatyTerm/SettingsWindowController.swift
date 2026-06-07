@@ -14,6 +14,7 @@ final class SettingsWindowController: NSObject {
     private let opacitySlider = NSSlider()
     private let opacityValueLabel = NSTextField(labelWithString: "")
     private let dimCheckbox = NSButton(checkboxWithTitle: "Dim terminal when unfocused", target: nil, action: nil)
+    private let inheritCwdCheckbox = NSButton(checkboxWithTitle: "Open new tabs in the current directory", target: nil, action: nil)
     private let recordButton = NSButton(title: "", target: nil, action: nil)
 
     // Hotkey recording state.
@@ -71,6 +72,11 @@ final class SettingsWindowController: NSObject {
         dimCheckbox.action = #selector(dimToggled(_:))
         stack.addArrangedSubview(dimCheckbox)
 
+        // Inherit working directory
+        inheritCwdCheckbox.target = self
+        inheritCwdCheckbox.action = #selector(inheritCwdToggled(_:))
+        stack.addArrangedSubview(inheritCwdCheckbox)
+
         // Unfocused opacity
         opacitySlider.minValue = 0.0
         opacitySlider.maxValue = 1.0
@@ -123,6 +129,7 @@ final class SettingsWindowController: NSObject {
         opacitySlider.doubleValue = Settings.shared.unfocusedOpacity
         opacitySlider.isEnabled = Settings.shared.dimWhenUnfocused
         opacityValueLabel.stringValue = "\(Int(Settings.shared.unfocusedOpacity * 100))%"
+        inheritCwdCheckbox.state = Settings.shared.inheritWorkingDirectory ? .on : .off
         recordButton.title = recording ? "Press a shortcut…" : Settings.shared.hotKeyDisplay
     }
 
@@ -145,6 +152,10 @@ final class SettingsWindowController: NSObject {
     @objc private func dimToggled(_ sender: NSButton) {
         Settings.shared.dimWhenUnfocused = (sender.state == .on)
         opacitySlider.isEnabled = (sender.state == .on)
+    }
+
+    @objc private func inheritCwdToggled(_ sender: NSButton) {
+        Settings.shared.inheritWorkingDirectory = (sender.state == .on)
     }
 
     @objc private func opacityChanged(_ sender: NSSlider) {
