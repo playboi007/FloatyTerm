@@ -1,0 +1,11 @@
+# Swift Package Manager / Xcode build output
+.build/
+DerivedData/
+*.xcodeproj
+*.xcworkspace
+
+# Compiled app bundle (build artifact)
+FloatyTerm.app/
+
+# macOS
+.DS_Store
