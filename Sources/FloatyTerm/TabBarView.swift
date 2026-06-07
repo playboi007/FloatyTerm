@@ -1,11 +1,36 @@
 import AppKit
 
+// MARK: - Drag-handle helper
+
+/// Mix-in behaviour: any NSView that adopts this override will forward its
+/// mouseDown events to `window?.performDrag(with:)`, making the view act as a
+/// window-drag handle while still letting subview NSControls receive their own
+/// clicks normally (AppKit delivers mouseDown to the front-most hit-tested view
+/// first, so buttons/chips are never preempted).
+class DragHandleView: NSView {
+    /// Returning false here is belt-and-suspenders: we're already disabling
+    /// isMovableByWindowBackground globally, but this makes the intent explicit.
+    override var mouseDownCanMoveWindow: Bool { false }
+
+    override func mouseDown(with event: NSEvent) {
+        // Initiate a window drag. If the user just clicks without moving, this
+        // is a harmless no-op from AppKit's perspective.
+        window?.performDrag(with: event)
+    }
+}
+
+// MARK: - TabChip
+
 /// A single tab "chip": a title button plus a small close (×) button.
 private final class TabChip: NSView {
     private let titleButton = NSButton()
     private let closeButton = NSButton()
     var onSelect: () -> Void = {}
     var onClose: () -> Void = {}
+
+    // The chip background itself must not move the window; clicks on the chip
+    // background (not on a button) should not propagate up as drag handles.
+    override var mouseDownCanMoveWindow: Bool { false }
 
     init(title: String, active: Bool) {
         super.init(frame: .zero)
@@ -55,9 +80,25 @@ private final class TabChip: NSView {
     @objc private func closeTapped() { onClose() }
 }
 
+// MARK: - DragHandleClipView
+
+/// An NSClipView subclass that acts as a drag handle. Needed because the
+/// NSScrollView inside TabStripView intercepts mouseDown on its clip view;
+/// replacing it with this subclass ensures clicks on empty strip space still
+/// initiate a window drag.
+private final class DragHandleClipView: NSClipView {
+    override var mouseDownCanMoveWindow: Bool { false }
+
+    override func mouseDown(with event: NSEvent) {
+        window?.performDrag(with: event)
+    }
+}
+
+// MARK: - TabStripView
+
 /// The strip that lives BELOW the header and shows one chip per tab. It is
 /// shown only when there are at least two tabs.
-final class TabStripView: NSView {
+final class TabStripView: DragHandleView {
     var onSelect: (Int) -> Void = { _ in }
     var onCloseTab: (Int) -> Void = { _ in }
 
@@ -80,6 +121,9 @@ final class TabStripView: NSView {
         scroll.hasHorizontalScroller = false
         scroll.hasVerticalScroller = false
         scroll.translatesAutoresizingMaskIntoConstraints = false
+        // Replace the default NSClipView with our drag-handle subclass so that
+        // mouseDown on empty space in the scroll area initiates a window drag.
+        scroll.contentView = DragHandleClipView()
         scroll.documentView = stack
         addSubview(scroll)
 
@@ -108,7 +152,7 @@ final class TabStripView: NSView {
 }
 
 /// The controls in the top header strip: "＋" (new tab) and "⧉" (new window).
-final class HeaderControlsView: NSView {
+final class HeaderControlsView: DragHandleView {
     var onAddTab: () -> Void = {}
     var onNewWindow: () -> Void = {}
 

@@ -42,7 +42,7 @@ final class FloatingPanel: NSPanel {
 
         hidesOnDeactivate = false      // stay visible when another app is focused
         isFloatingPanel = true
-        isMovableByWindowBackground = true
+        isMovableByWindowBackground = false
         isReleasedWhenClosed = false
 
         // Make the title bar a thin transparent drag strip.

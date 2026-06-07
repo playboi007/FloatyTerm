@@ -1,4 +1,5 @@
 import AppKit
+import SwiftTerm
 
 /// Owns one floating window:
 ///  - a frosted top region (header controls + a tab strip that appears when
@@ -14,6 +15,16 @@ final class TerminalWindowController: NSObject, NSWindowDelegate {
     private let contentArea = NSView()
     private let header = HeaderControlsView()
     private let tabStrip = TabStripView()
+
+    // MARK: - Find bar
+    private let findBar = FindBarView()
+    private var findBarTrailingConstraint: NSLayoutConstraint!
+    private var findBarTopConstraint: NSLayoutConstraint!
+    private var isFindBarVisible = false
+
+    // MARK: - Recent-commands palette
+    private let recentPalette = RecentCommandsPaletteView()
+    private var isPaletteVisible = false
 
     private let headerHeight: CGFloat = 28
     private let tabStripHeight: CGFloat = 30
@@ -98,6 +109,8 @@ final class TerminalWindowController: NSObject, NSWindowDelegate {
             name: Settings.didChange, object: nil
         )
 
+        setupFindBar()
+        setupRecentPalette()
         addTab() // start with one tab
     }
 
@@ -148,6 +161,9 @@ final class TerminalWindowController: NSObject, NSWindowDelegate {
             case "w": closeTab(activeIndex); return true
             case "n": onNewWindow?(); return true
             case ",": onOpenPreferences?(); return true
+            case "f": toggleFindBar(); return true
+            case "g": findNext(); return true
+            case "r": toggleRecentPalette(); return true
             default:
                 if let n = Int(chars), (1...9).contains(n) {
                     selectTab(n - 1)
@@ -157,6 +173,7 @@ final class TerminalWindowController: NSObject, NSWindowDelegate {
         } else if flags == [.command, .shift] {
             if event.keyCode == 30 { cycleTab(+1); return true } // ⌘⇧]  next
             if event.keyCode == 33 { cycleTab(-1); return true } // ⌘⇧[  prev
+            if chars == "g"        { findPrevious(); return true } // ⌘⇧G prev match
         }
         return false
     }
@@ -213,6 +230,10 @@ final class TerminalWindowController: NSObject, NSWindowDelegate {
 
     private func selectTab(_ index: Int) {
         guard tabs.indices.contains(index) else { return }
+        // Hide find bar when switching tabs (clear search in the old active tab).
+        if isFindBarVisible { hideFindBar() }
+        // Hide recent-commands palette when switching tabs.
+        if isPaletteVisible { hideRecentPalette() }
         activeIndex = index
         for (i, tab) in tabs.enumerated() {
             tab.view.isHidden = (i != index)
@@ -223,6 +244,9 @@ final class TerminalWindowController: NSObject, NSWindowDelegate {
 
     private func closeTab(_ index: Int) {
         guard tabs.indices.contains(index) else { return }
+        // If closing the active tab, clear the find bar and palette first.
+        if index == activeIndex && isFindBarVisible { hideFindBar() }
+        if index == activeIndex && isPaletteVisible { hideRecentPalette() }
         let tab = tabs.remove(at: index)
         tab.view.removeFromSuperview()
 
@@ -245,6 +269,101 @@ final class TerminalWindowController: NSObject, NSWindowDelegate {
         let show = tabs.count >= 2
         tabStrip.isHidden = !show
         tabStripHeightConstraint.constant = show ? tabStripHeight : 0
+    }
+
+    // MARK: - Find bar
+
+    private func setupFindBar() {
+        findBar.translatesAutoresizingMaskIntoConstraints = false
+        findBar.isHidden = true
+        // Add as a floating overlay above contentArea (inside root so it appears
+        // above the blur views in z-order without disturbing the layout system).
+        root.addSubview(findBar)
+
+        // Pin to top-right of the content area, with a small inset.
+        findBarTrailingConstraint = findBar.trailingAnchor.constraint(
+            equalTo: contentArea.trailingAnchor, constant: -10
+        )
+        findBarTopConstraint = findBar.topAnchor.constraint(
+            equalTo: contentBlur.topAnchor, constant: 8
+        )
+
+        NSLayoutConstraint.activate([
+            findBarTopConstraint,
+            findBarTrailingConstraint,
+            findBar.widthAnchor.constraint(lessThanOrEqualToConstant: 360),
+            findBar.widthAnchor.constraint(greaterThanOrEqualToConstant: 260)
+        ])
+
+        // Wire callbacks.
+        findBar.onSearchChanged = { [weak self] text in
+            // Live preview: jump to first match as user types.
+            guard let self else { return }
+            if text.isEmpty {
+                self.activeTerminalView?.clearSearch()
+            } else {
+                self.activeTerminalView?.findNext(text)
+            }
+        }
+        findBar.onFindNext = { [weak self] in self?.findNext() }
+        findBar.onFindPrevious = { [weak self] in self?.findPrevious() }
+        findBar.onClose = { [weak self] in self?.hideFindBar() }
+    }
+
+    private var activeTerminalView: FloatyTerminalView? {
+        tabs.indices.contains(activeIndex) ? tabs[activeIndex].view : nil
+    }
+
+    // MARK: - Public find API (explicitly requested by the feature spec)
+
+    /// Shows the find bar (if not already visible) and advances to the next match
+    /// for the current search term.
+    func findNext() {
+        guard let tv = activeTerminalView else { return }
+        let term = findBar.searchText
+        guard !term.isEmpty else {
+            showFindBar()
+            return
+        }
+        tv.findNext(term)
+    }
+
+    /// Shows the find bar (if not already visible) and moves to the previous match
+    /// for the current search term.
+    func findPrevious() {
+        guard let tv = activeTerminalView else { return }
+        let term = findBar.searchText
+        guard !term.isEmpty else {
+            showFindBar()
+            return
+        }
+        tv.findPrevious(term)
+    }
+
+    /// Toggles find bar visibility.
+    private func toggleFindBar() {
+        if isFindBarVisible { hideFindBar() } else { showFindBar() }
+    }
+
+    private func showFindBar() {
+        guard !isFindBarVisible else {
+            // Already visible — just re-focus the field.
+            findBar.focusSearchField()
+            return
+        }
+        isFindBarVisible = true
+        findBar.isHidden = false
+        findBar.focusSearchField()
+    }
+
+    private func hideFindBar() {
+        guard isFindBarVisible else { return }
+        isFindBarVisible = false
+        findBar.isHidden = true
+        // Clear search highlights in the active terminal.
+        activeTerminalView?.clearSearch()
+        // Return focus to the terminal.
+        focusActiveTab()
     }
 
     // MARK: - NSWindowDelegate
@@ -278,4 +397,66 @@ final class TerminalWindowController: NSObject, NSWindowDelegate {
     func windowDidResignKey(_ notification: Notification) { applyAppearance(focused: false) }
     func windowDidMove(_ notification: Notification) { panel.saveFrame() }
     func windowDidResize(_ notification: Notification) { panel.saveFrame() }
+
+    // MARK: - Recent-commands palette
+
+    private func setupRecentPalette() {
+        recentPalette.translatesAutoresizingMaskIntoConstraints = false
+        recentPalette.isHidden = true
+        // Layer it above the content area (and above the find bar) inside root.
+        root.addSubview(recentPalette)
+
+        // Center the palette horizontally in the content area; pin its top just
+        // below the header region; give it a fixed width and comfortable height.
+        NSLayoutConstraint.activate([
+            recentPalette.centerXAnchor.constraint(equalTo: contentArea.centerXAnchor),
+            recentPalette.topAnchor.constraint(
+                equalTo: contentBlur.topAnchor, constant: 20),
+            recentPalette.widthAnchor.constraint(
+                equalTo: contentArea.widthAnchor, multiplier: 0.75),
+            recentPalette.widthAnchor.constraint(
+                greaterThanOrEqualToConstant: 340),
+            recentPalette.widthAnchor.constraint(
+                lessThanOrEqualToConstant: 700),
+            recentPalette.heightAnchor.constraint(
+                equalToConstant: 340)
+        ])
+
+        // Wire insert callback: send text (and optionally CR) to active terminal.
+        recentPalette.onInsert = { [weak self] command, run in
+            guard let self, let tv = self.activeTerminalView else { return }
+            tv.send(txt: command)
+            if run { tv.send([0x0D]) }
+            self.hideRecentPalette()
+        }
+
+        recentPalette.onClose = { [weak self] in
+            self?.hideRecentPalette()
+        }
+    }
+
+    private func toggleRecentPalette() {
+        if isPaletteVisible { hideRecentPalette() } else { showRecentPalette() }
+    }
+
+    private func showRecentPalette() {
+        guard !isPaletteVisible else {
+            // Already visible — re-focus the search field.
+            recentPalette.focusSearchField()
+            return
+        }
+        isPaletteVisible = true
+        recentPalette.isHidden = false
+        // Reload history fresh every time the palette opens.
+        recentPalette.reloadHistory()
+        recentPalette.focusSearchField()
+    }
+
+    private func hideRecentPalette() {
+        guard isPaletteVisible else { return }
+        isPaletteVisible = false
+        recentPalette.isHidden = true
+        // Return focus to the terminal.
+        focusActiveTab()
+    }
 }
