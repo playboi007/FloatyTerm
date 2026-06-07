@@ -14,12 +14,14 @@ import WebKit
 final class TerminalWindowController: NSObject, NSWindowDelegate {
     let panel: FloatingPanel
 
-    private let root       = NSView()
-    private let topBlur    = NSVisualEffectView()     // header + tab strip backdrop (always)
-    private let contentBlur = NSVisualEffectView()    // content backdrop (toggleable)
+    private let root        = WindowDropView()
+    private let topBlur     = NSVisualEffectView()   // header + tab strip backdrop (always)
+    private let contentBlur = NSVisualEffectView()   // content backdrop (toggleable)
     private let contentArea = NSView()
-    private let header     = HeaderControlsView()
-    private let tabStrip   = TabStripView()
+    private let header      = HeaderControlsView()
+    private let tabStrip    = TabStripView()
+
+    private var _startEmpty: Bool = false
 
     // MARK: - Find bar (terminal-only overlay)
     private let findBar = FindBarView()
@@ -41,21 +43,29 @@ final class TerminalWindowController: NSObject, NSWindowDelegate {
 
     // MARK: - Heterogeneous tab list
 
-    private var tabs: [any TabContent] = []
+    /// Exposed (internal) so TabStripView's drag delegate can read it.
+    var tabs: [any TabContent] = []
     private var activeIndex = 0
 
     /// Held only during init so the first addTerminalTab() call can use it.
     /// Cleared after the first tab is created.
     private var pendingInitialDirectory: String?
 
-    var onNewWindow: (() -> Void)?
-    var onClosed: ((TerminalWindowController) -> Void)?
+    var onNewWindow:       (() -> Void)?
+    var onClosed:          ((TerminalWindowController) -> Void)?
     var onOpenPreferences: (() -> Void)?
+
+    /// Called when a tab should be torn off into a new window.
+    /// Parameters: the live tab object and the screen point where the drag ended.
+    var onDetachTab: ((any TabContent, NSPoint) -> Void)?
 
     /// - Parameter initialDirectory: The directory in which to open the first
     ///   terminal tab. nil → $HOME (the default / original behaviour).
-    init(initialDirectory: String? = nil) {
+    /// - Parameter startEmpty: When true, no initial tab is created.  Used by
+    ///   the tear-off path so `adoptTab` can install the reparented tab.
+    init(initialDirectory: String? = nil, startEmpty: Bool = false) {
         self.pendingInitialDirectory = initialDirectory
+        self._startEmpty = startEmpty
         let initial = NSRect(x: 0, y: 0, width: 720, height: 460)
         panel = FloatingPanel(contentRect: initial)
         super.init()
@@ -66,6 +76,8 @@ final class TerminalWindowController: NSObject, NSWindowDelegate {
         root.frame = initial
         root.autoresizingMask = [.width, .height]
         panel.contentView = root
+        root.windowController = self
+        root.registerDrop()
 
         topBlur.material     = .hudWindow
         topBlur.blendingMode = .behindWindow
@@ -113,11 +125,15 @@ final class TerminalWindowController: NSObject, NSWindowDelegate {
             contentArea.bottomAnchor.constraint(equalTo: contentBlur.bottomAnchor)
         ])
 
-        header.onAddTab      = { [weak self] in self?.addTerminalTab() }
-        header.onNewWindow   = { [weak self] in self?.onNewWindow?() }
+        header.onAddTab       = { [weak self] in self?.addTerminalTab() }
+        header.onNewWindow    = { [weak self] in self?.onNewWindow?() }
         header.onToggleURLBar = { [weak self] in self?.toggleURLBarCollapsed() }
-        tabStrip.onSelect    = { [weak self] i in self?.selectTab(i) }
-        tabStrip.onCloseTab  = { [weak self] i in self?.closeTab(i) }
+        tabStrip.onSelect     = { [weak self] i in self?.selectTab(i) }
+        tabStrip.onCloseTab   = { [weak self] i in self?.closeTab(i) }
+
+        // Wire drag-support back-references.
+        tabStrip.windowController = self
+        header.tabStripView       = tabStrip
 
         panel.keyCommandHandler = { [weak self] event in
             self?.handleKeyCommand(event) ?? false
@@ -131,7 +147,9 @@ final class TerminalWindowController: NSObject, NSWindowDelegate {
         setupFindBar()
         setupRecentPalette()
         setupURLBar()
-        addTerminalTab() // start with one terminal tab
+        if !_startEmpty {
+            addTerminalTab() // start with one terminal tab
+        }
     }
 
     deinit {
@@ -358,6 +376,54 @@ final class TerminalWindowController: NSObject, NSWindowDelegate {
         tabs[activeIndex].focus(in: panel)
     }
 
+    // MARK: - Tab tear-off / re-dock support
+
+    /// Remove `tab` from this window WITHOUT calling `cleanup()`.
+    /// The tab's session stays alive; its view is removed from the contentArea.
+    /// If this was the last tab, the window is closed.
+    func releaseTab(_ tab: any TabContent) {
+        guard let idx = tabs.firstIndex(where: { $0 === tab }) else { return }
+
+        // Hide overlays if the active (about-to-leave) tab owns them.
+        if idx == activeIndex {
+            if isFindBarVisible  { hideFindBar()       }
+            if isPaletteVisible  { hideRecentPalette() }
+            if isURLBarVisible   { hideURLBar()        }
+        }
+
+        tab.view.removeFromSuperview()
+        tabs.remove(at: idx)
+
+        if tabs.isEmpty {
+            panel.close()
+            return
+        }
+        activeIndex = min(activeIndex, tabs.count - 1)
+        selectTab(activeIndex)
+    }
+
+    /// Host `tab` in this window and select it.
+    /// Re-wires the tab's callbacks so title/termination events reference THIS controller.
+    func adoptTab(_ tab: any TabContent) {
+        // Re-wire callbacks before inserting so the refreshes land correctly.
+        tab.onTitleChanged = { [weak self] in
+            self?.refreshTabStrip()
+            // If it's a browser tab, sync the URL bar too.
+            if (tab as? BrowserController) != nil {
+                self?.syncURLBar()
+            }
+        }
+        if let termTab = tab as? TerminalController {
+            termTab.onTerminated = { [weak self, weak termTab] in
+                guard let self, let termTab,
+                      let idx = self.tabs.firstIndex(where: { $0 === termTab }) else { return }
+                self.closeTab(idx)
+            }
+        }
+
+        insertTab(tab)
+    }
+
     /// Updates the tab strip contents and shows/hides it (only visible with 2+ tabs).
     private func refreshTabStrip() {
         tabStrip.reload(titles: tabs.map { $0.title }, activeIndex: activeIndex)
@@ -581,7 +647,7 @@ final class TerminalWindowController: NSObject, NSWindowDelegate {
     }
 
     /// Updates URL field text and nav button enabled state from the active browser.
-    private func syncURLBar() {
+    func syncURLBar() {
         guard let bc = activeBrowser else { return }
         let urlString = bc.webView.url?.absoluteString ?? ""
         urlBar.updateURL(urlString)

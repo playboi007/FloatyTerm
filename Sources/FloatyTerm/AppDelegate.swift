@@ -41,18 +41,43 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     @discardableResult
     private func makeWindow(initialDirectory: String? = nil) -> TerminalWindowController {
         let wc = TerminalWindowController(initialDirectory: initialDirectory)
+        wireCallbacks(wc)
+        windows.append(wc)
+        wc.setupInitialFrame(cascadeIndex: windows.count - 1)
+        wc.show()
+        return wc
+    }
+
+    /// Creates a new floating window that starts empty and immediately adopts
+    /// `tab`.  The panel is positioned so `screenPoint` (the drop location) sits
+    /// near the top-left of the new window.
+    @discardableResult
+    private func makeWindowAdopting(_ tab: any TabContent, at screenPoint: NSPoint) -> TerminalWindowController {
+        let wc = TerminalWindowController(startEmpty: true)
+        wireCallbacks(wc)
+        windows.append(wc)
+        // Position the new window near the drop point.
+        let windowSize = wc.panel.frame.size
+        let origin = NSPoint(x: screenPoint.x - 20,
+                             y: screenPoint.y - windowSize.height + 20)
+        wc.panel.setFrameOrigin(origin)
+        wc.adoptTab(tab)
+        wc.show()
+        return wc
+    }
+
+    /// Wires the three standard callbacks that all windows share.
+    private func wireCallbacks(_ wc: TerminalWindowController) {
         wc.onNewWindow = { [weak self] in
-            // When the user requests a new window from this wc, inherit its cwd.
             self?.makeWindow(initialDirectory: wc.activeTerminalWorkingDirectory)
         }
         wc.onClosed = { [weak self] closed in
             self?.windows.removeAll { $0 === closed }
         }
         wc.onOpenPreferences = { [weak self] in self?.settingsWC.show() }
-        windows.append(wc)
-        wc.setupInitialFrame(cascadeIndex: windows.count - 1)
-        wc.show()
-        return wc
+        wc.onDetachTab = { [weak self] tab, screenPoint in
+            self?.makeWindowAdopting(tab, at: screenPoint)
+        }
     }
 
     private func currentWindow() -> TerminalWindowController? {
