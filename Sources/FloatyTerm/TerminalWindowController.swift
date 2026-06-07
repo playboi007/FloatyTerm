@@ -106,8 +106,9 @@ final class TerminalWindowController: NSObject, NSWindowDelegate {
             contentArea.bottomAnchor.constraint(equalTo: contentBlur.bottomAnchor)
         ])
 
-        header.onAddTab    = { [weak self] in self?.addTerminalTab() }
-        header.onNewWindow = { [weak self] in self?.onNewWindow?() }
+        header.onAddTab      = { [weak self] in self?.addTerminalTab() }
+        header.onNewWindow   = { [weak self] in self?.onNewWindow?() }
+        header.onToggleURLBar = { [weak self] in self?.toggleURLBarCollapsed() }
         tabStrip.onSelect    = { [weak self] i in self?.selectTab(i) }
         tabStrip.onCloseTab  = { [weak self] i in self?.closeTab(i) }
 
@@ -239,6 +240,14 @@ final class TerminalWindowController: NSObject, NSWindowDelegate {
         // Only apply font to terminal tabs.
         tabs.compactMap { $0 as? TerminalController }.forEach { $0.applyFont() }
         applyAppearance(focused: panel.isKeyWindow)
+        updateURLBarVisibility()  // reflect URL-bar collapse state changes
+    }
+
+    /// Collapses/expands the browser URL bar (persisted; applies to all windows).
+    private func toggleURLBarCollapsed() {
+        Settings.shared.urlBarCollapsed.toggle()
+        // The Settings.didChange notification triggers settingsChanged(), which
+        // refreshes URL-bar visibility everywhere.
     }
 
     // MARK: - Tabs (heterogeneous)
@@ -548,12 +557,17 @@ final class TerminalWindowController: NSObject, NSWindowDelegate {
         urlBar.updateNavState(canGoBack: bc.canGoBack, canGoForward: bc.canGoForward)
     }
 
-    /// Called after selectTab to show/hide the URL bar based on tab type.
+    /// Called after selectTab / settings change to show/hide the URL bar based
+    /// on tab type and the collapse toggle. The globe toggle in the header is
+    /// shown only for browser tabs and reflects the expanded/collapsed state.
     private func updateURLBarVisibility() {
-        if activeTabIsBrowser {
+        let expanded = !Settings.shared.urlBarCollapsed
+        if activeTabIsBrowser && expanded {
             showURLBar()
         } else {
             hideURLBar()
         }
+        header.setURLBarToggleVisible(activeTabIsBrowser)
+        header.setURLBarToggleActive(expanded)
     }
 }

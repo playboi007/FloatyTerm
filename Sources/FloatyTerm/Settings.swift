@@ -18,6 +18,7 @@ final class Settings {
     private init() {
         register(defaults: [
             "fontSize": 13.0,
+            "urlBarCollapsed": false,
             "backgroundBlur": true,
             "focusedOpacity": 0.30,
             "dimWhenUnfocused": true,
@@ -37,6 +38,13 @@ final class Settings {
     var fontSize: Double {
         get { d.double(forKey: "fontSize") }
         set { d.set(newValue, forKey: "fontSize"); notify() }
+    }
+
+    /// When true, the browser URL/navigation bar is collapsed (hidden) so it
+    /// doesn't obscure page content. Toggled by the globe icon in the header.
+    var urlBarCollapsed: Bool {
+        get { d.bool(forKey: "urlBarCollapsed") }
+        set { d.set(newValue, forKey: "urlBarCollapsed"); notify() }
     }
 
     /// When true, a frosted blur sits behind the terminal. Turn it off for a

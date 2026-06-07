@@ -151,11 +151,14 @@ final class TabStripView: DragHandleView {
     }
 }
 
-/// The controls in the top header strip: "＋" (new tab) and "⧉" (new window).
+/// The controls in the top header strip: a URL-bar toggle (browser tabs only),
+/// "＋" (new tab) and "⧉" (new window).
 final class HeaderControlsView: DragHandleView {
     var onAddTab: () -> Void = {}
     var onNewWindow: () -> Void = {}
+    var onToggleURLBar: () -> Void = {}
 
+    private let urlBarToggleButton = NSButton()
     private let addButton = NSButton()
     private let newWindowButton = NSButton()
 
@@ -168,10 +171,27 @@ final class HeaderControlsView: DragHandleView {
     private func setup() {
         configure(addButton, glyph: "+", action: #selector(addTapped))
         configure(newWindowButton, glyph: "⧉", action: #selector(newWindowTapped))
+
+        // Globe toggle for the address bar — only shown when a browser tab is active.
+        urlBarToggleButton.image = NSImage(systemSymbolName: "globe",
+                                           accessibilityDescription: "Toggle address bar")
+        urlBarToggleButton.isBordered = false
+        urlBarToggleButton.contentTintColor = NSColor.white.withAlphaComponent(0.8)
+        urlBarToggleButton.target = self
+        urlBarToggleButton.action = #selector(toggleURLBarTapped)
+        urlBarToggleButton.toolTip = "Show / hide address bar"
+        urlBarToggleButton.isHidden = true
+        urlBarToggleButton.translatesAutoresizingMaskIntoConstraints = false
+
+        addSubview(urlBarToggleButton)
         addSubview(addButton)
         addSubview(newWindowButton)
 
         NSLayoutConstraint.activate([
+            urlBarToggleButton.trailingAnchor.constraint(equalTo: addButton.leadingAnchor, constant: -6),
+            urlBarToggleButton.centerYAnchor.constraint(equalTo: centerYAnchor),
+            urlBarToggleButton.widthAnchor.constraint(equalToConstant: 24),
+
             addButton.trailingAnchor.constraint(equalTo: newWindowButton.leadingAnchor, constant: -4),
             addButton.centerYAnchor.constraint(equalTo: centerYAnchor),
             addButton.widthAnchor.constraint(equalToConstant: 24),
@@ -180,6 +200,19 @@ final class HeaderControlsView: DragHandleView {
             newWindowButton.centerYAnchor.constraint(equalTo: centerYAnchor),
             newWindowButton.widthAnchor.constraint(equalToConstant: 24)
         ])
+    }
+
+    /// Shows/hides the address-bar toggle (only relevant for browser tabs).
+    func setURLBarToggleVisible(_ visible: Bool) {
+        urlBarToggleButton.isHidden = !visible
+    }
+
+    /// Reflects whether the address bar is currently expanded.
+    func setURLBarToggleActive(_ active: Bool) {
+        urlBarToggleButton.contentTintColor = active
+            ? NSColor.controlAccentColor
+            : NSColor.white.withAlphaComponent(0.55)
+        urlBarToggleButton.toolTip = active ? "Hide address bar" : "Show address bar"
     }
 
     private func configure(_ button: NSButton, glyph: String, action: Selector) {
@@ -194,4 +227,5 @@ final class HeaderControlsView: DragHandleView {
 
     @objc private func addTapped() { onAddTab() }
     @objc private func newWindowTapped() { onNewWindow() }
+    @objc private func toggleURLBarTapped() { onToggleURLBar() }
 }
