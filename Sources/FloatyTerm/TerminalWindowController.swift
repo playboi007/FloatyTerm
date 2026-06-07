@@ -1,36 +1,47 @@
 import AppKit
 import SwiftTerm
+import WebKit
 
 /// Owns one floating window:
 ///  - a frosted top region (header controls + a tab strip that appears when
 ///    there are 2+ tabs) that stays opaque as a visual reference,
-///  - a content area below it that shows the active tab's terminal and whose
+///  - a content area below it that shows the active tab's view and whose
 ///    opacity/blur is configurable.
+///
+/// Tabs are heterogeneous: any object conforming to `TabContent` may live in
+/// `tabs`. Terminal-specific paths (find bar, recent-commands palette, foreground-
+/// job check, font updates) are guarded with `as? TerminalController` casts.
 final class TerminalWindowController: NSObject, NSWindowDelegate {
     let panel: FloatingPanel
 
-    private let root = NSView()
-    private let topBlur = NSVisualEffectView()      // header + tab strip backdrop (always)
-    private let contentBlur = NSVisualEffectView()  // terminal backdrop (toggleable)
+    private let root       = NSView()
+    private let topBlur    = NSVisualEffectView()     // header + tab strip backdrop (always)
+    private let contentBlur = NSVisualEffectView()    // content backdrop (toggleable)
     private let contentArea = NSView()
-    private let header = HeaderControlsView()
-    private let tabStrip = TabStripView()
+    private let header     = HeaderControlsView()
+    private let tabStrip   = TabStripView()
 
-    // MARK: - Find bar
+    // MARK: - Find bar (terminal-only overlay)
     private let findBar = FindBarView()
     private var findBarTrailingConstraint: NSLayoutConstraint!
     private var findBarTopConstraint: NSLayoutConstraint!
     private var isFindBarVisible = false
 
-    // MARK: - Recent-commands palette
+    // MARK: - Recent-commands palette (terminal-only overlay)
     private let recentPalette = RecentCommandsPaletteView()
     private var isPaletteVisible = false
+
+    // MARK: - URL bar (browser-only overlay)
+    private let urlBar = URLBarView()
+    private var isURLBarVisible = false
 
     private let headerHeight: CGFloat = 28
     private let tabStripHeight: CGFloat = 30
     private var tabStripHeightConstraint: NSLayoutConstraint!
 
-    private var tabs: [TerminalController] = []
+    // MARK: - Heterogeneous tab list
+
+    private var tabs: [any TabContent] = []
     private var activeIndex = 0
 
     var onNewWindow: (() -> Void)?
@@ -49,13 +60,13 @@ final class TerminalWindowController: NSObject, NSWindowDelegate {
         root.autoresizingMask = [.width, .height]
         panel.contentView = root
 
-        topBlur.material = .hudWindow
+        topBlur.material     = .hudWindow
         topBlur.blendingMode = .behindWindow
-        topBlur.state = .active
+        topBlur.state        = .active
 
-        contentBlur.material = .hudWindow
+        contentBlur.material     = .hudWindow
         contentBlur.blendingMode = .behindWindow
-        contentBlur.state = .active
+        contentBlur.state        = .active
 
         for v in [topBlur, contentBlur, contentArea, header, tabStrip] {
             v.translatesAutoresizingMaskIntoConstraints = false
@@ -95,10 +106,10 @@ final class TerminalWindowController: NSObject, NSWindowDelegate {
             contentArea.bottomAnchor.constraint(equalTo: contentBlur.bottomAnchor)
         ])
 
-        header.onAddTab = { [weak self] in self?.addTab() }
+        header.onAddTab    = { [weak self] in self?.addTerminalTab() }
         header.onNewWindow = { [weak self] in self?.onNewWindow?() }
-        tabStrip.onSelect = { [weak self] i in self?.selectTab(i) }
-        tabStrip.onCloseTab = { [weak self] i in self?.closeTab(i) }
+        tabStrip.onSelect    = { [weak self] i in self?.selectTab(i) }
+        tabStrip.onCloseTab  = { [weak self] i in self?.closeTab(i) }
 
         panel.keyCommandHandler = { [weak self] event in
             self?.handleKeyCommand(event) ?? false
@@ -111,7 +122,8 @@ final class TerminalWindowController: NSObject, NSWindowDelegate {
 
         setupFindBar()
         setupRecentPalette()
-        addTab() // start with one tab
+        setupURLBar()
+        addTerminalTab() // start with one terminal tab
     }
 
     deinit {
@@ -145,8 +157,11 @@ final class TerminalWindowController: NSObject, NSWindowDelegate {
     var isVisible: Bool { panel.isVisible }
     var isKey: Bool { panel.isKeyWindow }
 
-    /// Public entry for the menu bar's "New Tab".
-    func openNewTab() { addTab() }
+    /// Public entry for the menu bar's "New Tab" (terminal).
+    func openNewTab() { addTerminalTab() }
+
+    /// Public entry for the menu bar's "New Browser Tab".
+    func openNewBrowserTab() { addBrowserTab() }
 
     // MARK: - Keyboard commands
 
@@ -157,13 +172,23 @@ final class TerminalWindowController: NSObject, NSWindowDelegate {
 
         if flags == .command {
             switch chars {
-            case "t": addTab(); return true
+            case "t": addTerminalTab(); return true
+            case "b": addBrowserTab();  return true
             case "w": closeTab(activeIndex); return true
             case "n": onNewWindow?(); return true
             case ",": onOpenPreferences?(); return true
-            case "f": toggleFindBar(); return true
-            case "g": findNext(); return true
-            case "r": toggleRecentPalette(); return true
+            case "f":
+                // ⌘F is terminal-only; no-op when a browser tab is active.
+                if activeTabIsTerminal { toggleFindBar() }
+                return true
+            case "g":
+                if activeTabIsTerminal { findNext() }
+                return true
+            case "r":
+                // ⌘R is the recent-commands palette for terminal tabs;
+                // no-op for browser tabs (browser reload is in the URL bar).
+                if activeTabIsTerminal { toggleRecentPalette() }
+                return true
             default:
                 if let n = Int(chars), (1...9).contains(n) {
                     selectTab(n - 1)
@@ -171,9 +196,12 @@ final class TerminalWindowController: NSObject, NSWindowDelegate {
                 }
             }
         } else if flags == [.command, .shift] {
-            if event.keyCode == 30 { cycleTab(+1); return true } // ⌘⇧]  next
-            if event.keyCode == 33 { cycleTab(-1); return true } // ⌘⇧[  prev
-            if chars == "g"        { findPrevious(); return true } // ⌘⇧G prev match
+            if event.keyCode == 30 { cycleTab(+1); return true }  // ⌘⇧]  next
+            if event.keyCode == 33 { cycleTab(-1); return true }  // ⌘⇧[  prev
+            if chars == "g" {
+                if activeTabIsTerminal { findPrevious() }
+                return true
+            }
         }
         return false
     }
@@ -183,12 +211,22 @@ final class TerminalWindowController: NSObject, NSWindowDelegate {
         selectTab((activeIndex + delta + tabs.count) % tabs.count)
     }
 
+    // MARK: - Convenience type checks
+
+    private var activeTabIsTerminal: Bool {
+        tabs.indices.contains(activeIndex) && tabs[activeIndex] is TerminalController
+    }
+
+    private var activeTabIsBrowser: Bool {
+        tabs.indices.contains(activeIndex) && tabs[activeIndex] is BrowserController
+    }
+
+    private var activeBrowser: BrowserController? {
+        tabs.indices.contains(activeIndex) ? tabs[activeIndex] as? BrowserController : nil
+    }
+
     // MARK: - Appearance (transparency + blur)
 
-    /// Controls the terminal region's opacity and the blur toggle. We fade the
-    /// whole content area (the reliable mechanism for this terminal engine);
-    /// with blur OFF and a low value, the live content behind shows through.
-    /// The top region (header + tab strip) keeps full opacity as a reference.
     private func applyAppearance(focused: Bool) {
         contentBlur.isHidden = !Settings.shared.backgroundBlur
         let alpha = (Settings.shared.dimWhenUnfocused && !focused)
@@ -198,13 +236,14 @@ final class TerminalWindowController: NSObject, NSWindowDelegate {
     }
 
     @objc private func settingsChanged() {
-        tabs.forEach { $0.applyFont() }
+        // Only apply font to terminal tabs.
+        tabs.compactMap { $0 as? TerminalController }.forEach { $0.applyFont() }
         applyAppearance(focused: panel.isKeyWindow)
     }
 
-    // MARK: - Tabs
+    // MARK: - Tabs (heterogeneous)
 
-    private func addTab() {
+    private func addTerminalTab() {
         let tab = TerminalController()
         tab.onTerminated = { [weak self, weak tab] in
             guard let self, let tab,
@@ -212,7 +251,22 @@ final class TerminalWindowController: NSObject, NSWindowDelegate {
             self.closeTab(idx)
         }
         tab.onTitleChanged = { [weak self] in self?.refreshTabStrip() }
+        insertTab(tab)
+    }
 
+    func addBrowserTab() {
+        // One-time resource notice.
+        showBrowserResourceNoticeIfNeeded()
+
+        let tab = BrowserController()
+        tab.onTitleChanged = { [weak self] in
+            self?.refreshTabStrip()
+            self?.syncURLBar()
+        }
+        insertTab(tab)
+    }
+
+    private func insertTab(_ tab: any TabContent) {
         let v = tab.view
         v.translatesAutoresizingMaskIntoConstraints = false
         contentArea.addSubview(v)
@@ -230,28 +284,29 @@ final class TerminalWindowController: NSObject, NSWindowDelegate {
 
     private func selectTab(_ index: Int) {
         guard tabs.indices.contains(index) else { return }
-        // Hide find bar when switching tabs (clear search in the old active tab).
-        if isFindBarVisible { hideFindBar() }
-        // Hide recent-commands palette when switching tabs.
-        if isPaletteVisible { hideRecentPalette() }
+        // Hide terminal-only overlays when switching tabs.
+        if isFindBarVisible   { hideFindBar()       }
+        if isPaletteVisible   { hideRecentPalette() }
         activeIndex = index
         for (i, tab) in tabs.enumerated() {
             tab.view.isHidden = (i != index)
         }
         refreshTabStrip()
+        updateURLBarVisibility()
         focusActiveTab()
     }
 
     private func closeTab(_ index: Int) {
         guard tabs.indices.contains(index) else { return }
-        // If closing the active tab, clear the find bar and palette first.
-        if index == activeIndex && isFindBarVisible { hideFindBar() }
-        if index == activeIndex && isPaletteVisible { hideRecentPalette() }
+        if index == activeIndex && isFindBarVisible  { hideFindBar()       }
+        if index == activeIndex && isPaletteVisible  { hideRecentPalette() }
+        if index == activeIndex && isURLBarVisible   { hideURLBar()        }
         let tab = tabs.remove(at: index)
         tab.view.removeFromSuperview()
+        tab.cleanup()
 
         if tabs.isEmpty {
-            panel.close() // no tabs left → close the window
+            panel.close()
             return
         }
         activeIndex = min(activeIndex, tabs.count - 1)
@@ -260,7 +315,7 @@ final class TerminalWindowController: NSObject, NSWindowDelegate {
 
     private func focusActiveTab() {
         guard tabs.indices.contains(activeIndex) else { return }
-        panel.makeFirstResponder(tabs[activeIndex].view)
+        tabs[activeIndex].focus(in: panel)
     }
 
     /// Updates the tab strip contents and shows/hides it (only visible with 2+ tabs).
@@ -271,22 +326,37 @@ final class TerminalWindowController: NSObject, NSWindowDelegate {
         tabStripHeightConstraint.constant = show ? tabStripHeight : 0
     }
 
-    // MARK: - Find bar
+    // MARK: - One-time browser resource notice
+
+    private func showBrowserResourceNoticeIfNeeded() {
+        let key = "didShowBrowserResourceNotice"
+        guard !UserDefaults.standard.bool(forKey: key) else { return }
+        UserDefaults.standard.set(true, forKey: key)
+
+        let alert = NSAlert()
+        alert.alertStyle        = .informational
+        alert.messageText       = "Browser tabs use more resources"
+        alert.informativeText   = """
+            Browser tabs are powered by the system WebKit engine. \
+            They will use more CPU and RAM than terminal tabs, especially \
+            with rich web applications. This message appears only once.
+            """
+        alert.addButton(withTitle: "Got It")
+        NSApp.activate(ignoringOtherApps: true)
+        alert.runModal()
+    }
+
+    // MARK: - Find bar (terminal-only)
 
     private func setupFindBar() {
         findBar.translatesAutoresizingMaskIntoConstraints = false
         findBar.isHidden = true
-        // Add as a floating overlay above contentArea (inside root so it appears
-        // above the blur views in z-order without disturbing the layout system).
         root.addSubview(findBar)
 
-        // Pin to top-right of the content area, with a small inset.
         findBarTrailingConstraint = findBar.trailingAnchor.constraint(
-            equalTo: contentArea.trailingAnchor, constant: -10
-        )
+            equalTo: contentArea.trailingAnchor, constant: -10)
         findBarTopConstraint = findBar.topAnchor.constraint(
-            equalTo: contentBlur.topAnchor, constant: 8
-        )
+            equalTo: contentBlur.topAnchor, constant: 8)
 
         NSLayoutConstraint.activate([
             findBarTopConstraint,
@@ -295,9 +365,7 @@ final class TerminalWindowController: NSObject, NSWindowDelegate {
             findBar.widthAnchor.constraint(greaterThanOrEqualToConstant: 260)
         ])
 
-        // Wire callbacks.
         findBar.onSearchChanged = { [weak self] text in
-            // Live preview: jump to first match as user types.
             guard let self else { return }
             if text.isEmpty {
                 self.activeTerminalView?.clearSearch()
@@ -305,52 +373,35 @@ final class TerminalWindowController: NSObject, NSWindowDelegate {
                 self.activeTerminalView?.findNext(text)
             }
         }
-        findBar.onFindNext = { [weak self] in self?.findNext() }
+        findBar.onFindNext     = { [weak self] in self?.findNext()     }
         findBar.onFindPrevious = { [weak self] in self?.findPrevious() }
-        findBar.onClose = { [weak self] in self?.hideFindBar() }
+        findBar.onClose        = { [weak self] in self?.hideFindBar()  }
     }
 
     private var activeTerminalView: FloatyTerminalView? {
-        tabs.indices.contains(activeIndex) ? tabs[activeIndex].view : nil
+        (tabs.indices.contains(activeIndex) ? tabs[activeIndex] as? TerminalController : nil)?.terminalView
     }
 
-    // MARK: - Public find API (explicitly requested by the feature spec)
-
-    /// Shows the find bar (if not already visible) and advances to the next match
-    /// for the current search term.
     func findNext() {
         guard let tv = activeTerminalView else { return }
         let term = findBar.searchText
-        guard !term.isEmpty else {
-            showFindBar()
-            return
-        }
+        guard !term.isEmpty else { showFindBar(); return }
         tv.findNext(term)
     }
 
-    /// Shows the find bar (if not already visible) and moves to the previous match
-    /// for the current search term.
     func findPrevious() {
         guard let tv = activeTerminalView else { return }
         let term = findBar.searchText
-        guard !term.isEmpty else {
-            showFindBar()
-            return
-        }
+        guard !term.isEmpty else { showFindBar(); return }
         tv.findPrevious(term)
     }
 
-    /// Toggles find bar visibility.
     private func toggleFindBar() {
         if isFindBarVisible { hideFindBar() } else { showFindBar() }
     }
 
     private func showFindBar() {
-        guard !isFindBarVisible else {
-            // Already visible — just re-focus the field.
-            findBar.focusSearchField()
-            return
-        }
+        guard !isFindBarVisible else { findBar.focusSearchField(); return }
         isFindBarVisible = true
         findBar.isHidden = false
         findBar.focusSearchField()
@@ -360,9 +411,7 @@ final class TerminalWindowController: NSObject, NSWindowDelegate {
         guard isFindBarVisible else { return }
         isFindBarVisible = false
         findBar.isHidden = true
-        // Clear search highlights in the active terminal.
         activeTerminalView?.clearSearch()
-        // Return focus to the terminal.
         focusActiveTab()
     }
 
@@ -371,14 +420,22 @@ final class TerminalWindowController: NSObject, NSWindowDelegate {
     func windowShouldClose(_ sender: NSWindow) -> Bool {
         if AppRuntime.isQuitting || tabs.isEmpty { return true }
 
-        let busy = tabs.contains { $0.hasRunningForegroundJob }
-        if !busy && tabs.count == 1 { return true } // a single idle shell closes freely
+        // Only terminal tabs can have a running foreground job.
+        let terminalTabs = tabs.compactMap { $0 as? TerminalController }
+        let busy = terminalTabs.contains { $0.hasRunningForegroundJob }
+
+        // A single idle terminal (or any mix without a running job) closes freely.
+        if !busy && tabs.count == 1 { return true }
 
         let alert = NSAlert()
         alert.alertStyle = .warning
         alert.messageText = busy ? "A process is still running." : "Close this window?"
-        alert.informativeText = "Closing will end \(tabs.count) terminal "
-            + "session\(tabs.count == 1 ? "" : "s")."
+        let termCount = terminalTabs.count
+        let browCount = tabs.count - termCount
+        var parts: [String] = []
+        if termCount > 0 { parts.append("\(termCount) terminal session\(termCount == 1 ? "" : "s")") }
+        if browCount > 0 { parts.append("\(browCount) browser tab\(browCount == 1 ? "" : "s")") }
+        alert.informativeText = "Closing will end \(parts.joined(separator: " and "))."
         alert.addButton(withTitle: "Close")
         alert.addButton(withTitle: "Cancel")
         NSApp.activate(ignoringOtherApps: true)
@@ -386,53 +443,40 @@ final class TerminalWindowController: NSObject, NSWindowDelegate {
     }
 
     func windowWillClose(_ notification: Notification) {
-        // Defer so we don't drop our own last strong reference mid-callback.
         DispatchQueue.main.async { [weak self] in
             guard let self else { return }
             self.onClosed?(self)
         }
     }
 
-    func windowDidBecomeKey(_ notification: Notification) { applyAppearance(focused: true) }
+    func windowDidBecomeKey(_ notification: Notification) { applyAppearance(focused: true)  }
     func windowDidResignKey(_ notification: Notification) { applyAppearance(focused: false) }
-    func windowDidMove(_ notification: Notification) { panel.saveFrame() }
-    func windowDidResize(_ notification: Notification) { panel.saveFrame() }
+    func windowDidMove(_ notification: Notification)      { panel.saveFrame() }
+    func windowDidResize(_ notification: Notification)    { panel.saveFrame() }
 
-    // MARK: - Recent-commands palette
+    // MARK: - Recent-commands palette (terminal-only)
 
     private func setupRecentPalette() {
         recentPalette.translatesAutoresizingMaskIntoConstraints = false
         recentPalette.isHidden = true
-        // Layer it above the content area (and above the find bar) inside root.
         root.addSubview(recentPalette)
 
-        // Center the palette horizontally in the content area; pin its top just
-        // below the header region; give it a fixed width and comfortable height.
         NSLayoutConstraint.activate([
             recentPalette.centerXAnchor.constraint(equalTo: contentArea.centerXAnchor),
-            recentPalette.topAnchor.constraint(
-                equalTo: contentBlur.topAnchor, constant: 20),
-            recentPalette.widthAnchor.constraint(
-                equalTo: contentArea.widthAnchor, multiplier: 0.75),
-            recentPalette.widthAnchor.constraint(
-                greaterThanOrEqualToConstant: 340),
-            recentPalette.widthAnchor.constraint(
-                lessThanOrEqualToConstant: 700),
-            recentPalette.heightAnchor.constraint(
-                equalToConstant: 340)
+            recentPalette.topAnchor.constraint(equalTo: contentBlur.topAnchor, constant: 20),
+            recentPalette.widthAnchor.constraint(equalTo: contentArea.widthAnchor, multiplier: 0.75),
+            recentPalette.widthAnchor.constraint(greaterThanOrEqualToConstant: 340),
+            recentPalette.widthAnchor.constraint(lessThanOrEqualToConstant: 700),
+            recentPalette.heightAnchor.constraint(equalToConstant: 340)
         ])
 
-        // Wire insert callback: send text (and optionally CR) to active terminal.
         recentPalette.onInsert = { [weak self] command, run in
             guard let self, let tv = self.activeTerminalView else { return }
             tv.send(txt: command)
             if run { tv.send([0x0D]) }
             self.hideRecentPalette()
         }
-
-        recentPalette.onClose = { [weak self] in
-            self?.hideRecentPalette()
-        }
+        recentPalette.onClose = { [weak self] in self?.hideRecentPalette() }
     }
 
     private func toggleRecentPalette() {
@@ -440,14 +484,9 @@ final class TerminalWindowController: NSObject, NSWindowDelegate {
     }
 
     private func showRecentPalette() {
-        guard !isPaletteVisible else {
-            // Already visible — re-focus the search field.
-            recentPalette.focusSearchField()
-            return
-        }
+        guard !isPaletteVisible else { recentPalette.focusSearchField(); return }
         isPaletteVisible = true
         recentPalette.isHidden = false
-        // Reload history fresh every time the palette opens.
         recentPalette.reloadHistory()
         recentPalette.focusSearchField()
     }
@@ -456,7 +495,65 @@ final class TerminalWindowController: NSObject, NSWindowDelegate {
         guard isPaletteVisible else { return }
         isPaletteVisible = false
         recentPalette.isHidden = true
-        // Return focus to the terminal.
         focusActiveTab()
+    }
+
+    // MARK: - URL bar (browser-only)
+
+    private func setupURLBar() {
+        urlBar.translatesAutoresizingMaskIntoConstraints = false
+        urlBar.isHidden = true
+        // Layer above contentArea (inside root, like findBar and recentPalette).
+        root.addSubview(urlBar)
+
+        // Centred horizontally; pinned near the top of the content area.
+        NSLayoutConstraint.activate([
+            urlBar.centerXAnchor.constraint(equalTo: contentArea.centerXAnchor),
+            urlBar.topAnchor.constraint(equalTo: contentBlur.topAnchor, constant: 8),
+            urlBar.widthAnchor.constraint(equalTo: contentArea.widthAnchor, multiplier: 0.80),
+            urlBar.widthAnchor.constraint(greaterThanOrEqualToConstant: 340),
+            urlBar.widthAnchor.constraint(lessThanOrEqualToConstant: 700)
+        ])
+
+        urlBar.onLoad    = { [weak self] text in self?.browserLoad(text)  }
+        urlBar.onBack    = { [weak self] in self?.activeBrowser?.goBack()    }
+        urlBar.onForward = { [weak self] in self?.activeBrowser?.goForward() }
+        urlBar.onReload  = { [weak self] in self?.activeBrowser?.reload()    }
+    }
+
+    private func browserLoad(_ text: String) {
+        activeBrowser?.load(text)
+        focusActiveTab()
+    }
+
+    /// Shows the URL bar with current state (called when a browser tab becomes active).
+    private func showURLBar() {
+        guard !isURLBarVisible else { return }
+        isURLBarVisible = true
+        urlBar.isHidden = false
+        syncURLBar()
+    }
+
+    private func hideURLBar() {
+        guard isURLBarVisible else { return }
+        isURLBarVisible = false
+        urlBar.isHidden = true
+    }
+
+    /// Updates URL field text and nav button enabled state from the active browser.
+    private func syncURLBar() {
+        guard let bc = activeBrowser else { return }
+        let urlString = bc.webView.url?.absoluteString ?? ""
+        urlBar.updateURL(urlString)
+        urlBar.updateNavState(canGoBack: bc.canGoBack, canGoForward: bc.canGoForward)
+    }
+
+    /// Called after selectTab to show/hide the URL bar based on tab type.
+    private func updateURLBarVisibility() {
+        if activeTabIsBrowser {
+            showURLBar()
+        } else {
+            hideURLBar()
+        }
     }
 }

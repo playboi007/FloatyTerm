@@ -7,6 +7,7 @@ final class StatusItemController: NSObject {
 
     var onToggle: () -> Void = {}
     var onNewTab: () -> Void = {}
+    var onNewBrowserTab: () -> Void = {}
     var onNewWindow: () -> Void = {}
     var onPreferences: () -> Void = {}
 
@@ -25,8 +26,10 @@ final class StatusItemController: NSObject {
         menu.addItem(makeItem("Show / Hide", action: #selector(toggle),
                               key: "7", mods: [.command, .option]))
         menu.addItem(.separator())
-        menu.addItem(makeItem("New Tab", action: #selector(newTab),
+        menu.addItem(makeItem("New Terminal Tab", action: #selector(newTab),
                               key: "t", mods: [.command]))
+        menu.addItem(makeItem("New Browser Tab", action: #selector(newBrowserTab),
+                              key: "b", mods: [.command]))
         menu.addItem(makeItem("New Window", action: #selector(newWindow),
                               key: "n", mods: [.command]))
         menu.addItem(.separator())
@@ -46,9 +49,10 @@ final class StatusItemController: NSObject {
         return it
     }
 
-    @objc private func toggle() { onToggle() }
-    @objc private func newTab() { onNewTab() }
-    @objc private func newWindow() { onNewWindow() }
-    @objc private func preferences() { onPreferences() }
-    @objc private func quit() { NSApp.terminate(nil) }
+    @objc private func toggle()        { onToggle()         }
+    @objc private func newTab()        { onNewTab()          }
+    @objc private func newBrowserTab() { onNewBrowserTab()   }
+    @objc private func newWindow()     { onNewWindow()       }
+    @objc private func preferences()   { onPreferences()     }
+    @objc private func quit()          { NSApp.terminate(nil) }
 }

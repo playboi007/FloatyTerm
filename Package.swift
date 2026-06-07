@@ -13,7 +13,8 @@ let package = Package(
         .executableTarget(
             name: "FloatyTerm",
             dependencies: ["SwiftTerm"],
-            path: "Sources/FloatyTerm"
+            path: "Sources/FloatyTerm",
+            linkerSettings: [.linkedFramework("WebKit")]
         )
     ]
 )

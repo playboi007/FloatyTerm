@@ -11,10 +11,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         hotKey = HotKey { [weak self] in self?.toggle() }
 
-        statusItem.onToggle = { [weak self] in self?.toggle() }
-        statusItem.onNewWindow = { [weak self] in self?.makeWindow() }
-        statusItem.onNewTab = { [weak self] in self?.newTabInCurrentWindow() }
-        statusItem.onPreferences = { [weak self] in self?.settingsWC.show() }
+        statusItem.onToggle        = { [weak self] in self?.toggle() }
+        statusItem.onNewWindow     = { [weak self] in self?.makeWindow() }
+        statusItem.onNewTab        = { [weak self] in self?.newTerminalTabInCurrentWindow() }
+        statusItem.onNewBrowserTab = { [weak self] in self?.newBrowserTabInCurrentWindow() }
+        statusItem.onPreferences   = { [weak self] in self?.settingsWC.show() }
 
         // Re-register the global hotkey if it changes in Preferences.
         NotificationCenter.default.addObserver(
@@ -52,12 +53,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         windows.first(where: { $0.isKey }) ?? windows.last
     }
 
-    private func newTabInCurrentWindow() {
+    private func newTerminalTabInCurrentWindow() {
         if let wc = currentWindow() {
             wc.openNewTab()
             wc.show()
         } else {
             makeWindow()
+        }
+    }
+
+    private func newBrowserTabInCurrentWindow() {
+        if let wc = currentWindow() {
+            wc.openNewBrowserTab()
+            wc.show()
+        } else {
+            // No window yet — make one (starts with a terminal tab), then add browser.
+            let wc = makeWindow()
+            wc.openNewBrowserTab()
         }
     }
 
