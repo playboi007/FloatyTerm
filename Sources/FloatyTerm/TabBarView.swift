@@ -449,6 +449,7 @@ final class HeaderControlsView: DragHandleView {
     var onAddTab:        () -> Void = {}
     var onNewWindow:     () -> Void = {}
     var onToggleURLBar:  () -> Void = {}
+    var onMinimize:      () -> Void = {}
 
     /// Set by TerminalWindowController — used when a tab is dropped onto the header.
     weak var tabStripView: TabStripView?
@@ -456,6 +457,7 @@ final class HeaderControlsView: DragHandleView {
     private let urlBarToggleButton = NSButton()
     private let addButton          = NSButton()
     private let newWindowButton    = NSButton()
+    private let minimizeButton     = NSButton()
 
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
@@ -466,6 +468,18 @@ final class HeaderControlsView: DragHandleView {
     private func setup() {
         configure(addButton, glyph: "+", action: #selector(addTapped))
         configure(newWindowButton, glyph: "⧉", action: #selector(newWindowTapped))
+
+        // Minimize: hides THIS window to the menu bar (session preserved).
+        // Uses the conventional "minus" glyph (mirrors the macOS yellow button).
+        minimizeButton.image = NSImage(systemSymbolName: "minus",
+                                       accessibilityDescription: "Minimize window")
+        minimizeButton.isBordered = false
+        minimizeButton.font = .systemFont(ofSize: 15, weight: .semibold)
+        minimizeButton.contentTintColor = NSColor.white.withAlphaComponent(0.8)
+        minimizeButton.target = self
+        minimizeButton.action = #selector(minimizeTapped)
+        minimizeButton.toolTip = "Hide this window (restore from the menu-bar icon)"
+        minimizeButton.translatesAutoresizingMaskIntoConstraints = false
 
         // Globe toggle for the address bar — only shown when a browser tab is active.
         urlBarToggleButton.image = NSImage(systemSymbolName: "globe",
@@ -481,6 +495,7 @@ final class HeaderControlsView: DragHandleView {
         addSubview(urlBarToggleButton)
         addSubview(addButton)
         addSubview(newWindowButton)
+        addSubview(minimizeButton)
 
         NSLayoutConstraint.activate([
             urlBarToggleButton.trailingAnchor.constraint(equalTo: addButton.leadingAnchor, constant: -6),
@@ -491,9 +506,13 @@ final class HeaderControlsView: DragHandleView {
             addButton.centerYAnchor.constraint(equalTo: centerYAnchor),
             addButton.widthAnchor.constraint(equalToConstant: 24),
 
-            newWindowButton.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -10),
+            newWindowButton.trailingAnchor.constraint(equalTo: minimizeButton.leadingAnchor, constant: -4),
             newWindowButton.centerYAnchor.constraint(equalTo: centerYAnchor),
-            newWindowButton.widthAnchor.constraint(equalToConstant: 24)
+            newWindowButton.widthAnchor.constraint(equalToConstant: 24),
+
+            minimizeButton.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -10),
+            minimizeButton.centerYAnchor.constraint(equalTo: centerYAnchor),
+            minimizeButton.widthAnchor.constraint(equalToConstant: 24)
         ])
 
         // The header also acts as a drop destination for cross-window moves when
@@ -527,6 +546,7 @@ final class HeaderControlsView: DragHandleView {
     @objc private func addTapped()        { onAddTab()       }
     @objc private func newWindowTapped()  { onNewWindow()    }
     @objc private func toggleURLBarTapped() { onToggleURLBar() }
+    @objc private func minimizeTapped()   { onMinimize()     }
 
     // MARK: - NSDraggingDestination overrides (forward to tabStripView)
 

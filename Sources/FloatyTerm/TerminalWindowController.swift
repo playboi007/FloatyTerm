@@ -14,6 +14,15 @@ import WebKit
 final class TerminalWindowController: NSObject, NSWindowDelegate {
     let panel: FloatingPanel
 
+    /// Stable identifier so the menu bar can address this specific window
+    /// (e.g. to restore it after it has been minimized/hidden).
+    let id = UUID()
+
+    /// True while this window is individually hidden via the minimize button
+    /// (as opposed to the global ⌥⌘7 hide). Minimized windows are restorable
+    /// from the menu-bar "Hidden Windows" list.
+    private(set) var isMinimized = false
+
     private let root        = WindowDropView()
     private let topBlur     = NSVisualEffectView()   // header + tab strip backdrop (always)
     private let contentBlur = NSVisualEffectView()   // content backdrop (toggleable)
@@ -128,6 +137,7 @@ final class TerminalWindowController: NSObject, NSWindowDelegate {
         header.onAddTab       = { [weak self] in self?.addTerminalTab() }
         header.onNewWindow    = { [weak self] in self?.onNewWindow?() }
         header.onToggleURLBar = { [weak self] in self?.toggleURLBarCollapsed() }
+        header.onMinimize     = { [weak self] in self?.minimize() }
         tabStrip.onSelect     = { [weak self] i in self?.selectTab(i) }
         tabStrip.onCloseTab   = { [weak self] i in self?.closeTab(i) }
 
@@ -170,6 +180,7 @@ final class TerminalWindowController: NSObject, NSWindowDelegate {
     }
 
     func show() {
+        isMinimized = false
         panel.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
         focusActiveTab()
@@ -180,8 +191,24 @@ final class TerminalWindowController: NSObject, NSWindowDelegate {
         panel.orderOut(nil)
     }
 
+    /// Hides only THIS window (session preserved) and flags it as minimized so
+    /// it appears in the menu-bar "Hidden Windows" list for individual restore.
+    /// Distinct from the global ⌥⌘7 hide, which hides every window at once.
+    func minimize() {
+        panel.saveFrame()
+        isMinimized = true
+        panel.orderOut(nil)
+    }
+
     var isVisible: Bool { panel.isVisible }
     var isKey: Bool { panel.isKeyWindow }
+
+    /// A short title for menus, taken from the active tab.
+    var displayTitle: String {
+        guard tabs.indices.contains(activeIndex) else { return "FloatyTerm" }
+        let t = tabs[activeIndex].title.trimmingCharacters(in: .whitespacesAndNewlines)
+        return t.isEmpty ? "Untitled" : t
+    }
 
     /// Public entry for the menu bar's "New Tab" (terminal).
     func openNewTab() { addTerminalTab() }

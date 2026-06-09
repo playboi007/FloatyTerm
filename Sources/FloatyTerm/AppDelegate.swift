@@ -17,6 +17,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         statusItem.onNewBrowserTab = { [weak self] in self?.newBrowserTabInCurrentWindow() }
         statusItem.onPreferences   = { [weak self] in self?.settingsWC.show() }
 
+        // Feed the menu the list of individually-minimized windows so each can
+        // be restored on its own, and provide the restore action.
+        statusItem.hiddenWindowsProvider = { [weak self] in
+            (self?.windows ?? [])
+                .filter { $0.isMinimized }
+                .map { (id: $0.id, title: $0.displayTitle) }
+        }
+        statusItem.onRestoreWindow = { [weak self] id in
+            self?.windows.first { $0.id == id }?.show()
+        }
+
         // Re-register the global hotkey if it changes in Preferences.
         NotificationCenter.default.addObserver(
             self, selector: #selector(settingsChanged),

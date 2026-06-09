@@ -1,15 +1,24 @@
 import AppKit
 
 /// The menu-bar (status) item. Since FloatyTerm has no Dock icon, this is the
-/// visible home for New Window / New Tab / Preferences / Quit.
-final class StatusItemController: NSObject {
+/// visible home for New Window / New Tab / Preferences / Quit — and the place
+/// to restore windows that have been individually minimized.
+final class StatusItemController: NSObject, NSMenuDelegate {
     private let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
+    private let menu = NSMenu()
 
     var onToggle: () -> Void = {}
     var onNewTab: () -> Void = {}
     var onNewBrowserTab: () -> Void = {}
     var onNewWindow: () -> Void = {}
     var onPreferences: () -> Void = {}
+
+    /// Returns the windows that are currently minimized (hidden via their own
+    /// minimize button), so they can be listed for individual restore.
+    var hiddenWindowsProvider: () -> [(id: UUID, title: String)] = { [] }
+
+    /// Restores (un-minimizes) the window with the given id.
+    var onRestoreWindow: (UUID) -> Void = { _ in }
 
     override init() {
         super.init()
@@ -22,9 +31,44 @@ final class StatusItemController: NSObject {
             }
         }
 
-        let menu = NSMenu()
+        // Rebuild on each open so the "Hidden Windows" list is always current.
+        menu.delegate = self
+        item.menu = menu
+        rebuild()
+    }
+
+    // MARK: - NSMenuDelegate
+
+    func menuNeedsUpdate(_ menu: NSMenu) {
+        rebuild()
+    }
+
+    // MARK: - Menu construction
+
+    private func rebuild() {
+        menu.removeAllItems()
+
         menu.addItem(makeItem("Show / Hide", action: #selector(toggle),
                               key: "7", mods: [.command, .option]))
+
+        // Section: individually-minimized windows, each restorable on its own.
+        let hidden = hiddenWindowsProvider()
+        if !hidden.isEmpty {
+            menu.addItem(.separator())
+            let header = NSMenuItem(title: "Hidden Windows", action: nil, keyEquivalent: "")
+            header.isEnabled = false
+            menu.addItem(header)
+            for win in hidden {
+                let it = NSMenuItem(title: win.title,
+                                    action: #selector(restoreWindow(_:)), keyEquivalent: "")
+                it.target = self
+                it.representedObject = win.id
+                it.image = NSImage(systemSymbolName: "macwindow",
+                                   accessibilityDescription: nil)
+                menu.addItem(it)
+            }
+        }
+
         menu.addItem(.separator())
         menu.addItem(makeItem("New Terminal Tab", action: #selector(newTab),
                               key: "t", mods: [.command]))
@@ -38,7 +82,6 @@ final class StatusItemController: NSObject {
         menu.addItem(.separator())
         menu.addItem(makeItem("Quit FloatyTerm", action: #selector(quit),
                               key: "q", mods: [.command]))
-        item.menu = menu
     }
 
     private func makeItem(_ title: String, action: Selector,
@@ -49,10 +92,17 @@ final class StatusItemController: NSObject {
         return it
     }
 
+    // MARK: - Actions
+
     @objc private func toggle()        { onToggle()         }
     @objc private func newTab()        { onNewTab()          }
     @objc private func newBrowserTab() { onNewBrowserTab()   }
     @objc private func newWindow()     { onNewWindow()       }
     @objc private func preferences()   { onPreferences()     }
     @objc private func quit()          { NSApp.terminate(nil) }
+
+    @objc private func restoreWindow(_ sender: NSMenuItem) {
+        guard let id = sender.representedObject as? UUID else { return }
+        onRestoreWindow(id)
+    }
 }
