@@ -205,8 +205,14 @@ final class TerminalWindowController: NSObject, NSWindowDelegate {
     }
 
     private func reassertIfPinnedOnActiveSpace() {
-        guard panel.isPinned, panel.isVisible, panel.isOnActiveSpace else { return }
-        panel.orderFrontRegardless()
+        guard panel.isPinned else { return }
+        // When collapsed, the pinned bubble (not the panel) is what's on screen;
+        // nudge whichever one is live so it doesn't drop out during swipes.
+        if isCollapsed, let av = avatar {
+            if av.isOnActiveSpace { av.orderFrontRegardless() }
+        } else if panel.isVisible, panel.isOnActiveSpace {
+            panel.orderFrontRegardless()
+        }
     }
 
     // MARK: - Window placement / visibility
@@ -287,7 +293,9 @@ final class TerminalWindowController: NSObject, NSWindowDelegate {
         avatar = av
         av.onExpand = { [weak self] in self?.expandFromAvatar() }
         av.setFrame(frame, display: false)
-        av.reassertFloatingBehavior()
+        // Inherit the parent window's link state so a linked window's bubble
+        // sticks to the Space it was linked to instead of roaming all Spaces.
+        av.setPinned(panel.isPinned)
         av.orderFrontRegardless()
     }
 

@@ -11,6 +11,11 @@ final class AvatarPanel: NSPanel {
 
     static let diameter: CGFloat = 60
 
+    /// Mirrors the parent window's link state: when true the bubble is bound to
+    /// a single Space (.managed) so it sticks to the Space the window was linked
+    /// to, instead of roaming over all Spaces.
+    private(set) var isPinned = false
+
     init() {
         let size = NSRect(x: 0, y: 0, width: Self.diameter, height: Self.diameter)
         super.init(contentRect: size,
@@ -20,11 +25,10 @@ final class AvatarPanel: NSPanel {
         isOpaque = false
         backgroundColor = .clear
         hasShadow = true
-        level = .statusBar
-        collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .stationary]
         isFloatingPanel = true
         hidesOnDeactivate = false
         isMovableByWindowBackground = false
+        reassertFloatingBehavior()
 
         let content = AvatarContentView(frame: size)
         content.onExpand = { [weak self] in self?.onExpand?() }
@@ -36,7 +40,19 @@ final class AvatarPanel: NSPanel {
 
     func reassertFloatingBehavior() {
         level = .statusBar
-        collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .stationary]
+        if isPinned {
+            // Linked: stick to one Space (matches FloatingPanel's pinned mode).
+            collectionBehavior = [.managed, .fullScreenAuxiliary]
+        } else {
+            collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .stationary]
+        }
+    }
+
+    /// Sets whether the bubble is linked to its current Space (inherited from
+    /// the parent window when it collapses).
+    func setPinned(_ pinned: Bool) {
+        isPinned = pinned
+        reassertFloatingBehavior()
     }
 }
 
