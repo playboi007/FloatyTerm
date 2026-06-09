@@ -98,6 +98,12 @@ final class SettingsWindowController: NSObject {
         recordButton.widthAnchor.constraint(equalToConstant: 200).isActive = true
         stack.addArrangedSubview(row("Toggle hotkey", recordButton))
 
+        // The spawn hotkey is a fixed combo, surfaced here for discoverability.
+        let spawnHint = NSTextField(labelWithString: "Spawn a window on the current Space: ⌥⌘5")
+        spawnHint.font = .systemFont(ofSize: 11)
+        spawnHint.textColor = .secondaryLabelColor
+        stack.addArrangedSubview(spawnHint)
+
         w.contentView?.addSubview(stack)
         if let cv = w.contentView {
             NSLayoutConstraint.activate([

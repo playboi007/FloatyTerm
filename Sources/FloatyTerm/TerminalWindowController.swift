@@ -23,6 +23,19 @@ final class TerminalWindowController: NSObject, NSWindowDelegate {
     /// from the menu-bar "Hidden Windows" list.
     private(set) var isMinimized = false
 
+    /// True while this window is collapsed into its floating avatar bubble.
+    private(set) var isCollapsed = false
+
+    // Avatar (bubble) collapse state.
+    private var avatar: AvatarPanel?
+    private var collapsedSnapshot: NSImage?
+    private var savedFrameForExpand: NSRect = .zero
+    /// Where the cursor sat WITHIN the window when it collapsed (offset from the
+    /// window's bottom-left origin). On expand we place the window so this same
+    /// point — the collapse icon — returns to the bubble, preserving spatial
+    /// awareness instead of re-centering the window on the bubble.
+    private var collapseCursorOffset: NSPoint = .zero
+
     private let root        = WindowDropView()
     private let topBlur     = NSVisualEffectView()   // header + tab strip backdrop (always)
     private let contentBlur = NSVisualEffectView()   // content backdrop (toggleable)
@@ -138,6 +151,8 @@ final class TerminalWindowController: NSObject, NSWindowDelegate {
         header.onNewWindow    = { [weak self] in self?.onNewWindow?() }
         header.onToggleURLBar = { [weak self] in self?.toggleURLBarCollapsed() }
         header.onMinimize     = { [weak self] in self?.minimize() }
+        header.onTogglePin    = { [weak self] in self?.togglePin() }
+        header.onCollapse     = { [weak self] in self?.collapseToAvatar() }
         tabStrip.onSelect     = { [weak self] i in self?.selectTab(i) }
         tabStrip.onCloseTab   = { [weak self] i in self?.closeTab(i) }
 
@@ -154,6 +169,16 @@ final class TerminalWindowController: NSObject, NSWindowDelegate {
             name: Settings.didChange, object: nil
         )
 
+        // When the active Space changes, re-assert a pinned window so it doesn't
+        // intermittently drop out of view during rapid Space swipes (a window-
+        // server quirk with fullScreenAuxiliary windows). Guarded by
+        // isOnActiveSpace so we only nudge it when it actually belongs to the
+        // now-active Space — never pulling it onto a Space it isn't pinned to.
+        NSWorkspace.shared.notificationCenter.addObserver(
+            self, selector: #selector(activeSpaceChanged),
+            name: NSWorkspace.activeSpaceDidChangeNotification, object: nil
+        )
+
         setupFindBar()
         setupRecentPalette()
         setupURLBar()
@@ -164,44 +189,160 @@ final class TerminalWindowController: NSObject, NSWindowDelegate {
 
     deinit {
         NotificationCenter.default.removeObserver(self)
+        NSWorkspace.shared.notificationCenter.removeObserver(self)
+    }
+
+    /// Active Space changed: if this window is pinned and now belongs to the
+    /// active Space, nudge the compositor to re-display it (fixes the temporary
+    /// disappearance after several fullscreen-Space swipes). The second, delayed
+    /// pass catches cases where the window server is still re-attaching the
+    /// auxiliary window when the notification fires.
+    @objc private func activeSpaceChanged() {
+        reassertIfPinnedOnActiveSpace()
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) { [weak self] in
+            self?.reassertIfPinnedOnActiveSpace()
+        }
+    }
+
+    private func reassertIfPinnedOnActiveSpace() {
+        guard panel.isPinned, panel.isVisible, panel.isOnActiveSpace else { return }
+        panel.orderFrontRegardless()
     }
 
     // MARK: - Window placement / visibility
 
-    func setupInitialFrame(cascadeIndex: Int) {
-        panel.restoreSavedFrame()
-        if cascadeIndex > 0 {
-            let offset = CGFloat(cascadeIndex) * 26
-            var f = panel.frame
-            f.origin.x += offset
-            f.origin.y -= offset
-            panel.setFrame(f, display: false)
+    /// Positions a newly-created window.
+    /// - reference: frame of the window currently on the user's Space, if any —
+    ///   the new window cascades from it so it lands where the user is looking.
+    /// - isLaunchWindow: true only for the first window at app launch, which
+    ///   restores the remembered cross-launch frame. Otherwise (a window spawned
+    ///   onto a fresh Space with no reference) it centers on the active screen.
+    func placeInitialFrame(reference: NSRect?, isLaunchWindow: Bool) {
+        if let ref = reference {
+            panel.cascade(from: ref)
+        } else if isLaunchWindow {
+            panel.restoreSavedFrame()
+        } else {
+            panel.restoreSavedFrame()      // adopt remembered size…
+            panel.centerOnActiveScreen()   // …but center on the Space in view
         }
     }
 
     func show() {
         isMinimized = false
-        panel.makeKeyAndOrderFront(nil)
-        NSApp.activate(ignoringOtherApps: true)
+        // Use orderFrontRegardless + makeKey (NOT NSApp.activate) so the panel
+        // appears over another app's fullscreen Space without stealing it. This
+        // is what makes the overlay reliably show over Chrome/Cursor and lets
+        // every window come back together on ⌥⌘7.
+        panel.presentOverlay()
         focusActiveTab()
     }
 
     func hide() {
-        panel.saveFrame()
+        persistFrameIfRoaming()
         panel.orderOut(nil)
+    }
+
+    /// Only unpinned ("roaming") windows write the shared cross-launch frame.
+    /// A pinned window's geometry is Space-specific and must not become the
+    /// default that new/roaming windows restore from.
+    private func persistFrameIfRoaming() {
+        if !panel.isPinned { panel.saveFrame() }
+    }
+
+    // MARK: - Collapse to / expand from the floating avatar bubble
+
+    /// Morphs this window into a small floating avatar bubble (hero transition).
+    /// The session stays alive; double-clicking the bubble expands it back.
+    func collapseToAvatar() {
+        guard !isCollapsed else { return }
+        let termFrame = panel.frame
+        let snapshot = HeroTransition.snapshot(of: root) ?? NSImage(size: termFrame.size)
+        collapsedSnapshot = snapshot
+        savedFrameForExpand = termFrame
+
+        // Bubble lands at the mouse cursor (where the collapse icon was clicked),
+        // clamped on-screen — so the window appears to implode toward the click.
+        let d = AvatarPanel.diameter
+        let mouse = NSEvent.mouseLocation
+        // Remember the cursor's position within the window (the collapse icon)
+        // so expand can return that exact point to the bubble.
+        collapseCursorOffset = NSPoint(x: mouse.x - termFrame.minX,
+                                       y: mouse.y - termFrame.minY)
+        let avatarFrame = panel.clampToVisibleScreen(
+            NSRect(x: mouse.x - d / 2, y: mouse.y - d / 2, width: d, height: d))
+
+        isCollapsed = true
+        persistFrameIfRoaming()
+        panel.orderOut(nil)
+
+        HeroTransition.morph(snapshot: snapshot, from: termFrame, to: avatarFrame,
+                             startRadius: 8, endRadius: d / 2, fadeToGlyph: true) { [weak self] in
+            self?.showAvatar(at: avatarFrame)
+        }
+    }
+
+    private func showAvatar(at frame: NSRect) {
+        let av = avatar ?? AvatarPanel()
+        avatar = av
+        av.onExpand = { [weak self] in self?.expandFromAvatar() }
+        av.setFrame(frame, display: false)
+        av.reassertFloatingBehavior()
+        av.orderFrontRegardless()
+    }
+
+    /// Reverses the collapse: the bubble grows back into the terminal, expanding
+    /// from wherever the user has moved the bubble.
+    func expandFromAvatar() {
+        guard isCollapsed, let av = avatar else { return }
+        let avatarFrame = av.frame
+        let size = savedFrameForExpand.size
+        // Place the window so the collapse-icon point (where the cursor was) lands
+        // at the bubble's center — the window unfolds back to where the eye expects.
+        let center = NSPoint(x: avatarFrame.midX, y: avatarFrame.midY)
+        let raw = NSRect(x: center.x - collapseCursorOffset.x,
+                         y: center.y - collapseCursorOffset.y,
+                         width: size.width, height: size.height)
+        let target = panel.clampToVisibleScreen(raw)
+        let image = collapsedSnapshot ?? HeroTransition.snapshot(of: root) ?? NSImage(size: size)
+        let d = AvatarPanel.diameter
+
+        av.orderOut(nil)
+        HeroTransition.morph(snapshot: image, from: avatarFrame, to: target,
+                             startRadius: d / 2, endRadius: 8, fadeToGlyph: false) { [weak self] in
+            guard let self else { return }
+            self.isCollapsed = false
+            self.panel.setFrame(target, display: false)
+            self.panel.presentOverlay()
+            self.focusActiveTab()
+        }
     }
 
     /// Hides only THIS window (session preserved) and flags it as minimized so
     /// it appears in the menu-bar "Hidden Windows" list for individual restore.
     /// Distinct from the global ⌥⌘7 hide, which hides every window at once.
     func minimize() {
-        panel.saveFrame()
+        persistFrameIfRoaming()
         isMinimized = true
         panel.orderOut(nil)
     }
 
     var isVisible: Bool { panel.isVisible }
     var isKey: Bool { panel.isKeyWindow }
+
+    /// True when this window is linked/pinned to a specific Space.
+    var isPinned: Bool { panel.isPinned }
+
+    /// True when this window currently lives on the Space the user is viewing.
+    var isOnActiveSpace: Bool { panel.isOnActiveSpace }
+
+    /// Toggles whether this window is linked to the current Space. When linked,
+    /// it stays on that Space (with its session) instead of floating over all of
+    /// them; the pin button reflects the new state.
+    private func togglePin() {
+        panel.setPinned(!panel.isPinned)
+        header.setPinned(panel.isPinned)
+    }
 
     /// A short title for menus, taken from the active tab.
     var displayTitle: String {
@@ -584,8 +725,8 @@ final class TerminalWindowController: NSObject, NSWindowDelegate {
 
     func windowDidBecomeKey(_ notification: Notification) { applyAppearance(focused: true)  }
     func windowDidResignKey(_ notification: Notification) { applyAppearance(focused: false) }
-    func windowDidMove(_ notification: Notification)      { panel.saveFrame() }
-    func windowDidResize(_ notification: Notification)    { panel.saveFrame() }
+    func windowDidMove(_ notification: Notification)      { persistFrameIfRoaming() }
+    func windowDidResize(_ notification: Notification)    { persistFrameIfRoaming() }
 
     // MARK: - Recent-commands palette (terminal-only)
 

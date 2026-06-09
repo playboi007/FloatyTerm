@@ -450,6 +450,8 @@ final class HeaderControlsView: DragHandleView {
     var onNewWindow:     () -> Void = {}
     var onToggleURLBar:  () -> Void = {}
     var onMinimize:      () -> Void = {}
+    var onTogglePin:     () -> Void = {}
+    var onCollapse:      () -> Void = {}
 
     /// Set by TerminalWindowController — used when a tab is dropped onto the header.
     weak var tabStripView: TabStripView?
@@ -457,6 +459,8 @@ final class HeaderControlsView: DragHandleView {
     private let urlBarToggleButton = NSButton()
     private let addButton          = NSButton()
     private let newWindowButton    = NSButton()
+    private let pinButton          = NSButton()
+    private let collapseButton     = NSButton()
     private let minimizeButton     = NSButton()
 
     override init(frame frameRect: NSRect) {
@@ -468,6 +472,27 @@ final class HeaderControlsView: DragHandleView {
     private func setup() {
         configure(addButton, glyph: "+", action: #selector(addTapped))
         configure(newWindowButton, glyph: "⧉", action: #selector(newWindowTapped))
+
+        // Pin/link: binds THIS window to the current Space so it stops following
+        // the user across Spaces. Toggles between "pin" and "pin.fill".
+        pinButton.image = NSImage(systemSymbolName: "pin",
+                                  accessibilityDescription: "Pin window to this Space")
+        pinButton.isBordered = false
+        pinButton.contentTintColor = NSColor.white.withAlphaComponent(0.8)
+        pinButton.target = self
+        pinButton.action = #selector(pinTapped)
+        pinButton.toolTip = "Pin this window to the current Space"
+        pinButton.translatesAutoresizingMaskIntoConstraints = false
+
+        // Collapse: morphs THIS window into a small floating avatar bubble.
+        collapseButton.image = NSImage(systemSymbolName: "arrow.down.right.and.arrow.up.left",
+                                       accessibilityDescription: "Collapse to avatar")
+        collapseButton.isBordered = false
+        collapseButton.contentTintColor = NSColor.white.withAlphaComponent(0.8)
+        collapseButton.target = self
+        collapseButton.action = #selector(collapseTapped)
+        collapseButton.toolTip = "Collapse to a floating bubble (double-click the bubble to expand)"
+        collapseButton.translatesAutoresizingMaskIntoConstraints = false
 
         // Minimize: hides THIS window to the menu bar (session preserved).
         // Uses the conventional "minus" glyph (mirrors the macOS yellow button).
@@ -495,6 +520,8 @@ final class HeaderControlsView: DragHandleView {
         addSubview(urlBarToggleButton)
         addSubview(addButton)
         addSubview(newWindowButton)
+        addSubview(pinButton)
+        addSubview(collapseButton)
         addSubview(minimizeButton)
 
         NSLayoutConstraint.activate([
@@ -506,9 +533,17 @@ final class HeaderControlsView: DragHandleView {
             addButton.centerYAnchor.constraint(equalTo: centerYAnchor),
             addButton.widthAnchor.constraint(equalToConstant: 24),
 
-            newWindowButton.trailingAnchor.constraint(equalTo: minimizeButton.leadingAnchor, constant: -4),
+            newWindowButton.trailingAnchor.constraint(equalTo: pinButton.leadingAnchor, constant: -4),
             newWindowButton.centerYAnchor.constraint(equalTo: centerYAnchor),
             newWindowButton.widthAnchor.constraint(equalToConstant: 24),
+
+            pinButton.trailingAnchor.constraint(equalTo: collapseButton.leadingAnchor, constant: -4),
+            pinButton.centerYAnchor.constraint(equalTo: centerYAnchor),
+            pinButton.widthAnchor.constraint(equalToConstant: 24),
+
+            collapseButton.trailingAnchor.constraint(equalTo: minimizeButton.leadingAnchor, constant: -4),
+            collapseButton.centerYAnchor.constraint(equalTo: centerYAnchor),
+            collapseButton.widthAnchor.constraint(equalToConstant: 24),
 
             minimizeButton.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -10),
             minimizeButton.centerYAnchor.constraint(equalTo: centerYAnchor),
@@ -518,6 +553,19 @@ final class HeaderControlsView: DragHandleView {
         // The header also acts as a drop destination for cross-window moves when
         // the tab strip is hidden (single-tab windows).
         registerForDraggedTypes([NSPasteboard.PasteboardType(TabDragRegistry.uti)])
+    }
+
+    /// Reflects the window's pinned/linked state on the pin button.
+    func setPinned(_ pinned: Bool) {
+        pinButton.image = NSImage(
+            systemSymbolName: pinned ? "pin.fill" : "pin",
+            accessibilityDescription: pinned ? "Unpin window" : "Pin window to this Space")
+        pinButton.contentTintColor = pinned
+            ? NSColor.controlAccentColor
+            : NSColor.white.withAlphaComponent(0.8)
+        pinButton.toolTip = pinned
+            ? "Linked to this Space — click to unlink (float over all Spaces)"
+            : "Pin this window to the current Space"
     }
 
     /// Shows/hides the address-bar toggle (only relevant for browser tabs).
@@ -547,6 +595,8 @@ final class HeaderControlsView: DragHandleView {
     @objc private func newWindowTapped()  { onNewWindow()    }
     @objc private func toggleURLBarTapped() { onToggleURLBar() }
     @objc private func minimizeTapped()   { onMinimize()     }
+    @objc private func pinTapped()        { onTogglePin()    }
+    @objc private func collapseTapped()   { onCollapse()     }
 
     // MARK: - NSDraggingDestination overrides (forward to tabStripView)
 

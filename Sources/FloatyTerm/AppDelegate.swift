@@ -1,4 +1,5 @@
 import AppKit
+import Carbon.HIToolbox
 
 final class AppDelegate: NSObject, NSApplicationDelegate {
     private var windows: [TerminalWindowController] = []
@@ -9,7 +10,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationDidFinishLaunching(_ notification: Notification) {
         makeWindow()
 
-        hotKey = HotKey { [weak self] in self?.toggle() }
+        hotKey = HotKey()
+        registerHotKeys()
 
         statusItem.onToggle        = { [weak self] in self?.toggle() }
         statusItem.onNewWindow     = { [weak self] in self?.makeWindow() }
@@ -41,7 +43,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     @objc private func settingsChanged() {
-        hotKey?.reregister()
+        registerHotKeys()
+    }
+
+    /// Registers both global hotkeys:
+    ///  - id 1: the toggle (⌥⌘7 by default, customizable) — localized hide/show.
+    ///  - id 2: spawn-on-this-Space, fixed at ⌥⌘5.
+    /// Re-called whenever Settings change so a rebind of the toggle updates it.
+    private func registerHotKeys() {
+        let code = Settings.shared.hotKeyCode
+        let mods = Settings.shared.hotKeyModifiers
+        hotKey.register(id: 1, keyCode: code, modifiers: mods) { [weak self] in
+            self?.toggle()
+        }
+        hotKey.register(id: 2, keyCode: UInt32(kVK_ANSI_5),
+                        modifiers: UInt32(cmdKey | optionKey)) { [weak self] in
+            self?.spawnOnCurrentSpace()
+        }
     }
 
     // MARK: - Windows
@@ -51,12 +69,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     ///   first terminal tab. Pass nil to use $HOME (the default).
     @discardableResult
     private func makeWindow(initialDirectory: String? = nil) -> TerminalWindowController {
+        let isLaunchWindow = windows.isEmpty
+        // Cascade from the window the user is currently looking at (if any) so a
+        // new window lands where they are — not from a stale shared frame that
+        // might belong to a pinned window on another Space.
+        let reference = isLaunchWindow ? nil : frontWindowFrameOnCurrentSpace()
         let wc = TerminalWindowController(initialDirectory: initialDirectory)
         wireCallbacks(wc)
         windows.append(wc)
-        wc.setupInitialFrame(cascadeIndex: windows.count - 1)
+        wc.placeInitialFrame(reference: reference, isLaunchWindow: isLaunchWindow)
         wc.show()
         return wc
+    }
+
+    /// Frame of the window currently visible on the user's Space, preferring the
+    /// key window. Returns nil when no FloatyTerm window is on the active Space
+    /// (e.g. a fresh Space where all existing windows are pinned elsewhere).
+    private func frontWindowFrameOnCurrentSpace() -> NSRect? {
+        if let key = windows.first(where: { $0.isKey }) { return key.panel.frame }
+        if let here = windows.first(where: isPresentOnCurrentSpace) { return here.panel.frame }
+        return nil
     }
 
     /// Creates a new floating window that starts empty and immediately adopts
@@ -115,15 +147,41 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
+    /// A FloatyTerm window the user can actually see on the CURRENT Space:
+    /// any visible roaming (unpinned, all-Spaces) window, or a pinned window
+    /// that happens to live on the active Space.
+    private func isPresentOnCurrentSpace(_ wc: TerminalWindowController) -> Bool {
+        wc.isVisible && (!wc.isPinned || wc.isOnActiveSpace)
+    }
+
+    /// ⌥⌘7 — a localized toggle for the CURRENT Space. It only hides or shows
+    /// terminals relevant to where the user is; it never spawns (that's ⌥⌘5)
+    /// and never yanks pinned windows bound to other Spaces.
     private func toggle() {
+        // Bootstrap: no windows exist at all → create the first one.
         if windows.isEmpty {
             makeWindow()
             return
         }
-        if windows.contains(where: { $0.isVisible }) {
-            windows.forEach { $0.hide() }     // hide all (sessions preserved)
-        } else {
-            windows.forEach { $0.show() }     // bring them all back
+
+        // If something is already visible on this Space, dismiss only those.
+        // Pinned windows bound to OTHER Spaces are left untouched.
+        if windows.contains(where: isPresentOnCurrentSpace) {
+            windows.filter(isPresentOnCurrentSpace).forEach { $0.hide() }
+            return
         }
+
+        // Nothing here: summon any roaming (unpinned) windows — they join all
+        // Spaces, so they appear right here. Collapsed windows are skipped (they
+        // live in their avatar bubble). If there's nothing to summon, this is
+        // intentionally a no-op: use ⌥⌘5 to spawn one on this Space.
+        windows.filter { !$0.isPinned && !$0.isCollapsed }.forEach { $0.show() }
+    }
+
+    /// ⌥⌘5 — explicitly spawn a fresh window on the current Space, regardless
+    /// of what's pinned elsewhere. Placement cascades from a window already on
+    /// this Space, or centers on the active screen when the Space is empty.
+    private func spawnOnCurrentSpace() {
+        makeWindow()
     }
 }
