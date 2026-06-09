@@ -1,25 +1,27 @@
 import AppKit
 import Carbon.HIToolbox
 
-/// Registers the global toggle hotkey using the Carbon Hot Key API.
+/// Registers global hotkeys using the Carbon Hot Key API.
 ///
 /// We use Carbon on purpose: it does NOT require Accessibility permission,
-/// unlike NSEvent global key monitors. The key combo is read from `Settings`
-/// and can be changed at runtime via `reregister()`.
+/// unlike NSEvent global key monitors. Multiple hotkeys are supported, each
+/// keyed by a small integer `id`; the shared C event handler dispatches to the
+/// matching Swift callback. Key combos come from `Settings` and can change at
+/// runtime — just call `register(...)` again with the same id.
 final class HotKey {
-    private var hotKeyRef: EventHotKeyRef?
+    private var refs: [UInt32: EventHotKeyRef] = [:]
+    private var handlers: [UInt32: () -> Void] = [:]
     private var eventHandler: EventHandlerRef?
-    private let callback: () -> Void
 
     // The Carbon C callback can't capture Swift context, so we route through
     // a single shared instance.
     private static var shared: HotKey?
 
-    init(callback: @escaping () -> Void) {
-        self.callback = callback
+    private let signature: OSType = 0x46544B59 // 'FTKY'
+
+    init() {
         HotKey.shared = self
         installHandler()
-        reregister()
     }
 
     private func installHandler() {
@@ -29,36 +31,43 @@ final class HotKey {
         )
         InstallEventHandler(
             GetApplicationEventTarget(),
-            { (_, _, _) -> OSStatus in
-                HotKey.shared?.callback()
+            { (_, event, _) -> OSStatus in
+                guard let event else { return noErr }
+                var hkID = EventHotKeyID()
+                GetEventParameter(
+                    event, EventParamName(kEventParamDirectObject),
+                    EventParamType(typeEventHotKeyID), nil,
+                    MemoryLayout<EventHotKeyID>.size, nil, &hkID
+                )
+                HotKey.shared?.fire(id: hkID.id)
                 return noErr
             },
-            1,
-            &eventType,
-            nil,
-            &eventHandler
+            1, &eventType, nil, &eventHandler
         )
     }
 
-    /// (Re)registers the hotkey using the current `Settings` values.
-    func reregister() {
-        if let existing = hotKeyRef {
+    /// Registers (or replaces) the hotkey stored under `id`.
+    func register(id: UInt32, keyCode: UInt32, modifiers: UInt32, action: @escaping () -> Void) {
+        if let existing = refs[id] {
             UnregisterEventHotKey(existing)
-            hotKeyRef = nil
+            refs[id] = nil
         }
-        let hotKeyID = EventHotKeyID(signature: OSType(0x46544B59), id: 1) // 'FTKY'
+        handlers[id] = action
+        var ref: EventHotKeyRef?
+        let hotKeyID = EventHotKeyID(signature: signature, id: id)
         RegisterEventHotKey(
-            Settings.shared.hotKeyCode,
-            Settings.shared.hotKeyModifiers,
-            hotKeyID,
-            GetApplicationEventTarget(),
-            0,
-            &hotKeyRef
+            keyCode, modifiers, hotKeyID,
+            GetApplicationEventTarget(), 0, &ref
         )
+        refs[id] = ref
+    }
+
+    private func fire(id: UInt32) {
+        handlers[id]?()
     }
 
     deinit {
-        if let hotKeyRef { UnregisterEventHotKey(hotKeyRef) }
+        for (_, ref) in refs { UnregisterEventHotKey(ref) }
         if let eventHandler { RemoveEventHandler(eventHandler) }
     }
 }
