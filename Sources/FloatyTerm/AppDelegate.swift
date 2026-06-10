@@ -375,8 +375,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// "send it back" works at the TAB level: when the session's window is
     /// pinned to another Space, we borrow the tab into a window here while the
     /// source window stays where it is — the header's return arrow re-merges
-    /// the tab into it. A pinned window down to its last tab travels whole
-    /// (it unpins; re-pin it wherever it should live next).
+    /// the tab into it. A single-tab window LENDS its session instead: it
+    /// stays behind empty (bubble / ticker / placeholder panel), keeping its
+    /// pin, Space, and frame, so Return restores everything exactly as it was.
     private func summon(_ entry: SessionEntry) {
         guard let wc = entry.window,
               windows.contains(where: { $0 === wc }),
@@ -404,25 +405,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             return
         }
 
+        // Borrow the tab into a window on this Space. The source window never
+        // moves: with other tabs it keeps living normally; with only this one
+        // it LENDS it, staying behind empty (still pinned, still collapsed /
+        // tickered / minimized, however it was) as the permanent home the
+        // Return arrow sends the tab back to. Either way the arrow shows.
         if wc.tabs.count >= 2 {
-            // Borrow the tab into a window on this Space. The source keeps its
-            // other tabs and survives on its own Space (still collapsed /
-            // tickered / minimized, however it was) — so the Return arrow has
-            // a permanent target (it must never be ephemeral).
             wc.releaseTab(tab)
-            let borrower = makeWindowAdopting(tab, at: .zero)
-            if let frame = summonTargetFrame(size: borrower.panel.frame.size) {
-                borrower.panel.setFrame(frame, display: false)
-            }
-            if windows.contains(where: { $0 === wc }), !wc.tabs.isEmpty {
-                borrower.markBorrowed(tab, from: wc)
-            }
-        } else {
-            // Last tab: borrowing would close the source, leaving Return with
-            // nothing to return to — bring the whole window instead. Handles
-            // pinned+collapsed / pinned+ticker / pinned+minimized / ghosted.
-            wc.selectTab(at: idx)
-            wc.unpinAndSummon(at: summonTargetFrame(size: wc.currentContentSize))
+        } else if wc.lendOnlyTab() == nil {
+            return
+        }
+        let borrower = makeWindowAdopting(tab, at: .zero)
+        if let frame = summonTargetFrame(size: borrower.panel.frame.size) {
+            borrower.panel.setFrame(frame, display: false)
+        }
+        if windows.contains(where: { $0 === wc }) {
+            borrower.markBorrowed(tab, from: wc)
         }
     }
 

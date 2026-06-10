@@ -758,9 +758,13 @@ final class HeaderControlsView: DragHandleView, NSMenuDelegate {
         urlBarToggleButton.isHidden = !visible
     }
 
-    /// Shows/hides the return-borrowed-tab button.
-    func setReturnVisible(_ visible: Bool) {
+    /// Shows/hides the return-borrowed-tab button. `hint` names where the tab
+    /// goes home to (e.g. its window on the Chrome Space).
+    func setReturnVisible(_ visible: Bool, hint: String? = nil) {
         returnButton.isHidden = !visible
+        if visible {
+            returnButton.toolTip = hint ?? "Return this tab to the window it came from"
+        }
     }
 
     /// Reflects whether the address bar is currently expanded.

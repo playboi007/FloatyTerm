@@ -106,6 +106,17 @@ final class TerminalWindowController: NSObject, NSWindowDelegate {
     }
     private var borrows: [BorrowRecord] = []
 
+    /// True while this window's ONLY tab is borrowed away (session-switcher
+    /// summon of a single-tab pinned window). The window stays alive on its
+    /// Space — bubble, ticker strip, or an empty panel with a note — as the
+    /// anchor the Return arrow sends the tab home to. Cleared by `insertTab`
+    /// (the tab coming home, or any new tab opened here).
+    private(set) var isLent = false
+    /// Weak ref to the lent-away tab: when it deallocates (closed at the
+    /// borrower instead of returned), the empty husk reaps itself.
+    private weak var lentTab: (any TabContent)?
+    private var lentPlaceholder: NSTextField?
+
     var onNewWindow:       (() -> Void)?
     var onClosed:          ((TerminalWindowController) -> Void)?
     var onOpenPreferences: (() -> Void)?
@@ -573,10 +584,6 @@ final class TerminalWindowController: NSObject, NSWindowDelegate {
         return nil
     }
 
-    /// The window's content size for summon placement, valid in every state
-    /// (a collapsed/tickered window's panel frame is stale; use the saved one).
-    var currentContentSize: NSSize { persistableFrame.size }
-
     /// Toggles whether this window is linked to the current Space. When linked,
     /// it stays on that Space (with its session) instead of floating over all of
     /// them; the pin button reflects the new state.
@@ -793,6 +800,14 @@ final class TerminalWindowController: NSObject, NSWindowDelegate {
     }
 
     private func insertTab(_ tab: any TabContent) {
+        // A tab arriving — the lent one coming home, or a fresh one — means
+        // this window is a real session host again, not a waiting husk.
+        if isLent {
+            isLent = false
+            lentTab = nil
+            lentPlaceholder?.removeFromSuperview()
+            lentPlaceholder = nil
+        }
         let v = tab.view
         v.translatesAutoresizingMaskIntoConstraints = false
         contentArea.addSubview(v)
@@ -850,6 +865,11 @@ final class TerminalWindowController: NSObject, NSWindowDelegate {
         if index == activeIndex && isURLBarVisible   { hideURLBar()        }
         let tab = tabs.remove(at: index)
         closeReaderIfNeeded(forClosing: tab)
+        // If this tab was lent here by a window that gave up its ONLY session,
+        // that husk now waits for nothing — close it along with the tab.
+        if let lender = borrowSource(for: tab), lender.isLent, lender.tabs.isEmpty {
+            lender.panel.close()
+        }
         clearBorrow(for: tab)
         tab.view.removeFromSuperview()
         tab.cleanup()
@@ -962,6 +982,13 @@ final class TerminalWindowController: NSObject, NSWindowDelegate {
     /// Timer tick: refresh chip labels/dots, the ticker strip, and the bubble
     /// badge. Skipped when nothing of this window is on screen.
     private func refreshActivity() {
+        // Husk self-reap: the lent-away tab died with its borrower (closed
+        // instead of returned), so nothing can ever come home — don't strand
+        // an empty shell on its Space.
+        if isLent, lentTab == nil {
+            panel.close()
+            return
+        }
         if isTicker {
             refreshTicker()
             return
@@ -1036,10 +1063,14 @@ final class TerminalWindowController: NSObject, NSWindowDelegate {
     }
 
     /// Shows the header's return arrow only while the ACTIVE tab is borrowed
-    /// and its source window still exists.
+    /// and its source window still exists. The tooltip names where home is.
     private func updateReturnButton() {
         let active = tabs.indices.contains(activeIndex) ? tabs[activeIndex] : nil
-        header.setReturnVisible(active.flatMap { borrowSource(for: $0) } != nil)
+        let source = active.flatMap { borrowSource(for: $0) }
+        let hint = source?.pinnedAppName.map {
+            "Return this tab to its window on the \($0) Space"
+        }
+        header.setReturnVisible(source != nil, hint: hint)
     }
 
     /// True when `tab` was borrowed here and its source window still exists.
@@ -1071,32 +1102,52 @@ final class TerminalWindowController: NSObject, NSWindowDelegate {
     /// Selects a tab by index (public entry for the session switcher).
     func selectTab(at index: Int) { selectTab(index) }
 
-    /// Brings the WHOLE window to the user's current Space — used when
-    /// summoning the only tab of a pinned window (nothing would remain on the
-    /// source Space, so borrowing is wrong: the Return arrow must never point
-    /// at a dead source). Handles every combined state: unpins panel + bubble
-    /// + ticker strip, un-ghosts, expands collapsed/tickered windows, and
-    /// un-minimizes — landing at `targetFrame` when given (the summon grid
-    /// point). Re-pin to link it to a Space again.
-    func unpinAndSummon(at targetFrame: NSRect? = nil) {
-        if panel.isPinned {
-            panel.setPinned(false)
-            header.setPinned(false)
-            pinnedAppName = nil
+    /// Lends this window's ONLY tab to a borrower on the user's Space. Unlike
+    /// `releaseTab`, the emptied window does NOT close: it stays behind on its
+    /// own Space — still pinned, still collapsed / tickered / ghosted, exactly
+    /// as it was — so the borrower's Return arrow has a permanent home to send
+    /// the tab back to. Pin state, the pinned-over app name, frame, and avatar
+    /// style all survive untouched; an expanded panel shows a note instead of
+    /// a dead content area. An existing borrow record on the tab is kept, so
+    /// chained returns (A → B → C) unwind one hop at a time.
+    func lendOnlyTab() -> (any TabContent)? {
+        guard tabs.count == 1, let tab = tabs.first else { return nil }
+        if isFindBarVisible { hideFindBar()       }
+        if isPaletteVisible { hideRecentPalette() }
+        if isURLBarVisible  { hideURLBar()        }
+        hideSelectionBar()
+        closeReaderIfNeeded(forClosing: tab)
+        tab.view.removeFromSuperview()
+        tabs.removeAll()
+        activeIndex = 0
+        isLent = true
+        lentTab = tab
+        showLentPlaceholder()
+        refreshTabStrip()
+        updateViewedFlags()
+        updateReturnButton()
+        return tab
+    }
+
+    private func showLentPlaceholder() {
+        if lentPlaceholder == nil {
+            let label = NSTextField(wrappingLabelWithString:
+                "Session lent to another Space — press ↩ there to send it home.")
+            label.alignment = .center
+            label.font = .systemFont(ofSize: 12)
+            label.textColor = .secondaryLabelColor
+            label.isSelectable = false
+            label.translatesAutoresizingMaskIntoConstraints = false
+            contentArea.addSubview(label)
+            NSLayoutConstraint.activate([
+                label.centerXAnchor.constraint(equalTo: contentArea.centerXAnchor),
+                label.centerYAnchor.constraint(equalTo: contentArea.centerYAnchor),
+                label.widthAnchor.constraint(lessThanOrEqualTo: contentArea.widthAnchor,
+                                             constant: -32)
+            ])
+            lentPlaceholder = label
         }
-        avatar?.setPinned(false)
-        ticker?.setPinned(false)
-        if isGhosted { setGhosted(false) }
-        if isCollapsed {
-            expandFromAvatar(to: targetFrame)
-        } else if isTicker {
-            expandFromTicker(to: targetFrame)
-        } else {
-            if let targetFrame {
-                panel.setFrame(panel.clampToVisibleScreen(targetFrame), display: false)
-            }
-            show()   // also clears isMinimized
-        }
+        lentPlaceholder?.isHidden = false
     }
 
     // MARK: - One-time browser resource notice
