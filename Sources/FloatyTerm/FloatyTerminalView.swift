@@ -24,6 +24,18 @@ final class FloatyTerminalView: LocalProcessTerminalView {
         registerDragTypes()
     }
 
+    // MARK: - Output hook
+
+    /// Fired with the raw bytes whenever the shell produces output (pty →
+    /// view). TerminalController uses it for "unseen output" tracking and the
+    /// ticker's live last-line.
+    var onOutput: ((ArraySlice<UInt8>) -> Void)?
+
+    override func dataReceived(slice: ArraySlice<UInt8>) {
+        super.dataReceived(slice: slice)
+        onOutput?(slice)
+    }
+
     // MARK: - Window-drag guard
 
     /// The terminal area must never move the window; text selection and input
@@ -67,7 +79,9 @@ final class FloatyTerminalView: LocalProcessTerminalView {
         case "c":
             // Only intercept ⌘C when text is actually selected, so we never
             // clobber the clipboard with an empty string when nothing is picked.
-            if selectedRange().length > 0 {
+            // Must use SwiftTerm's selection state — selectedRange() is the
+            // NSTextInputClient (IME marked-text) range, not the mouse selection.
+            if hasSelection {
                 copy(self)
                 return true
             }

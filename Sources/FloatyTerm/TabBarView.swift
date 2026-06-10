@@ -121,10 +121,17 @@ private final class PassthroughTextField: NSTextField {
 /// points from the mouseDown location starts a tab-drag session; a pointer
 /// movement below that threshold (or no movement) is a normal click-to-select.
 final class TabChip: NSView, NSDraggingSource {
+    private let statusDot = NSView()
     private let titleLabel = PassthroughTextField(labelWithString: "")
     private let closeButton = NSButton()
     var onSelect: () -> Void = {}
     var onClose:  () -> Void = {}
+    var onRename: () -> Void = {}
+    var onReturn: () -> Void = {}
+
+    /// True when this chip's tab is borrowed (offers "Return to Original
+    /// Window" in the context menu).
+    private var canReturn = false
 
     // Set by TabStripView so the chip knows what to put in the registry.
     var tabIndex: Int = 0
@@ -139,17 +146,17 @@ final class TabChip: NSView, NSDraggingSource {
     private var mouseDownEvent: NSEvent?
     private var dragStarted = false
 
-    init(title: String, active: Bool) {
+    init(title: String, active: Bool, status: SessionStatus = .idle) {
         super.init(frame: .zero)
         wantsLayer = true
         layer?.cornerRadius = 5
-        layer?.backgroundColor = active
-            ? NSColor.white.withAlphaComponent(0.20).cgColor
-            : NSColor.white.withAlphaComponent(0.06).cgColor
 
-        titleLabel.stringValue = title
+        statusDot.wantsLayer = true
+        statusDot.layer?.cornerRadius = 3
+        statusDot.translatesAutoresizingMaskIntoConstraints = false
+
         titleLabel.font = .systemFont(ofSize: 11)
-        titleLabel.textColor = active ? .white : NSColor.white.withAlphaComponent(0.7)
+        update(title: title, active: active, status: status)
         titleLabel.lineBreakMode = .byTruncatingTail
         titleLabel.isBordered = false
         titleLabel.drawsBackground = false
@@ -165,13 +172,19 @@ final class TabChip: NSView, NSDraggingSource {
         closeButton.action = #selector(closeTapped)
         closeButton.translatesAutoresizingMaskIntoConstraints = false
 
+        addSubview(statusDot)
         addSubview(titleLabel)
         addSubview(closeButton)
 
         NSLayoutConstraint.activate([
             heightAnchor.constraint(equalToConstant: 24),
 
-            titleLabel.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 8),
+            statusDot.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 7),
+            statusDot.centerYAnchor.constraint(equalTo: centerYAnchor),
+            statusDot.widthAnchor.constraint(equalToConstant: 6),
+            statusDot.heightAnchor.constraint(equalToConstant: 6),
+
+            titleLabel.leadingAnchor.constraint(equalTo: statusDot.trailingAnchor, constant: 5),
             titleLabel.centerYAnchor.constraint(equalTo: centerYAnchor),
             titleLabel.widthAnchor.constraint(lessThanOrEqualToConstant: 140),
 
@@ -184,7 +197,45 @@ final class TabChip: NSView, NSDraggingSource {
 
     required init?(coder: NSCoder) { fatalError() }
 
+    /// Refreshes the chip's label, active styling, and status dot in place —
+    /// used by the strip's diffing reload so updates don't recreate chips.
+    func update(title: String, active: Bool, status: SessionStatus, canReturn: Bool = false) {
+        titleLabel.stringValue = title
+        titleLabel.textColor = active ? .white : NSColor.white.withAlphaComponent(0.7)
+        layer?.backgroundColor = active
+            ? NSColor.white.withAlphaComponent(0.20).cgColor
+            : NSColor.white.withAlphaComponent(0.06).cgColor
+        statusDot.layer?.backgroundColor = status.color.cgColor
+        self.canReturn = canReturn
+        toolTip = title
+    }
+
     @objc private func closeTapped()  { onClose()  }
+
+    // MARK: - Context menu (rename / close)
+
+    override func menu(for event: NSEvent) -> NSMenu? {
+        let menu = NSMenu(title: "Tab")
+        let rename = NSMenuItem(title: "Rename Tab…", action: #selector(renameTapped), keyEquivalent: "")
+        rename.target = self
+        menu.addItem(rename)
+        if canReturn {
+            let ret = NSMenuItem(title: "Return to Original Window",
+                                 action: #selector(returnFromMenu), keyEquivalent: "")
+            ret.target = self
+            ret.image = NSImage(systemSymbolName: "arrow.uturn.left", accessibilityDescription: nil)
+            menu.addItem(ret)
+        }
+        menu.addItem(.separator())
+        let close = NSMenuItem(title: "Close Tab", action: #selector(closeFromMenu), keyEquivalent: "")
+        close.target = self
+        menu.addItem(close)
+        return menu
+    }
+
+    @objc private func renameTapped()  { onRename() }
+    @objc private func returnFromMenu() { onReturn() }
+    @objc private func closeFromMenu() { onClose()  }
 
     // MARK: - Mouse tracking for drag-vs-click disambiguation
 
@@ -310,6 +361,15 @@ private final class DragHandleClipView: NSClipView {
 final class TabStripView: DragHandleView, TabChipDragDelegate {
     var onSelect:     (Int) -> Void = { _ in }
     var onCloseTab:   (Int) -> Void = { _ in }
+    var onRenameTab:  (Int) -> Void = { _ in }
+    var onReturnTab:  (Int) -> Void = { _ in }
+
+    /// One row of strip data: what a chip shows.
+    struct Item {
+        let title: String
+        let status: SessionStatus
+        var canReturn: Bool = false
+    }
 
     /// Set by TerminalWindowController so we can call releaseTab/adoptTab.
     weak var windowController: TerminalWindowController?
@@ -349,23 +409,60 @@ final class TabStripView: DragHandleView, TabChipDragDelegate {
             scroll.trailingAnchor.constraint(equalTo: trailingAnchor),
             stack.heightAnchor.constraint(equalTo: scroll.heightAnchor)
         ])
-        // Note: the drop destination is the whole-window WindowDropView (root),
-        // not this strip — the strip is hidden for single-tab windows. The strip
-        // remains the drag SOURCE (via TabChip) only.
+        // The strip is a drop destination of its own (it sits above the
+        // whole-window WindowDropView in hit-testing): a SAME-window drop here
+        // reorders tabs; a cross-window drop merges, same as dropping anywhere
+        // else on the window. Single-tab windows hide the strip, so the
+        // whole-window destination still covers that case.
+        registerForDraggedTypes([NSPasteboard.PasteboardType(TabDragRegistry.uti)])
     }
 
-    func reload(titles: [String], activeIndex: Int) {
+    func reload(items: [Item], activeIndex: Int) {
+        // Same chip count (the common case: a title/status change or a tab
+        // switch): update chips in place. Rebuilding on every shell-title
+        // update is wasted work and destroys a chip that may be mid-drag.
+        let existing = stack.arrangedSubviews.compactMap { $0 as? TabChip }
+        if existing.count == items.count {
+            for (index, item) in items.enumerated() {
+                existing[index].update(title: item.title.isEmpty ? "Tab \(index + 1)" : item.title,
+                                       active: index == activeIndex,
+                                       status: item.status,
+                                       canReturn: item.canReturn)
+                existing[index].tabIndex = index
+            }
+            return
+        }
+
         stack.arrangedSubviews.forEach {
             stack.removeArrangedSubview($0)
             $0.removeFromSuperview()
         }
-        for (index, title) in titles.enumerated() {
-            let chip = TabChip(title: title.isEmpty ? "Tab \(index + 1)" : title,
-                               active: index == activeIndex)
+        for (index, item) in items.enumerated() {
+            let chip = TabChip(title: item.title.isEmpty ? "Tab \(index + 1)" : item.title,
+                               active: index == activeIndex,
+                               status: item.status)
+            chip.update(title: item.title.isEmpty ? "Tab \(index + 1)" : item.title,
+                        active: index == activeIndex,
+                        status: item.status,
+                        canReturn: item.canReturn)
             chip.tabIndex = index
             chip.dragDelegate = self
-            chip.onSelect = { [weak self] in self?.onSelect(index) }
-            chip.onClose  = { [weak self] in self?.onCloseTab(index) }
+            chip.onSelect = { [weak self, weak chip] in
+                guard let self, let chip else { return }
+                self.onSelect(chip.tabIndex)
+            }
+            chip.onClose  = { [weak self, weak chip] in
+                guard let self, let chip else { return }
+                self.onCloseTab(chip.tabIndex)
+            }
+            chip.onRename = { [weak self, weak chip] in
+                guard let self, let chip else { return }
+                self.onRenameTab(chip.tabIndex)
+            }
+            chip.onReturn = { [weak self, weak chip] in
+                guard let self, let chip else { return }
+                self.onReturnTab(chip.tabIndex)
+            }
             stack.addArrangedSubview(chip)
         }
     }
@@ -389,6 +486,15 @@ final class TabStripView: DragHandleView, TabChipDragDelegate {
             return
         }
         TabDragRegistry.shared.remove(token: token)
+
+        // Dropped back onto the SOURCE window (which rejects its own tab so it
+        // doesn't count as a destination): that's a cancelled drag, not a
+        // tear-off. Without this, a 6-pt wiggle on a chip click would detach
+        // the tab into a brand-new window.
+        if let sourcePanel = entry.sourceController?.panel,
+           sourcePanel.frame.contains(screenPoint) {
+            return
+        }
 
         // Tear-off: first remove the tab from the source window (so its strip
         // and tabs array no longer hold it), THEN hand it to a new window.
@@ -428,12 +534,26 @@ final class TabStripView: DragHandleView, TabChipDragDelegate {
             // Cross-window move.
             sourceWC.releaseTab(tab)
             destWC.adoptTab(tab)
+            return true
         }
-        // If same window, we could implement reorder here — skipped for now.
+
+        // Same-window drop on the strip → reorder to the drop position.
+        if let from = destWC.tabs.firstIndex(where: { $0 === tab }) {
+            var to = dropTargetIndex(for: sender)
+            if to > from { to -= 1 }   // account for the removal before insert
+            destWC.moveTab(from: from, to: to)
+        }
         return true
     }
 
     // MARK: - Helpers
+
+    /// The insertion slot for a drop at the sender's pointer location: the
+    /// number of chips whose horizontal midpoint lies left of the pointer.
+    private func dropTargetIndex(for sender: NSDraggingInfo) -> Int {
+        let p = stack.convert(sender.draggingLocation, from: nil)
+        return stack.arrangedSubviews.filter { $0.frame.midX < p.x }.count
+    }
 
     private func tokenFromSender(_ sender: NSDraggingInfo) -> String? {
         sender.draggingPasteboard.string(
@@ -445,17 +565,27 @@ final class TabStripView: DragHandleView, TabChipDragDelegate {
 
 /// The controls in the top header strip: a URL-bar toggle (browser tabs only),
 /// "＋" (new tab) and "⧉" (new window).
-final class HeaderControlsView: DragHandleView {
+final class HeaderControlsView: DragHandleView, NSMenuDelegate {
     var onAddTab:        () -> Void = {}
     var onNewWindow:     () -> Void = {}
     var onToggleURLBar:  () -> Void = {}
     var onMinimize:      () -> Void = {}
     var onTogglePin:     () -> Void = {}
     var onCollapse:      () -> Void = {}
+    var onCollapseTicker: () -> Void = {}
+    var onGhost:         () -> Void = {}
+    var onReturnTab:     () -> Void = {}
+    /// Context Snap: capture what's behind the window. `asText` = OCR variant.
+    var onSnap:          (_ asText: Bool) -> Void = { _ in }
+    /// Populates the camera button's right-click history menu.
+    var onBuildSnapMenu: ((NSMenu) -> Void)?
 
     /// Set by TerminalWindowController — used when a tab is dropped onto the header.
     weak var tabStripView: TabStripView?
 
+    private let snapButton         = NSButton()
+    private let returnButton       = NSButton()
+    private let ghostButton        = NSButton()
     private let urlBarToggleButton = NSButton()
     private let addButton          = NSButton()
     private let newWindowButton    = NSButton()
@@ -491,7 +621,7 @@ final class HeaderControlsView: DragHandleView {
         collapseButton.contentTintColor = NSColor.white.withAlphaComponent(0.8)
         collapseButton.target = self
         collapseButton.action = #selector(collapseTapped)
-        collapseButton.toolTip = "Collapse to a floating bubble (double-click the bubble to expand)"
+        collapseButton.toolTip = "Collapse to a floating bubble · ⌥-click for a live ticker strip"
         collapseButton.translatesAutoresizingMaskIntoConstraints = false
 
         // Minimize: hides THIS window to the menu bar (session preserved).
@@ -517,6 +647,49 @@ final class HeaderControlsView: DragHandleView {
         urlBarToggleButton.isHidden = true
         urlBarToggleButton.translatesAutoresizingMaskIntoConstraints = false
 
+        // Return: visible only when the ACTIVE tab was borrowed from another
+        // window via the session switcher; sends it back to its source window
+        // (which never left its Space).
+        returnButton.image = NSImage(systemSymbolName: "arrow.uturn.left",
+                                     accessibilityDescription: "Return tab to its original window")
+        returnButton.isBordered = false
+        returnButton.contentTintColor = NSColor.controlAccentColor
+        returnButton.target = self
+        returnButton.action = #selector(returnTapped)
+        returnButton.toolTip = "Return this tab to the window it came from"
+        returnButton.isHidden = true
+        returnButton.translatesAutoresizingMaskIntoConstraints = false
+
+        // Ghost: click-through + faded, for watching logs over another app.
+        // One-way from here — a ghosted window can't be clicked, so it's
+        // restored from the menu-bar icon (or by summoning via ⌥⌘K).
+        ghostButton.image = NSImage(systemSymbolName: "eye.slash",
+                                    accessibilityDescription: "Ghost window (click-through)")
+        ghostButton.isBordered = false
+        ghostButton.contentTintColor = NSColor.white.withAlphaComponent(0.8)
+        ghostButton.target = self
+        ghostButton.action = #selector(ghostTapped)
+        ghostButton.toolTip = "Ghost: click-through & faded — restore from the menu-bar icon"
+        ghostButton.translatesAutoresizingMaskIntoConstraints = false
+
+        // Context Snap: photograph what this window is overlaying and type the
+        // snapshot's path into the prompt, so the terminal agent can read it.
+        snapButton.image = NSImage(systemSymbolName: "camera.viewfinder",
+                                   accessibilityDescription: "Snap what's behind this window")
+        snapButton.isBordered = false
+        snapButton.contentTintColor = NSColor.white.withAlphaComponent(0.8)
+        snapButton.target = self
+        snapButton.action = #selector(snapTapped)
+        snapButton.toolTip = "Snap what's behind (drag to pick a region) · ⌥-click for OCR text · right-click for history"
+        snapButton.translatesAutoresizingMaskIntoConstraints = false
+        // Right-click → history of previous snaps (rebuilt on each open).
+        let history = NSMenu(title: "Snaps")
+        history.delegate = self
+        snapButton.menu = history
+
+        addSubview(snapButton)
+        addSubview(returnButton)
+        addSubview(ghostButton)
         addSubview(urlBarToggleButton)
         addSubview(addButton)
         addSubview(newWindowButton)
@@ -525,6 +698,18 @@ final class HeaderControlsView: DragHandleView {
         addSubview(minimizeButton)
 
         NSLayoutConstraint.activate([
+            snapButton.trailingAnchor.constraint(equalTo: returnButton.leadingAnchor, constant: -6),
+            snapButton.centerYAnchor.constraint(equalTo: centerYAnchor),
+            snapButton.widthAnchor.constraint(equalToConstant: 24),
+
+            returnButton.trailingAnchor.constraint(equalTo: ghostButton.leadingAnchor, constant: -6),
+            returnButton.centerYAnchor.constraint(equalTo: centerYAnchor),
+            returnButton.widthAnchor.constraint(equalToConstant: 24),
+
+            ghostButton.trailingAnchor.constraint(equalTo: urlBarToggleButton.leadingAnchor, constant: -6),
+            ghostButton.centerYAnchor.constraint(equalTo: centerYAnchor),
+            ghostButton.widthAnchor.constraint(equalToConstant: 24),
+
             urlBarToggleButton.trailingAnchor.constraint(equalTo: addButton.leadingAnchor, constant: -6),
             urlBarToggleButton.centerYAnchor.constraint(equalTo: centerYAnchor),
             urlBarToggleButton.widthAnchor.constraint(equalToConstant: 24),
@@ -573,6 +758,11 @@ final class HeaderControlsView: DragHandleView {
         urlBarToggleButton.isHidden = !visible
     }
 
+    /// Shows/hides the return-borrowed-tab button.
+    func setReturnVisible(_ visible: Bool) {
+        returnButton.isHidden = !visible
+    }
+
     /// Reflects whether the address bar is currently expanded.
     func setURLBarToggleActive(_ active: Bool) {
         urlBarToggleButton.contentTintColor = active
@@ -596,7 +786,28 @@ final class HeaderControlsView: DragHandleView {
     @objc private func toggleURLBarTapped() { onToggleURLBar() }
     @objc private func minimizeTapped()   { onMinimize()     }
     @objc private func pinTapped()        { onTogglePin()    }
-    @objc private func collapseTapped()   { onCollapse()     }
+    @objc private func ghostTapped()      { onGhost()        }
+    @objc private func returnTapped()     { onReturnTab()    }
+
+    @objc private func snapTapped() {
+        let asText = NSApp.currentEvent?.modifierFlags.contains(.option) == true
+        onSnap(asText)
+    }
+
+    // MARK: - NSMenuDelegate (snap history)
+
+    func menuNeedsUpdate(_ menu: NSMenu) {
+        onBuildSnapMenu?(menu)
+    }
+
+    /// Plain click → avatar bubble; ⌥-click → one-line ticker strip.
+    @objc private func collapseTapped() {
+        if NSApp.currentEvent?.modifierFlags.contains(.option) == true {
+            onCollapseTicker()
+        } else {
+            onCollapse()
+        }
+    }
 
     // MARK: - NSDraggingDestination overrides (forward to tabStripView)
 

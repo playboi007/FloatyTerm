@@ -1,4 +1,5 @@
 import AppKit
+import Carbon.HIToolbox
 
 /// The menu-bar (status) item. Since FloatyTerm has no Dock icon, this is the
 /// visible home for New Window / New Tab / Preferences / Quit — and the place
@@ -19,6 +20,13 @@ final class StatusItemController: NSObject, NSMenuDelegate {
 
     /// Restores (un-minimizes) the window with the given id.
     var onRestoreWindow: (UUID) -> Void = { _ in }
+
+    /// Returns the currently-ghosted (click-through) windows. They can't be
+    /// clicked directly, so this menu is their primary restore path.
+    var ghostedWindowsProvider: () -> [(id: UUID, title: String)] = { [] }
+
+    /// Un-ghosts the window with the given id.
+    var onUnghostWindow: (UUID) -> Void = { _ in }
 
     override init() {
         super.init()
@@ -48,8 +56,11 @@ final class StatusItemController: NSObject, NSMenuDelegate {
     private func rebuild() {
         menu.removeAllItems()
 
+        // Mirror the user's actual toggle hotkey (it's rebindable), instead of
+        // a hardcoded ⌥⌘7 that goes stale after a rebind.
+        let (toggleKey, toggleMods) = Self.toggleKeyEquivalent()
         menu.addItem(makeItem("Show / Hide", action: #selector(toggle),
-                              key: "7", mods: [.command, .option]))
+                              key: toggleKey, mods: toggleMods))
 
         // Section: individually-minimized windows, each restorable on its own.
         let hidden = hiddenWindowsProvider()
@@ -69,6 +80,24 @@ final class StatusItemController: NSObject, NSMenuDelegate {
             }
         }
 
+        // Section: ghosted (click-through) windows — restorable only from here.
+        let ghosted = ghostedWindowsProvider()
+        if !ghosted.isEmpty {
+            menu.addItem(.separator())
+            let header = NSMenuItem(title: "Ghosted Windows", action: nil, keyEquivalent: "")
+            header.isEnabled = false
+            menu.addItem(header)
+            for win in ghosted {
+                let it = NSMenuItem(title: win.title,
+                                    action: #selector(unghostWindow(_:)), keyEquivalent: "")
+                it.target = self
+                it.representedObject = win.id
+                it.image = NSImage(systemSymbolName: "eye",
+                                   accessibilityDescription: nil)
+                menu.addItem(it)
+            }
+        }
+
         menu.addItem(.separator())
         menu.addItem(makeItem("New Terminal Tab", action: #selector(newTab),
                               key: "t", mods: [.command]))
@@ -82,6 +111,20 @@ final class StatusItemController: NSObject, NSMenuDelegate {
         menu.addItem(.separator())
         menu.addItem(makeItem("Quit FloatyTerm", action: #selector(quit),
                               key: "q", mods: [.command]))
+    }
+
+    /// Derives the menu key-equivalent for the toggle from Settings: the key
+    /// character comes from the display string ("⌥⌘7" → "7"), the modifiers
+    /// from the stored Carbon mask.
+    private static func toggleKeyEquivalent() -> (String, NSEvent.ModifierFlags) {
+        let key = Settings.shared.hotKeyDisplay.last.map { String($0).lowercased() } ?? "7"
+        let carbon = Settings.shared.hotKeyModifiers
+        var mods: NSEvent.ModifierFlags = []
+        if carbon & UInt32(cmdKey)     != 0 { mods.insert(.command) }
+        if carbon & UInt32(optionKey)  != 0 { mods.insert(.option)  }
+        if carbon & UInt32(controlKey) != 0 { mods.insert(.control) }
+        if carbon & UInt32(shiftKey)   != 0 { mods.insert(.shift)   }
+        return (key, mods)
     }
 
     private func makeItem(_ title: String, action: Selector,
@@ -104,5 +147,10 @@ final class StatusItemController: NSObject, NSMenuDelegate {
     @objc private func restoreWindow(_ sender: NSMenuItem) {
         guard let id = sender.representedObject as? UUID else { return }
         onRestoreWindow(id)
+    }
+
+    @objc private func unghostWindow(_ sender: NSMenuItem) {
+        guard let id = sender.representedObject as? UUID else { return }
+        onUnghostWindow(id)
     }
 }

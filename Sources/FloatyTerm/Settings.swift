@@ -7,6 +7,41 @@ enum AppRuntime {
     static var isQuitting = false
 }
 
+/// Where summon overlays (the session switcher palette and borrowed/summoned
+/// windows) appear on the active screen: one of the 9 cardinal grid points.
+/// Configurable in Preferences so the overlay doesn't land on top of a
+/// terminal the user already has in view.
+enum SummonPosition: String, CaseIterable {
+    case topLeft, top, topRight
+    case left, center, right
+    case bottomLeft, bottom, bottomRight
+
+    /// Row-major 3×3 layout for the Preferences grid picker.
+    static let gridOrder: [[SummonPosition]] = [
+        [.topLeft, .top, .topRight],
+        [.left, .center, .right],
+        [.bottomLeft, .bottom, .bottomRight]
+    ]
+
+    /// A frame of `size` anchored at this grid point within `vis`
+    /// (the screen's visible frame), inset by `margin`.
+    func frame(forSize size: NSSize, in vis: NSRect, margin: CGFloat = 24) -> NSRect {
+        let x: CGFloat
+        switch self {
+        case .topLeft, .left, .bottomLeft:    x = vis.minX + margin
+        case .top, .center, .bottom:          x = vis.midX - size.width / 2
+        case .topRight, .right, .bottomRight: x = vis.maxX - size.width - margin
+        }
+        let y: CGFloat
+        switch self {
+        case .topLeft, .top, .topRight:          y = vis.maxY - size.height - margin
+        case .left, .center, .right:             y = vis.midY - size.height / 2
+        case .bottomLeft, .bottom, .bottomRight: y = vis.minY + margin
+        }
+        return NSRect(x: x, y: y, width: size.width, height: size.height)
+    }
+}
+
 /// User-configurable settings, persisted in UserDefaults. Posts
 /// `Settings.didChange` whenever a value is updated so the UI can react live.
 final class Settings {
@@ -26,7 +61,10 @@ final class Settings {
             "hotKeyCode": Int(kVK_ANSI_7),
             "hotKeyModifiers": Int(cmdKey | optionKey),
             "hotKeyDisplay": "⌥⌘7",
-            "inheritWorkingDirectory": true
+            "inheritWorkingDirectory": true,
+            "browserTransparency": true,
+            "summonPosition": SummonPosition.center.rawValue,
+            "ghostOpacity": 0.35
         ])
     }
 
@@ -87,6 +125,27 @@ final class Settings {
     var hotKeyDisplay: String {
         get { d.string(forKey: "hotKeyDisplay") ?? "⌥⌘7" }
         set { d.set(newValue, forKey: "hotKeyDisplay"); notify() }
+    }
+
+    /// Whole-window opacity applied to "ghosted" (click-through) windows.
+    var ghostOpacity: Double {
+        get { d.double(forKey: "ghostOpacity") }
+        set { d.set(newValue, forKey: "ghostOpacity"); notify() }
+    }
+
+    /// Grid point where the session switcher and summoned windows appear.
+    var summonPosition: SummonPosition {
+        get { SummonPosition(rawValue: d.string(forKey: "summonPosition") ?? "") ?? .center }
+        set { d.set(newValue.rawValue, forKey: "summonPosition"); notify() }
+    }
+
+    /// When true, browser tabs force transparent page backgrounds so the blur
+    /// shows through. Some dark-mode sites rely on their background color for
+    /// readability — turn this off for normal opaque pages. Applies to browser
+    /// tabs created after the change (the WKWebView config is fixed at creation).
+    var browserTransparency: Bool {
+        get { d.bool(forKey: "browserTransparency") }
+        set { d.set(newValue, forKey: "browserTransparency"); notify() }
     }
 
     /// When true, new terminal tabs and new windows inherit the working directory

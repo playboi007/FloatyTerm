@@ -14,10 +14,13 @@ enum HeroTransition {
     static let duration: TimeInterval = 0.34
 
     /// - fadeToGlyph: true for collapse (snapshot→glyph), false for expand.
+    /// - style: the window's avatar personalization, so the morphing bubble
+    ///   matches the real bubble's icon and ring color.
     static func morph(snapshot: NSImage,
                       from start: NSRect, to end: NSRect,
                       startRadius: CGFloat, endRadius: CGFloat,
                       fadeToGlyph: Bool,
+                      style: AvatarStyle = AvatarStyle(),
                       completion: @escaping () -> Void) {
 
         let overlay = NSPanel(contentRect: start,
@@ -42,7 +45,7 @@ enum HeroTransition {
         snapView.autoresizingMask = [.width, .height]
 
         // Bubble/glyph layer.
-        let bubble = makeBubble(frame: content.bounds, radius: startRadius)
+        let bubble = makeBubble(frame: content.bounds, radius: startRadius, style: style)
         bubble.autoresizingMask = [.width, .height]
 
         snapView.alphaValue = fadeToGlyph ? 1 : 0
@@ -79,20 +82,21 @@ enum HeroTransition {
     // MARK: - Private
 
     /// A view that visually matches the avatar bubble: dark translucent circle,
-    /// accent ring, centered terminal glyph that scales with the frame.
-    private static func makeBubble(frame: NSRect, radius: CGFloat) -> NSView {
+    /// the window's ring color, centered personalized glyph that scales with
+    /// the frame.
+    private static func makeBubble(frame: NSRect, radius: CGFloat, style: AvatarStyle) -> NSView {
         let v = NSView(frame: frame)
         v.wantsLayer = true
         v.layer?.backgroundColor = NSColor(white: 0.10, alpha: 0.82).cgColor
         v.layer?.cornerRadius = radius
         v.layer?.borderWidth = 1.5
-        v.layer?.borderColor = NSColor.controlAccentColor.withAlphaComponent(0.9).cgColor
+        v.layer?.borderColor = style.color.withAlphaComponent(0.9).cgColor
         v.layer?.masksToBounds = true
 
         let glyph = NSImageView(frame: frame.insetBy(dx: frame.width * 0.30,
                                                      dy: frame.height * 0.30))
         let cfg = NSImage.SymbolConfiguration(pointSize: 24, weight: .medium)
-        glyph.image = NSImage(systemSymbolName: "terminal", accessibilityDescription: nil)?
+        glyph.image = NSImage(systemSymbolName: style.symbol, accessibilityDescription: nil)?
             .withSymbolConfiguration(cfg)
         glyph.contentTintColor = .white
         glyph.imageScaling = .scaleProportionallyUpOrDown

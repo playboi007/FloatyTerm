@@ -12,9 +12,15 @@ enum ZshHistoryReader {
 
     static func load(limit: Int = 500) -> [String] {
         let path = NSHomeDirectory() + "/.zsh_history"
-        guard let data = FileManager.default.contents(atPath: path), !data.isEmpty else {
+        guard let rawData = FileManager.default.contents(atPath: path), !rawData.isEmpty else {
             return []
         }
+
+        // zsh "metafies" history on disk: bytes that clash with its internals
+        // (0x83–0x9D and others) are written as 0x83 followed by the byte XOR
+        // 0x20. Undo that first, or any command containing multibyte UTF-8
+        // (accents, emoji, CJK) decodes as mojibake.
+        let data = unmetafy(rawData)
 
         // Leniently decode: try UTF-8, fall back to ISO Latin-1 (never crashes).
         let raw: String
@@ -87,5 +93,24 @@ enum ZshHistoryReader {
         }
         // `result` is already most-recent-first because we reversed before de-dup.
         return result
+    }
+
+    /// Reverses zsh's on-disk "metafication": 0x83 marks the next byte as
+    /// escaped (real value = byte ^ 0x20).
+    private static func unmetafy(_ data: Data) -> Data {
+        guard data.contains(0x83) else { return data }
+        var out = Data(capacity: data.count)
+        var escaped = false
+        for byte in data {
+            if escaped {
+                out.append(byte ^ 0x20)
+                escaped = false
+            } else if byte == 0x83 {
+                escaped = true
+            } else {
+                out.append(byte)
+            }
+        }
+        return out
     }
 }

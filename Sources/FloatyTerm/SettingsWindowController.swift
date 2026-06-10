@@ -13,9 +13,13 @@ final class SettingsWindowController: NSObject {
     private let focusedValueLabel = NSTextField(labelWithString: "")
     private let opacitySlider = NSSlider()
     private let opacityValueLabel = NSTextField(labelWithString: "")
+    private let ghostSlider = NSSlider()
+    private let ghostValueLabel = NSTextField(labelWithString: "")
     private let dimCheckbox = NSButton(checkboxWithTitle: "Dim terminal when unfocused", target: nil, action: nil)
     private let inheritCwdCheckbox = NSButton(checkboxWithTitle: "Open new tabs in the current directory", target: nil, action: nil)
+    private let browserTransparencyCheckbox = NSButton(checkboxWithTitle: "Transparent browser backgrounds (new tabs; some dark sites look better off)", target: nil, action: nil)
     private let recordButton = NSButton(title: "", target: nil, action: nil)
+    private var summonGridButtons: [NSButton] = []   // 9 buttons, row-major
 
     // Hotkey recording state.
     private var recording = false
@@ -59,8 +63,8 @@ final class SettingsWindowController: NSObject {
         blurCheckbox.action = #selector(blurToggled(_:))
         stack.addArrangedSubview(blurCheckbox)
 
-        // Focused opacity
-        focusedSlider.minValue = 0.0
+        // Focused opacity (floor 0.1 — 0 would make the terminal text invisible)
+        focusedSlider.minValue = 0.1
         focusedSlider.maxValue = 1.0
         focusedSlider.target = self
         focusedSlider.action = #selector(focusedChanged(_:))
@@ -77,13 +81,26 @@ final class SettingsWindowController: NSObject {
         inheritCwdCheckbox.action = #selector(inheritCwdToggled(_:))
         stack.addArrangedSubview(inheritCwdCheckbox)
 
-        // Unfocused opacity
-        opacitySlider.minValue = 0.0
+        // Browser background transparency
+        browserTransparencyCheckbox.target = self
+        browserTransparencyCheckbox.action = #selector(browserTransparencyToggled(_:))
+        stack.addArrangedSubview(browserTransparencyCheckbox)
+
+        // Unfocused opacity (same floor as focused)
+        opacitySlider.minValue = 0.1
         opacitySlider.maxValue = 1.0
         opacitySlider.target = self
         opacitySlider.action = #selector(opacityChanged(_:))
         opacitySlider.widthAnchor.constraint(equalToConstant: 200).isActive = true
         stack.addArrangedSubview(row("Unfocused opacity", opacitySlider, opacityValueLabel))
+
+        // Ghost opacity (click-through windows)
+        ghostSlider.minValue = 0.1
+        ghostSlider.maxValue = 0.9
+        ghostSlider.target = self
+        ghostSlider.action = #selector(ghostOpacityChanged(_:))
+        ghostSlider.widthAnchor.constraint(equalToConstant: 200).isActive = true
+        stack.addArrangedSubview(row("Ghost opacity", ghostSlider, ghostValueLabel))
 
         // Launch at login
         let loginCheckbox = NSButton(checkboxWithTitle: "Launch at login",
@@ -98,11 +115,52 @@ final class SettingsWindowController: NSObject {
         recordButton.widthAnchor.constraint(equalToConstant: 200).isActive = true
         stack.addArrangedSubview(row("Toggle hotkey", recordButton))
 
-        // The spawn hotkey is a fixed combo, surfaced here for discoverability.
-        let spawnHint = NSTextField(labelWithString: "Spawn a window on the current Space: ⌥⌘5")
+        // Summon position: a 3×3 grid of screen anchor points controlling
+        // where the session switcher and summoned (borrowed) windows appear —
+        // so they don't land on top of a terminal already in view.
+        let gridStack = NSStackView()
+        gridStack.orientation = .vertical
+        gridStack.spacing = 2
+        summonGridButtons = []
+        for row in SummonPosition.gridOrder {
+            let rowStack = NSStackView()
+            rowStack.orientation = .horizontal
+            rowStack.spacing = 2
+            for position in row {
+                let b = NSButton(title: "", target: self, action: #selector(summonPositionTapped(_:)))
+                b.bezelStyle = .smallSquare
+                b.setButtonType(.pushOnPushOff)
+                b.identifier = NSUserInterfaceItemIdentifier(position.rawValue)
+                b.toolTip = "Summon overlays appear here"
+                b.widthAnchor.constraint(equalToConstant: 22).isActive = true
+                b.heightAnchor.constraint(equalToConstant: 18).isActive = true
+                summonGridButtons.append(b)
+                rowStack.addArrangedSubview(b)
+            }
+            gridStack.addArrangedSubview(rowStack)
+        }
+        let gridCaption = NSTextField(labelWithString: "Where the switcher & summoned windows appear")
+        gridCaption.font = .systemFont(ofSize: 11)
+        gridCaption.textColor = .secondaryLabelColor
+        stack.addArrangedSubview(row("Summon position", gridStack, gridCaption))
+
+        // The fixed combos, surfaced here for discoverability.
+        let spawnHint = NSTextField(labelWithString:
+            "Spawn a window on this Space: ⌥⌘5 · Session switcher: ⌥⌘K (⌘K in a window)")
         spawnHint.font = .systemFont(ofSize: 11)
         spawnHint.textColor = .secondaryLabelColor
         stack.addArrangedSubview(spawnHint)
+
+        // If the window closes mid-recording, tear the monitor down — a live
+        // local monitor that returns nil would silently eat every keystroke.
+        NotificationCenter.default.addObserver(
+            forName: NSWindow.willCloseNotification, object: w, queue: .main
+        ) { [weak self] _ in
+            guard let self, self.recording else { return }
+            self.recording = false
+            self.removeMonitor()
+            self.syncControls()
+        }
 
         w.contentView?.addSubview(stack)
         if let cv = w.contentView {
@@ -136,7 +194,14 @@ final class SettingsWindowController: NSObject {
         opacitySlider.isEnabled = Settings.shared.dimWhenUnfocused
         opacityValueLabel.stringValue = "\(Int(Settings.shared.unfocusedOpacity * 100))%"
         inheritCwdCheckbox.state = Settings.shared.inheritWorkingDirectory ? .on : .off
+        browserTransparencyCheckbox.state = Settings.shared.browserTransparency ? .on : .off
+        ghostSlider.doubleValue = Settings.shared.ghostOpacity
+        ghostValueLabel.stringValue = "\(Int(Settings.shared.ghostOpacity * 100))%"
         recordButton.title = recording ? "Press a shortcut…" : Settings.shared.hotKeyDisplay
+        let current = Settings.shared.summonPosition.rawValue
+        for b in summonGridButtons {
+            b.state = (b.identifier?.rawValue == current) ? .on : .off
+        }
     }
 
     // MARK: - Actions
@@ -162,6 +227,22 @@ final class SettingsWindowController: NSObject {
 
     @objc private func inheritCwdToggled(_ sender: NSButton) {
         Settings.shared.inheritWorkingDirectory = (sender.state == .on)
+    }
+
+    @objc private func browserTransparencyToggled(_ sender: NSButton) {
+        Settings.shared.browserTransparency = (sender.state == .on)
+    }
+
+    @objc private func ghostOpacityChanged(_ sender: NSSlider) {
+        Settings.shared.ghostOpacity = sender.doubleValue
+        ghostValueLabel.stringValue = "\(Int(sender.doubleValue * 100))%"
+    }
+
+    @objc private func summonPositionTapped(_ sender: NSButton) {
+        guard let raw = sender.identifier?.rawValue,
+              let position = SummonPosition(rawValue: raw) else { return }
+        Settings.shared.summonPosition = position
+        syncControls()   // radio behaviour: exactly one grid cell stays on
     }
 
     @objc private func opacityChanged(_ sender: NSSlider) {
@@ -209,6 +290,16 @@ final class SettingsWindowController: NSObject {
     private func captureHotkey(_ event: NSEvent) {
         let flags = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
         let carbonMods = Self.carbonModifiers(flags)
+
+        // Esc cancels recording (otherwise the only way out is the button,
+        // since plain keys are swallowed by the guard below).
+        if event.keyCode == UInt16(kVK_Escape), carbonMods == 0 {
+            recording = false
+            removeMonitor()
+            syncControls()
+            return
+        }
+
         // Require at least one non-shift modifier so the combo is global-safe.
         guard carbonMods != 0,
               carbonMods != UInt32(shiftKey) else { return }

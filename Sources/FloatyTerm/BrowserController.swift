@@ -19,6 +19,26 @@ final class BrowserController: NSObject, TabContent, WKNavigationDelegate, WKUID
     var onTitleChanged: (() -> Void)?
     var onTerminated: (() -> Void)?   // browsers never self-terminate; kept for protocol
 
+    /// Fired when the URL or back/forward availability changes, so the URL bar
+    /// stays in sync on navigations that don't change the page title.
+    var onNavChanged: (() -> Void)?
+
+    /// User-pinned name (right-click chip → Rename). Wins over the page title.
+    var customName: String?
+
+    var displayName: String {
+        if let name = customName, !name.isEmpty { return name }
+        return title
+    }
+
+    // MARK: - Unseen-change tracking (title changes while not in view)
+
+    private(set) var hasUnseenOutput = false
+
+    var isCurrentlyViewed = true {
+        didSet { if isCurrentlyViewed { hasUnseenOutput = false } }
+    }
+
     // MARK: - Browser state
 
     /// The underlying web view, typed for internal use.
@@ -30,50 +50,59 @@ final class BrowserController: NSObject, TabContent, WKNavigationDelegate, WKUID
     // MARK: - KVO
 
     private var titleObservation: NSKeyValueObservation?
+    private var navObservations: [NSKeyValueObservation] = []
 
     // MARK: - Init
 
-    override init() {
+    private let initialURL: String?
+
+    /// - Parameter initialURL: first page to load; nil = the default homepage.
+    ///   Used by session restore to bring a browser tab back to its last page.
+    init(initialURL: String? = nil) {
+        self.initialURL = initialURL
         // ── Ephemeral session ────────────────────────────────────────────────
         let config = WKWebViewConfiguration()
         config.websiteDataStore = .nonPersistent()
 
-        // ── Transparency coaxing CSS ─────────────────────────────────────────
-        // Injected at document-start so it applies before page paint.
-        // NOTE: This is aggressive — it forces transparent backgrounds on all
-        //       sites. Most look fine over the blur, but some dark-mode pages
-        //       use background-color for readability; they may look odd. The
-        //       intent is to let the blurred floating panel show through.
-        //       This is tunable in a future Phase 2 setting.
-        let css = "html, body { background-color: transparent !important; }"
-        let script = WKUserScript(
-            source: """
-            (function() {
-                var style = document.createElement('style');
-                style.textContent = '\(css)';
-                document.documentElement.appendChild(style);
-            })();
-            """,
-            injectionTime: .atDocumentStart,
-            forMainFrameOnly: false
-        )
-        config.userContentController.addUserScript(script)
+        // ── Transparency coaxing (optional, Settings.browserTransparency) ───
+        // Aggressive: forces transparent page backgrounds on all sites so the
+        // blurred panel shows through. Some dark-mode pages rely on their
+        // background-color for readability, so this is a user setting now;
+        // it's baked into the WKWebView config, so it applies to tabs created
+        // after the toggle (existing tabs keep their look).
+        let transparent = Settings.shared.browserTransparency
+        if transparent {
+            let css = "html, body { background-color: transparent !important; }"
+            let script = WKUserScript(
+                source: """
+                (function() {
+                    var style = document.createElement('style');
+                    style.textContent = '\(css)';
+                    document.documentElement.appendChild(style);
+                })();
+                """,
+                injectionTime: .atDocumentStart,
+                forMainFrameOnly: false
+            )
+            config.userContentController.addUserScript(script)
+        }
 
         let wv = WKWebView(frame: .zero, configuration: config)
         wv.translatesAutoresizingMaskIntoConstraints = false
 
-        // ── Transparency coaxing (native layer) ──────────────────────────────
-        // (a) KVC private API — suppresses the default opaque white backdrop.
-        //     Accepted use: confirmed working on macOS 13–15; Apple's WKWebView
-        //     team has acknowledged this key informally. No App Store concern
-        //     here (this is a non-sandboxed macOS app).
-        wv.setValue(false, forKey: "drawsBackground")
-        // (b) Clear CALayer background — no compositor solid fill behind content.
-        wv.wantsLayer = true
-        wv.layer?.backgroundColor = CGColor.clear
-        // (c) macOS 12+ official API for the "under page" gutter colour.
-        if #available(macOS 12.0, *) {
-            wv.underPageBackgroundColor = .clear
+        if transparent {
+            // ── Transparency coaxing (native layer) ─────────────────────────
+            // (a) KVC private API — suppresses the default opaque white
+            //     backdrop. Confirmed working on macOS 13–15; no App Store
+            //     concern here (this is a non-sandboxed macOS app).
+            wv.setValue(false, forKey: "drawsBackground")
+            // (b) Clear CALayer background — no compositor fill behind content.
+            wv.wantsLayer = true
+            wv.layer?.backgroundColor = CGColor.clear
+            // (c) macOS 12+ official API for the "under page" gutter colour.
+            if #available(macOS 12.0, *) {
+                wv.underPageBackgroundColor = .clear
+            }
         }
 
         webView = wv
@@ -88,12 +117,26 @@ final class BrowserController: NSObject, TabContent, WKNavigationDelegate, WKUID
             guard let self else { return }
             let newTitle = change.newValue??.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
             self.title = newTitle.isEmpty ? "Browser" : newTitle
+            if !self.isCurrentlyViewed { self.hasUnseenOutput = true }
             self.onTitleChanged?()
         }
 
-        // Load the default homepage.
-        load("https://duckduckgo.com")
+        // ── KVO: URL + history state → keep the URL bar honest ──────────────
+        navObservations = [
+            webView.observe(\.url)          { [weak self] _, _ in self?.onNavChanged?() },
+            webView.observe(\.canGoBack)    { [weak self] _, _ in self?.onNavChanged?() },
+            webView.observe(\.canGoForward) { [weak self] _, _ in self?.onNavChanged?() }
+        ]
+
+        // Load the restored page, or the default homepage.
+        load(initialURL ?? "https://duckduckgo.com")
     }
+
+    // MARK: - Page zoom (⌘+/⌘−/⌘0)
+
+    func zoomIn()    { webView.pageZoom = min(3.0, webView.pageZoom + 0.1) }
+    func zoomOut()   { webView.pageZoom = max(0.5, webView.pageZoom - 0.1) }
+    func resetZoom() { webView.pageZoom = 1.0 }
 
     // MARK: - TabContent focus / cleanup
 
@@ -103,6 +146,7 @@ final class BrowserController: NSObject, TabContent, WKNavigationDelegate, WKUID
 
     func cleanup() {
         titleObservation = nil
+        navObservations = []
         webView.stopLoading()
     }
 
@@ -133,12 +177,20 @@ final class BrowserController: NSObject, TabContent, WKNavigationDelegate, WKUID
     // MARK: - URL parsing helper
 
     private func parseURL(_ text: String) -> URL? {
-        // If it already has a scheme, parse it directly.
-        if text.lowercased().hasPrefix("http://") || text.lowercased().hasPrefix("https://") {
+        // Anything with an explicit scheme (http, https, file, about…) parses
+        // directly — don't second-guess it into a search.
+        if text.contains("://") || text.lowercased().hasPrefix("about:") {
             return URL(string: text)
         }
-        // Looks like a hostname (contains a dot, no spaces)?
-        if !text.contains(" "), text.contains(".") {
+        guard !text.contains(" ") else { return nil }
+        // Dev-server style: localhost / 127.0.0.1, with or without a port.
+        let host = text.split(separator: "/").first.map(String.init) ?? text
+        let bareHost = host.split(separator: ":").first.map(String.init) ?? host
+        if bareHost == "localhost" || bareHost == "127.0.0.1" {
+            return URL(string: "http://\(text)")
+        }
+        // Looks like a hostname (contains a dot)?
+        if text.contains(".") {
             return URL(string: "https://\(text)")
         }
         return nil
@@ -183,6 +235,7 @@ final class BrowserController: NSObject, TabContent, WKNavigationDelegate, WKUID
         let alert = NSAlert()
         alert.messageText = message
         alert.addButton(withTitle: "OK")
+        NSApp.activate(ignoringOtherApps: true)  // accessory app: surface the modal
         alert.runModal()
         completionHandler()
     }
@@ -196,6 +249,7 @@ final class BrowserController: NSObject, TabContent, WKNavigationDelegate, WKUID
         alert.messageText = message
         alert.addButton(withTitle: "OK")
         alert.addButton(withTitle: "Cancel")
+        NSApp.activate(ignoringOtherApps: true)
         completionHandler(alert.runModal() == .alertFirstButtonReturn)
     }
 
@@ -212,6 +266,7 @@ final class BrowserController: NSObject, TabContent, WKNavigationDelegate, WKUID
         let field = NSTextField(frame: NSRect(x: 0, y: 0, width: 300, height: 24))
         field.stringValue = defaultText ?? ""
         alert.accessoryView = field
+        NSApp.activate(ignoringOtherApps: true)
         if alert.runModal() == .alertFirstButtonReturn {
             completionHandler(field.stringValue)
         } else {

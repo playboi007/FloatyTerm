@@ -59,16 +59,25 @@ final class RecentCommandsPaletteView: NSVisualEffectView {
     // MARK: Public API
 
     /// Reloads history from disk and resets the search field. Call each time
-    /// the palette is made visible.
+    /// the palette is made visible. The file read + parse happens off the main
+    /// thread so a large ~/.zsh_history never stalls the open animation; stale
+    /// results from a previous reload are discarded via a generation counter.
+    private var reloadGeneration = 0
     func reloadHistory() {
-        allCommands = ZshHistoryReader.load(limit: 500)
-        applyFilter("")
         searchField.stringValue = ""
-        if filteredCommands.isEmpty {
-            tableView.deselectAll(nil)
-        } else {
-            tableView.selectRowIndexes(IndexSet(integer: 0), byExtendingSelection: false)
-            tableView.scrollRowToVisible(0)
+        reloadGeneration += 1
+        let generation = reloadGeneration
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            let commands = ZshHistoryReader.load(limit: 500)
+            DispatchQueue.main.async {
+                guard let self, self.reloadGeneration == generation else { return }
+                self.allCommands = commands
+                // Honour whatever the user has typed while the load ran.
+                self.applyFilter(self.searchField.stringValue)
+                if self.filteredCommands.isEmpty {
+                    self.tableView.deselectAll(nil)
+                }
+            }
         }
     }
 

@@ -100,17 +100,18 @@ final class FloatingPanel: NSPanel {
     func presentOverlay() {
         reassertFloatingBehavior()
         orderFrontRegardless()
-        makeKey()
+        // Only grab key focus if we actually landed on the active Space. A
+        // pinned window being revealed onto a DIFFERENT Space must not makeKey,
+        // or it would yank the user across Spaces. Roaming windows join all
+        // Spaces, so isOnActiveSpace is true for them.
+        if isOnActiveSpace { makeKey() }
     }
 
-    // MARK: - Position persistence (single cross-launch "last used" frame)
+    // MARK: - Legacy frame restore (migration fallback)
     //
-    // NOTE: this is intentionally ONE shared slot — it remembers where the
-    // roaming window was so the next *launch* reopens in a familiar spot. It is
-    // NOT per-window identity. To stop it clobbering things, callers must only
-    // write it from unpinned windows, and new windows are placed relative to the
-    // window on the current Space (see cascade/centerOnActiveScreen) rather than
-    // blindly restoring this slot.
+    // Window geometry now lives in per-window records (WindowStateStore). This
+    // old single shared slot is kept read-only so installs upgrading from the
+    // previous version still reopen in a familiar spot on their first launch.
 
     private static let keyX = "frameX", keyY = "frameY", keyW = "frameW", keyH = "frameH"
 
@@ -132,14 +133,6 @@ final class FloatingPanel: NSPanel {
         } else {
             center()
         }
-    }
-
-    func saveFrame() {
-        let d = UserDefaults.standard
-        d.set(frame.origin.x, forKey: Self.keyX)
-        d.set(frame.origin.y, forKey: Self.keyY)
-        d.set(frame.size.width, forKey: Self.keyW)
-        d.set(frame.size.height, forKey: Self.keyH)
     }
 
     // MARK: - Per-window placement (no shared state)

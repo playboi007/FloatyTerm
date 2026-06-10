@@ -26,6 +26,15 @@ final class TerminalWindowController: NSObject, NSWindowDelegate {
     /// True while this window is collapsed into its floating avatar bubble.
     private(set) var isCollapsed = false
 
+    /// True while this window is collapsed into a one-line ticker strip.
+    private(set) var isTicker = false
+    private var ticker: TickerPanel?
+
+    /// True while this window is "ghosted": click-through and faded, for
+    /// watching logs over another app. Restored from the menu-bar icon or by
+    /// summoning the session (the window itself can't be clicked).
+    private(set) var isGhosted = false
+
     // Avatar (bubble) collapse state.
     private var avatar: AvatarPanel?
     private var collapsedSnapshot: NSImage?
@@ -55,6 +64,14 @@ final class TerminalWindowController: NSObject, NSWindowDelegate {
     private let recentPalette = RecentCommandsPaletteView()
     private var isPaletteVisible = false
 
+    // MARK: - Selection action bar (terminal-only overlay)
+    private let selectionBar = SelectionActionBar()
+    private var selectionText = ""
+
+    // MARK: - Transcript reader (live clean view of one session's output)
+    private var transcriptReader: TranscriptReaderController?
+    private let readerButton = NSButton()
+
     // MARK: - URL bar (browser-only overlay)
     private let urlBar = URLBarView()
     private var isURLBarVisible = false
@@ -73,9 +90,36 @@ final class TerminalWindowController: NSObject, NSWindowDelegate {
     /// Cleared after the first tab is created.
     private var pendingInitialDirectory: String?
 
+    /// Pending debounced frame save (see scheduleFrameSave()).
+    private var frameSaveWork: DispatchWorkItem?
+
+    /// Periodic refresh of chip labels / status dots / bubble badge (auto-labels
+    /// and running-state come from polling the pty). Invalidated on close.
+    private var activityTimer: Timer?
+
+    /// Tabs borrowed from another window via the session switcher, so they can
+    /// be sent back. Keyed by tab identity; sources are weak (a closed source
+    /// simply means there's nothing to return to).
+    private struct BorrowRecord {
+        let tabID: ObjectIdentifier
+        weak var source: TerminalWindowController?
+    }
+    private var borrows: [BorrowRecord] = []
+
     var onNewWindow:       (() -> Void)?
     var onClosed:          ((TerminalWindowController) -> Void)?
     var onOpenPreferences: (() -> Void)?
+
+    /// Notifies the app delegate that this window's persistable state (frame,
+    /// avatar style) changed, so the per-window records can be rewritten.
+    var onStateChanged:    (() -> Void)?
+
+    /// Asks the app delegate to open the global session switcher (⌘K).
+    var onOpenSwitcher:    (() -> Void)?
+
+    /// This window's avatar-bubble personalization (icon + ring color).
+    /// Set via right-click on the bubble; restored from the window record.
+    private(set) var avatarStyle = AvatarStyle()
 
     /// Called when a tab should be torn off into a new window.
     /// Parameters: the live tab object and the screen point where the drag ended.
@@ -150,11 +194,18 @@ final class TerminalWindowController: NSObject, NSWindowDelegate {
         header.onAddTab       = { [weak self] in self?.addTerminalTab() }
         header.onNewWindow    = { [weak self] in self?.onNewWindow?() }
         header.onToggleURLBar = { [weak self] in self?.toggleURLBarCollapsed() }
-        header.onMinimize     = { [weak self] in self?.minimize() }
-        header.onTogglePin    = { [weak self] in self?.togglePin() }
-        header.onCollapse     = { [weak self] in self?.collapseToAvatar() }
+        header.onMinimize       = { [weak self] in self?.minimize() }
+        header.onTogglePin      = { [weak self] in self?.togglePin() }
+        header.onCollapse       = { [weak self] in self?.collapseToAvatar() }
+        header.onCollapseTicker = { [weak self] in self?.collapseToTicker() }
+        header.onGhost          = { [weak self] in self?.setGhosted(true) }
+        header.onSnap           = { [weak self] asText in self?.captureContext(asText: asText) }
+        header.onBuildSnapMenu  = { [weak self] menu in self?.buildSnapHistoryMenu(menu) }
         tabStrip.onSelect     = { [weak self] i in self?.selectTab(i) }
         tabStrip.onCloseTab   = { [weak self] i in self?.closeTab(i) }
+        tabStrip.onRenameTab  = { [weak self] i in self?.promptRename(i) }
+        tabStrip.onReturnTab  = { [weak self] i in self?.returnBorrowedTab(at: i) }
+        header.onReturnTab    = { [weak self] in self?.returnBorrowedTab() }
 
         // Wire drag-support back-references.
         tabStrip.windowController = self
@@ -182,9 +233,20 @@ final class TerminalWindowController: NSObject, NSWindowDelegate {
         setupFindBar()
         setupRecentPalette()
         setupURLBar()
+        setupSelectionBar()
+        setupReaderButton()
+        installSelectionMonitor()
         if !_startEmpty {
             addTerminalTab() // start with one terminal tab
         }
+
+        // Auto-labels ("flutter · myapp") and running-state dots come from
+        // polling the pty; 2s with generous tolerance keeps it imperceptible.
+        let timer = Timer.scheduledTimer(withTimeInterval: 2.0, repeats: true) { [weak self] _ in
+            self?.refreshActivity()
+        }
+        timer.tolerance = 0.5
+        activityTimer = timer
     }
 
     deinit {
@@ -206,10 +268,13 @@ final class TerminalWindowController: NSObject, NSWindowDelegate {
 
     private func reassertIfPinnedOnActiveSpace() {
         guard panel.isPinned else { return }
-        // When collapsed, the pinned bubble (not the panel) is what's on screen;
-        // nudge whichever one is live so it doesn't drop out during swipes.
+        // When collapsed/tickered, the pinned bubble or strip (not the panel)
+        // is what's on screen; nudge whichever one is live so it doesn't drop
+        // out during swipes.
         if isCollapsed, let av = avatar {
             if av.isOnActiveSpace { av.orderFrontRegardless() }
+        } else if isTicker, let t = ticker {
+            if t.isOnActiveSpace { t.orderFrontRegardless() }
         } else if panel.isVisible, panel.isOnActiveSpace {
             panel.orderFrontRegardless()
         }
@@ -242,18 +307,83 @@ final class TerminalWindowController: NSObject, NSWindowDelegate {
         // every window come back together on ⌥⌘7.
         panel.presentOverlay()
         focusActiveTab()
+        updateViewedFlags()
     }
 
     func hide() {
-        persistFrameIfRoaming()
+        closeReaderIfNeeded()
         panel.orderOut(nil)
+        updateViewedFlags()
     }
 
-    /// Only unpinned ("roaming") windows write the shared cross-launch frame.
-    /// A pinned window's geometry is Space-specific and must not become the
-    /// default that new/roaming windows restore from.
-    private func persistFrameIfRoaming() {
-        if !panel.isPinned { panel.saveFrame() }
+    // MARK: - Per-window persisted state
+
+    /// The frame worth persisting: a collapsed/tickered window's panel is
+    /// hidden, so its pre-collapse frame is the meaningful one.
+    private var persistableFrame: NSRect {
+        (isCollapsed || isTicker) ? savedFrameForExpand : panel.frame
+    }
+
+    /// Snapshot of this window's persistable state for the window-records store.
+    var stateRecord: WindowRecord {
+        WindowRecord(frame: NSStringFromRect(persistableFrame),
+                     avatarSymbol: avatarStyle.symbol,
+                     avatarColor: avatarStyle.colorName,
+                     tabs: tabs.map(tabRecord(for:)),
+                     activeIndex: activeIndex)
+    }
+
+    private func tabRecord(for tab: any TabContent) -> TabRecord {
+        if let bc = tab as? BrowserController {
+            return TabRecord(kind: "browser", customName: bc.customName,
+                             directory: nil, url: bc.webView.url?.absoluteString)
+        }
+        let tc = tab as? TerminalController
+        return TabRecord(kind: "terminal", customName: tab.customName,
+                         directory: tc?.currentWorkingDirectory, url: nil)
+    }
+
+    /// Recreates tabs from a saved session: terminals restart in their last
+    /// directory, browsers reload their page, custom names survive.
+    /// Used only on launch, on a window created with startEmpty.
+    func restoreTabs(_ records: [TabRecord], activeIndex savedActive: Int) {
+        for record in records {
+            if record.kind == "browser" {
+                let tab = BrowserController(initialURL: record.url)
+                tab.customName = record.customName
+                tab.onTitleChanged = { [weak self] in
+                    self?.refreshTabStrip()
+                    self?.syncURLBar()
+                }
+                tab.onNavChanged = { [weak self] in self?.syncURLBar() }
+                insertTab(tab)
+            } else {
+                let tab = TerminalController(startDirectory: record.directory)
+                tab.customName = record.customName
+                tab.onTerminated = { [weak self, weak tab] in
+                    guard let self, let tab,
+                          let idx = self.tabs.firstIndex(where: { $0 === tab }) else { return }
+                    self.closeTab(idx)
+                }
+                tab.onTitleChanged = { [weak self] in self?.refreshTabStrip() }
+                insertTab(tab)
+            }
+        }
+        if tabs.isEmpty { addTerminalTab() }   // corrupt record safety net
+        selectTab(min(max(0, savedActive), tabs.count - 1))
+    }
+
+    /// Adopts a persisted record at launch: frame (clamped on-screen, in case
+    /// displays changed since last run) and avatar style.
+    func applyRestored(_ record: WindowRecord) {
+        avatarStyle = AvatarStyle(symbol: record.avatarSymbol,
+                                  colorName: record.avatarColor)
+        let f = NSRectFromString(record.frame)
+        if f.width >= 320, f.height >= 180 {
+            panel.setFrame(panel.clampToVisibleScreen(f), display: false)
+        } else {
+            panel.restoreSavedFrame()   // corrupt record → legacy fallback
+        }
     }
 
     // MARK: - Collapse to / expand from the floating avatar bubble
@@ -262,6 +392,7 @@ final class TerminalWindowController: NSObject, NSWindowDelegate {
     /// The session stays alive; double-clicking the bubble expands it back.
     func collapseToAvatar() {
         guard !isCollapsed else { return }
+        closeReaderIfNeeded()
         let termFrame = panel.frame
         let snapshot = HeroTransition.snapshot(of: root) ?? NSImage(size: termFrame.size)
         collapsedSnapshot = snapshot
@@ -279,11 +410,12 @@ final class TerminalWindowController: NSObject, NSWindowDelegate {
             NSRect(x: mouse.x - d / 2, y: mouse.y - d / 2, width: d, height: d))
 
         isCollapsed = true
-        persistFrameIfRoaming()
         panel.orderOut(nil)
+        updateViewedFlags()
 
         HeroTransition.morph(snapshot: snapshot, from: termFrame, to: avatarFrame,
-                             startRadius: 8, endRadius: d / 2, fadeToGlyph: true) { [weak self] in
+                             startRadius: 8, endRadius: d / 2, fadeToGlyph: true,
+                             style: avatarStyle) { [weak self] in
             self?.showAvatar(at: avatarFrame)
         }
     }
@@ -292,47 +424,131 @@ final class TerminalWindowController: NSObject, NSWindowDelegate {
         let av = avatar ?? AvatarPanel()
         avatar = av
         av.onExpand = { [weak self] in self?.expandFromAvatar() }
+        av.apply(style: avatarStyle)
+        av.onStyleChange = { [weak self] style in
+            guard let self else { return }
+            self.avatarStyle = style
+            self.onStateChanged?()   // persist the new personalization
+        }
         av.setFrame(frame, display: false)
-        // Inherit the parent window's link state so a linked window's bubble
-        // sticks to the Space it was linked to instead of roaming all Spaces.
-        av.setPinned(panel.isPinned)
+        // Bring the bubble up as ROAMING first so it attaches to the CURRENT
+        // Space — including another app's fullscreen Space. A brand-new managed
+        // window ordered onto a foreign fullscreen Space won't attach (it lands
+        // on the desktop). So for a linked window we pin on the next runloop
+        // tick, once the bubble is actually displayed here — mirroring how the
+        // window itself got pinned (it was already shown on this Space).
+        av.setPinned(false)
         av.orderFrontRegardless()
+        if panel.isPinned {
+            DispatchQueue.main.async { [weak av] in av?.setPinned(true) }
+        }
     }
 
     /// Reverses the collapse: the bubble grows back into the terminal, expanding
     /// from wherever the user has moved the bubble.
-    func expandFromAvatar() {
+    /// - Parameter overrideTarget: explicit destination frame (summoning a
+    ///   pinned bubble from another Space lands at the summon grid point
+    ///   instead of wherever the off-Space bubble happened to sit).
+    func expandFromAvatar(to overrideTarget: NSRect? = nil) {
         guard isCollapsed, let av = avatar else { return }
         let avatarFrame = av.frame
         let size = savedFrameForExpand.size
         // Place the window so the collapse-icon point (where the cursor was) lands
         // at the bubble's center — the window unfolds back to where the eye expects.
         let center = NSPoint(x: avatarFrame.midX, y: avatarFrame.midY)
-        let raw = NSRect(x: center.x - collapseCursorOffset.x,
-                         y: center.y - collapseCursorOffset.y,
-                         width: size.width, height: size.height)
+        let raw = overrideTarget ?? NSRect(x: center.x - collapseCursorOffset.x,
+                                           y: center.y - collapseCursorOffset.y,
+                                           width: size.width, height: size.height)
         let target = panel.clampToVisibleScreen(raw)
         let image = collapsedSnapshot ?? HeroTransition.snapshot(of: root) ?? NSImage(size: size)
         let d = AvatarPanel.diameter
 
         av.orderOut(nil)
         HeroTransition.morph(snapshot: image, from: avatarFrame, to: target,
-                             startRadius: d / 2, endRadius: 8, fadeToGlyph: false) { [weak self] in
+                             startRadius: d / 2, endRadius: 8, fadeToGlyph: false,
+                             style: avatarStyle) { [weak self] in
             guard let self else { return }
             self.isCollapsed = false
             self.panel.setFrame(target, display: false)
             self.panel.presentOverlay()
             self.focusActiveTab()
+            self.updateViewedFlags()
         }
+    }
+
+    // MARK: - Ghost mode (click-through log watching)
+
+    /// Ghosts/unghosts this window: ghosted windows ignore all mouse events
+    /// (clicks pass through to the app beneath) and fade to the configurable
+    /// ghost opacity. Because a ghosted window can't be clicked, restoring
+    /// happens from the menu-bar icon or by summoning the session (⌥⌘K).
+    func setGhosted(_ on: Bool) {
+        isGhosted = on
+        panel.ignoresMouseEvents = on
+        panel.alphaValue = on ? CGFloat(max(0.1, Settings.shared.ghostOpacity)) : 1.0
+        if !on { panel.presentOverlay() }
+    }
+
+    // MARK: - Ticker mode (one-line live strip)
+
+    /// Collapses this window into a one-line floating strip showing the active
+    /// session's name, status, and live last line of output. ⌥-click the
+    /// collapse button; double-click the strip to expand back.
+    func collapseToTicker() {
+        guard !isCollapsed, !isTicker else { return }
+        closeReaderIfNeeded()
+        savedFrameForExpand = panel.frame
+        isTicker = true
+        panel.orderOut(nil)
+        updateViewedFlags()
+
+        let t = ticker ?? TickerPanel()
+        ticker = t
+        t.onExpand = { [weak self] in self?.expandFromTicker() }
+        // The strip takes the window's top edge, so it stays where the eye was.
+        let f = savedFrameForExpand
+        let raw = NSRect(x: f.minX, y: f.maxY - TickerPanel.height,
+                         width: min(TickerPanel.defaultWidth, f.width),
+                         height: TickerPanel.height)
+        t.setFrame(panel.clampToVisibleScreen(raw), display: false)
+        // Same Space dance as the avatar: attach roaming first, then re-pin.
+        t.setPinned(false)
+        t.orderFrontRegardless()
+        if panel.isPinned {
+            DispatchQueue.main.async { [weak t] in t?.setPinned(true) }
+        }
+        refreshTicker()
+    }
+
+    /// - Parameter overrideTarget: explicit destination frame (see
+    ///   expandFromAvatar — used when summoning across Spaces).
+    func expandFromTicker(to overrideTarget: NSRect? = nil) {
+        guard isTicker else { return }
+        ticker?.orderOut(nil)
+        isTicker = false
+        let raw = overrideTarget ?? savedFrameForExpand
+        panel.setFrame(panel.clampToVisibleScreen(raw), display: false)
+        panel.presentOverlay()
+        focusActiveTab()
+        updateViewedFlags()
+    }
+
+    private func refreshTicker() {
+        guard isTicker, let t = ticker else { return }
+        let tab = tabs.indices.contains(activeIndex) ? tabs[activeIndex] : nil
+        t.update(name: tab?.displayName ?? "FloatyTerm",
+                 line: (tab as? TerminalController)?.lastOutputLine ?? "",
+                 status: tab.map { status(of: $0) } ?? .idle)
     }
 
     /// Hides only THIS window (session preserved) and flags it as minimized so
     /// it appears in the menu-bar "Hidden Windows" list for individual restore.
     /// Distinct from the global ⌥⌘7 hide, which hides every window at once.
     func minimize() {
-        persistFrameIfRoaming()
+        closeReaderIfNeeded()
         isMinimized = true
         panel.orderOut(nil)
+        updateViewedFlags()
     }
 
     var isVisible: Bool { panel.isVisible }
@@ -344,18 +560,46 @@ final class TerminalWindowController: NSObject, NSWindowDelegate {
     /// True when this window currently lives on the Space the user is viewing.
     var isOnActiveSpace: Bool { panel.isOnActiveSpace }
 
+    /// Whether this window's visible representative — the panel, or its bubble
+    /// / ticker strip when collapsed — is on the user's current Space.
+    /// `panel.isOnActiveSpace` LIES for hidden panels (it answers "where would
+    /// it land if shown"), so combined states like pinned+collapsed must ask
+    /// the thing that's actually on screen. nil = nothing on screen, unknowable
+    /// (pinned + minimized/hidden).
+    var presenceOnActiveSpace: Bool? {
+        if isCollapsed { return avatar?.isOnActiveSpace }
+        if isTicker { return ticker?.isOnActiveSpace }
+        if panel.isVisible { return panel.isOnActiveSpace }
+        return nil
+    }
+
+    /// The window's content size for summon placement, valid in every state
+    /// (a collapsed/tickered window's panel frame is stale; use the saved one).
+    var currentContentSize: NSSize { persistableFrame.size }
+
     /// Toggles whether this window is linked to the current Space. When linked,
     /// it stays on that Space (with its session) instead of floating over all of
     /// them; the pin button reflects the new state.
     private func togglePin() {
         panel.setPinned(!panel.isPinned)
         header.setPinned(panel.isPinned)
+        // FloatyTerm never activates itself, so the frontmost app right now is
+        // the one this window is being pinned OVER — the session switcher
+        // shows it ("another Space (Chrome)").
+        pinnedAppName = panel.isPinned
+            ? NSWorkspace.shared.frontmostApplication?.localizedName
+            : nil
+        scheduleFrameSave()   // pinned windows are excluded from saved sessions
     }
 
-    /// A short title for menus, taken from the active tab.
+    /// The app that was frontmost when this window was pinned — i.e. what it
+    /// overlays on its Space. Runtime-only, cleared on unpin.
+    private(set) var pinnedAppName: String?
+
+    /// A short title for menus, taken from the active tab (honours renames).
     var displayTitle: String {
         guard tabs.indices.contains(activeIndex) else { return "FloatyTerm" }
-        let t = tabs[activeIndex].title.trimmingCharacters(in: .whitespacesAndNewlines)
+        let t = tabs[activeIndex].displayName.trimmingCharacters(in: .whitespacesAndNewlines)
         return t.isEmpty ? "Untitled" : t
     }
 
@@ -387,10 +631,31 @@ final class TerminalWindowController: NSObject, NSWindowDelegate {
                 if activeTabIsTerminal { findNext() }
                 return true
             case "r":
-                // ⌘R is the recent-commands palette for terminal tabs;
-                // no-op for browser tabs (browser reload is in the URL bar).
+                // ⌘R: recent-commands palette for terminal tabs, reload for
+                // browser tabs (standard browser muscle memory).
                 if activeTabIsTerminal { toggleRecentPalette() }
+                else { activeBrowser?.reload() }
                 return true
+            case "k":
+                // ⌘K: global session switcher (find/summon any session).
+                onOpenSwitcher?()
+                return true
+            case "l":
+                // ⌘L: focus the address bar (expanding it first if collapsed).
+                guard activeTabIsBrowser else { return false }
+                if Settings.shared.urlBarCollapsed {
+                    Settings.shared.urlBarCollapsed = false  // didChange shows the bar
+                } else if !isURLBarVisible {
+                    showURLBar()
+                }
+                urlBar.focusURLField()
+                return true
+            case "=", "+":
+                zoomOrFontStep(+1); return true
+            case "-":
+                zoomOrFontStep(-1); return true
+            case "0":
+                zoomOrFontStep(0); return true
             default:
                 if let n = Int(chars), (1...9).contains(n) {
                     selectTab(n - 1)
@@ -411,6 +676,25 @@ final class TerminalWindowController: NSObject, NSWindowDelegate {
     private func cycleTab(_ delta: Int) {
         guard !tabs.isEmpty else { return }
         selectTab((activeIndex + delta + tabs.count) % tabs.count)
+    }
+
+    /// ⌘+/⌘−/⌘0. Browser tabs zoom the page; terminal tabs step the global
+    /// font size (which Settings.didChange propagates to every terminal).
+    private func zoomOrFontStep(_ direction: Int) {
+        if let bc = activeBrowser {
+            switch direction {
+            case 0:  bc.resetZoom()
+            case 1:  bc.zoomIn()
+            default: bc.zoomOut()
+            }
+            return
+        }
+        let defaultSize = 13.0
+        switch direction {
+        case 0:  Settings.shared.fontSize = defaultSize
+        case 1:  Settings.shared.fontSize = min(24, Settings.shared.fontSize + 1)
+        default: Settings.shared.fontSize = max(9, Settings.shared.fontSize - 1)
+        }
     }
 
     // MARK: - Working-directory inheritance
@@ -446,7 +730,9 @@ final class TerminalWindowController: NSObject, NSWindowDelegate {
         let alpha = (Settings.shared.dimWhenUnfocused && !focused)
             ? Settings.shared.unfocusedOpacity
             : Settings.shared.focusedOpacity
-        contentArea.alphaValue = CGFloat(alpha)
+        // Floor at 0.1: the alpha applies to the terminal text itself, so 0
+        // would render the content invisible with no way to see what you type.
+        contentArea.alphaValue = CGFloat(max(0.1, alpha))
     }
 
     @objc private func settingsChanged() {
@@ -454,6 +740,9 @@ final class TerminalWindowController: NSObject, NSWindowDelegate {
         tabs.compactMap { $0 as? TerminalController }.forEach { $0.applyFont() }
         applyAppearance(focused: panel.isKeyWindow)
         updateURLBarVisibility()  // reflect URL-bar collapse state changes
+        if isGhosted {            // live-apply a ghost-opacity slider change
+            panel.alphaValue = CGFloat(max(0.1, Settings.shared.ghostOpacity))
+        }
     }
 
     /// Collapses/expands the browser URL bar (persisted; applies to all windows).
@@ -497,6 +786,9 @@ final class TerminalWindowController: NSObject, NSWindowDelegate {
             self?.refreshTabStrip()
             self?.syncURLBar()
         }
+        // Fires on URL / canGoBack / canGoForward changes — title KVO alone
+        // misses same-title navigations and back/forward state flips.
+        tab.onNavChanged = { [weak self] in self?.syncURLBar() }
         insertTab(tab)
     }
 
@@ -514,6 +806,7 @@ final class TerminalWindowController: NSObject, NSWindowDelegate {
         tabs.append(tab)
         selectTab(tabs.count - 1)
         applyAppearance(focused: panel.isKeyWindow)
+        scheduleFrameSave()   // tabs are part of the persisted session now
     }
 
     private func selectTab(_ index: Int) {
@@ -521,21 +814,43 @@ final class TerminalWindowController: NSObject, NSWindowDelegate {
         // Hide terminal-only overlays when switching tabs.
         if isFindBarVisible   { hideFindBar()       }
         if isPaletteVisible   { hideRecentPalette() }
+        hideSelectionBar()
         activeIndex = index
         for (i, tab) in tabs.enumerated() {
             tab.view.isHidden = (i != index)
         }
         refreshTabStrip()
         updateURLBarVisibility()
+        updateViewedFlags()
+        updateReturnButton()
+        readerButton.isHidden = !activeTabIsTerminal
         focusActiveTab()
     }
 
     private func closeTab(_ index: Int) {
         guard tabs.indices.contains(index) else { return }
+
+        // ⌘W / chip-✕ on a terminal with a running foreground job: confirm
+        // before killing it. (The shell-exited path arrives here too, but by
+        // then the job is gone, so the prompt never fires for it.)
+        if !AppRuntime.isQuitting,
+           let tc = tabs[index] as? TerminalController, tc.hasRunningForegroundJob {
+            let alert = NSAlert()
+            alert.alertStyle = .warning
+            alert.messageText = "A process is still running in this tab."
+            alert.informativeText = "Closing the tab will end it."
+            alert.addButton(withTitle: "Close Tab")
+            alert.addButton(withTitle: "Cancel")
+            NSApp.activate(ignoringOtherApps: true)
+            guard alert.runModal() == .alertFirstButtonReturn else { return }
+        }
+
         if index == activeIndex && isFindBarVisible  { hideFindBar()       }
         if index == activeIndex && isPaletteVisible  { hideRecentPalette() }
         if index == activeIndex && isURLBarVisible   { hideURLBar()        }
         let tab = tabs.remove(at: index)
+        closeReaderIfNeeded(forClosing: tab)
+        clearBorrow(for: tab)
         tab.view.removeFromSuperview()
         tab.cleanup()
 
@@ -545,6 +860,7 @@ final class TerminalWindowController: NSObject, NSWindowDelegate {
         }
         activeIndex = min(activeIndex, tabs.count - 1)
         selectTab(activeIndex)
+        scheduleFrameSave()
     }
 
     private func focusActiveTab() {
@@ -567,8 +883,10 @@ final class TerminalWindowController: NSObject, NSWindowDelegate {
             if isURLBarVisible   { hideURLBar()        }
         }
 
+        closeReaderIfNeeded(forClosing: tab)
         tab.view.removeFromSuperview()
         tabs.remove(at: idx)
+        clearBorrow(for: tab)
 
         if tabs.isEmpty {
             panel.close()
@@ -576,6 +894,23 @@ final class TerminalWindowController: NSObject, NSWindowDelegate {
         }
         activeIndex = min(activeIndex, tabs.count - 1)
         selectTab(activeIndex)
+        scheduleFrameSave()
+    }
+
+    /// Reorders a tab within this window (tab-strip drag). The active tab stays
+    /// active regardless of where it (or its neighbours) moved.
+    func moveTab(from: Int, to: Int) {
+        guard tabs.indices.contains(from) else { return }
+        let target = max(0, min(tabs.count - 1, to))
+        guard target != from else { return }
+        let activeTab = tabs.indices.contains(activeIndex) ? tabs[activeIndex] : nil
+        let tab = tabs.remove(at: from)
+        tabs.insert(tab, at: target)
+        if let activeTab, let idx = tabs.firstIndex(where: { $0 === activeTab }) {
+            activeIndex = idx
+        }
+        refreshTabStrip()
+        scheduleFrameSave()
     }
 
     /// Host `tab` in this window and select it.
@@ -596,16 +931,172 @@ final class TerminalWindowController: NSObject, NSWindowDelegate {
                 self.closeTab(idx)
             }
         }
+        if let browserTab = tab as? BrowserController {
+            browserTab.onNavChanged = { [weak self] in self?.syncURLBar() }
+        }
 
         insertTab(tab)
     }
 
     /// Updates the tab strip contents and shows/hides it (only visible with 2+ tabs).
     private func refreshTabStrip() {
-        tabStrip.reload(titles: tabs.map { $0.title }, activeIndex: activeIndex)
+        let items = tabs.map {
+            TabStripView.Item(title: $0.displayName, status: status(of: $0),
+                              canReturn: isBorrowed($0))
+        }
+        tabStrip.reload(items: items, activeIndex: activeIndex)
         let show = tabs.count >= 2
         tabStrip.isHidden = !show
         tabStripHeightConstraint.constant = show ? tabStripHeight : 0
+    }
+
+    // MARK: - Session status / activity refresh
+
+    /// The attention state of one tab (unseen output wins over running).
+    func status(of tab: any TabContent) -> SessionStatus {
+        if tab.hasUnseenOutput { return .unseenOutput }
+        if let tc = tab as? TerminalController, tc.hasRunningForegroundJob { return .running }
+        return .idle
+    }
+
+    /// Timer tick: refresh chip labels/dots, the ticker strip, and the bubble
+    /// badge. Skipped when nothing of this window is on screen.
+    private func refreshActivity() {
+        if isTicker {
+            refreshTicker()
+            return
+        }
+        if isCollapsed {
+            // Aggregate across tabs for the bubble badge.
+            let agg: SessionStatus
+            if tabs.contains(where: { $0.hasUnseenOutput }) {
+                agg = .unseenOutput
+            } else if tabs.contains(where: { ($0 as? TerminalController)?.hasRunningForegroundJob == true }) {
+                agg = .running
+            } else {
+                agg = .idle
+            }
+            avatar?.setStatus(agg)
+            return
+        }
+        guard panel.isVisible else { return }
+        refreshTabStrip()
+        updateReturnButton()   // self-heal: never let a borrowed tab hide its way back
+    }
+
+    /// Keeps each tab's "the user can see me" flag honest. New output while a
+    /// tab is viewed never counts as unseen; marking a tab viewed clears its badge.
+    private func updateViewedFlags() {
+        let viewing = panel.isVisible && !isCollapsed
+        for (i, tab) in tabs.enumerated() {
+            tab.isCurrentlyViewed = viewing && i == activeIndex
+        }
+    }
+
+    // MARK: - Rename
+
+    /// Right-click → Rename Tab…: sets the custom name (empty clears it,
+    /// falling back to the automatic label).
+    private func promptRename(_ index: Int) {
+        guard tabs.indices.contains(index) else { return }
+        let tab = tabs[index]
+        let alert = NSAlert()
+        alert.messageText = "Rename Tab"
+        alert.informativeText = "Leave empty to go back to the automatic name."
+        alert.addButton(withTitle: "Rename")
+        alert.addButton(withTitle: "Cancel")
+        let field = NSTextField(frame: NSRect(x: 0, y: 0, width: 260, height: 24))
+        field.stringValue = tab.customName ?? ""
+        field.placeholderString = tab.displayName
+        alert.accessoryView = field
+        alert.window.initialFirstResponder = field
+        NSApp.activate(ignoringOtherApps: true)
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        let name = field.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        tab.customName = name.isEmpty ? nil : name
+        refreshTabStrip()
+        scheduleFrameSave()
+    }
+
+    // MARK: - Borrowed tabs (session-switcher summon / return)
+
+    /// Records that `tab` was borrowed from `source`, so the header can offer
+    /// to send it back. Call after adopting the tab.
+    func markBorrowed(_ tab: any TabContent, from source: TerminalWindowController) {
+        borrows.append(BorrowRecord(tabID: ObjectIdentifier(tab), source: source))
+        updateReturnButton()
+    }
+
+    private func borrowSource(for tab: any TabContent) -> TerminalWindowController? {
+        borrows.first { $0.tabID == ObjectIdentifier(tab) }?.source
+    }
+
+    private func clearBorrow(for tab: any TabContent) {
+        borrows.removeAll { $0.tabID == ObjectIdentifier(tab) }
+    }
+
+    /// Shows the header's return arrow only while the ACTIVE tab is borrowed
+    /// and its source window still exists.
+    private func updateReturnButton() {
+        let active = tabs.indices.contains(activeIndex) ? tabs[activeIndex] : nil
+        header.setReturnVisible(active.flatMap { borrowSource(for: $0) } != nil)
+    }
+
+    /// True when `tab` was borrowed here and its source window still exists.
+    func isBorrowed(_ tab: any TabContent) -> Bool {
+        borrowSource(for: tab) != nil
+    }
+
+    /// Sends the active borrowed tab back (header arrow).
+    private func returnBorrowedTab() {
+        returnBorrowedTab(at: activeIndex)
+    }
+
+    /// Sends the borrowed tab at `index` back to the window it came from
+    /// (which never left its Space). Closes this window if that was its last tab.
+    func returnBorrowedTab(at index: Int) {
+        guard tabs.indices.contains(index) else { return }
+        let tab = tabs[index]
+        guard let source = borrowSource(for: tab) else {
+            clearBorrow(for: tab)
+            updateReturnButton()
+            return
+        }
+        releaseTab(tab)          // also clears the borrow record
+        source.adoptTab(tab)
+    }
+
+    // MARK: - Switcher summon support
+
+    /// Selects a tab by index (public entry for the session switcher).
+    func selectTab(at index: Int) { selectTab(index) }
+
+    /// Brings the WHOLE window to the user's current Space — used when
+    /// summoning the only tab of a pinned window (nothing would remain on the
+    /// source Space, so borrowing is wrong: the Return arrow must never point
+    /// at a dead source). Handles every combined state: unpins panel + bubble
+    /// + ticker strip, un-ghosts, expands collapsed/tickered windows, and
+    /// un-minimizes — landing at `targetFrame` when given (the summon grid
+    /// point). Re-pin to link it to a Space again.
+    func unpinAndSummon(at targetFrame: NSRect? = nil) {
+        if panel.isPinned {
+            panel.setPinned(false)
+            header.setPinned(false)
+            pinnedAppName = nil
+        }
+        avatar?.setPinned(false)
+        ticker?.setPinned(false)
+        if isGhosted { setGhosted(false) }
+        if isCollapsed {
+            expandFromAvatar(to: targetFrame)
+        } else if isTicker {
+            expandFromTicker(to: targetFrame)
+        } else {
+            if let targetFrame {
+                panel.setFrame(panel.clampToVisibleScreen(targetFrame), display: false)
+            }
+            show()   // also clears isMinimized
+        }
     }
 
     // MARK: - One-time browser resource notice
@@ -697,6 +1188,362 @@ final class TerminalWindowController: NSObject, NSWindowDelegate {
         focusActiveTab()
     }
 
+    // MARK: - Selection action bar (terminal-only)
+
+    private func setupSelectionBar() {
+        selectionBar.isHidden = true
+        // Frame-positioned (follows the mouse), so no Auto Layout here.
+        selectionBar.translatesAutoresizingMaskIntoConstraints = true
+        root.addSubview(selectionBar)
+
+        selectionBar.onCopy = { [weak self] in
+            guard let self else { return }
+            NSPasteboard.general.clearContents()
+            NSPasteboard.general.setString(self.selectionText, forType: .string)
+            self.hideSelectionBar()
+        }
+        selectionBar.onOpen = { [weak self] in
+            guard let self else { return }
+            self.openSelectionTarget()
+            self.hideSelectionBar()
+        }
+        selectionBar.onSearch = { [weak self] in
+            guard let self else { return }
+            self.openBrowserTab(loading: self.selectionText)   // non-URL → DDG search
+            self.hideSelectionBar()
+        }
+        selectionBar.onInsert = { [weak self] in
+            guard let self else { return }
+            self.activeTerminalView?.send(txt: self.selectionText)
+            self.hideSelectionBar()
+            self.focusActiveTab()
+        }
+    }
+
+    /// SwiftTerm's mouse handlers aren't `open`, so selection is detected via
+    /// a local event monitor: mouse-up over the active terminal with a live
+    /// selection shows the bar; mouse-down anywhere else dismisses it.
+    private var mouseMonitor: Any?
+
+    private func installSelectionMonitor() {
+        mouseMonitor = NSEvent.addLocalMonitorForEvents(
+            matching: [.leftMouseDown, .leftMouseUp]
+        ) { [weak self] event in
+            self?.handleSelectionMouse(event)
+            return event
+        }
+    }
+
+    private func handleSelectionMouse(_ event: NSEvent) {
+        guard event.window === panel else { return }
+
+        if event.type == .leftMouseDown {
+            // Keep the bar when the click is ON the bar (its buttons).
+            let p = root.convert(event.locationInWindow, from: nil)
+            if selectionBar.isHidden || !selectionBar.frame.contains(p) {
+                hideSelectionBar()
+            }
+            return
+        }
+
+        // Mouse-up: show the bar if the active terminal has a selection.
+        guard let tv = activeTerminalView else { return }
+        let pInTV = tv.convert(event.locationInWindow, from: nil)
+        guard tv.bounds.contains(pInTV) else { return }
+        let windowPoint = event.locationInWindow
+        // Defer one tick so SwiftTerm finishes committing the selection.
+        DispatchQueue.main.async { [weak self] in
+            guard let self, let tv = self.activeTerminalView else { return }
+            guard tv.hasSelection,
+                  let text = tv.selectedText,
+                  !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
+            self.showSelectionBar(at: windowPoint, text: text)
+        }
+    }
+
+    private func showSelectionBar(at windowPoint: NSPoint, text: String) {
+        selectionText = text
+        selectionBar.setOpenAvailable(selectionOpenTarget() != nil)
+
+        let size = NSSize(width: selectionBar.naturalWidth, height: SelectionActionBar.barHeight)
+        let p = root.convert(windowPoint, from: nil)
+        var origin = NSPoint(x: p.x - size.width / 2, y: p.y + 14)
+        // Keep the bar inside the content area (below the header/tab strip).
+        let area = contentArea.frame
+        origin.x = min(max(origin.x, area.minX + 6), area.maxX - size.width - 6)
+        origin.y = min(max(origin.y, area.minY + 6), area.maxY - size.height - 6)
+        selectionBar.frame = NSRect(origin: origin, size: size)
+        root.addSubview(selectionBar, positioned: .above, relativeTo: nil)
+        selectionBar.isHidden = false
+    }
+
+    private func hideSelectionBar() {
+        selectionBar.isHidden = true
+    }
+
+    /// What "Open" would do with the current selection: a web URL, or an
+    /// existing file/folder (relative paths resolve against the shell's cwd).
+    private enum OpenTarget {
+        case url(String)
+        case file(URL)
+    }
+
+    private func selectionOpenTarget() -> OpenTarget? {
+        let t = selectionText.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !t.isEmpty, !t.contains("\n") else { return nil }
+        if t.contains("://") { return .url(t) }
+        if t.lowercased().hasPrefix("www."), !t.contains(" ") { return .url("https://\(t)") }
+        guard !t.contains(" ") else { return nil }
+
+        // Strip a trailing :line(:col) suffix from compiler/stack-trace paths.
+        let pathPart = t.replacingOccurrences(of: #":\d+(:\d+)?$"#, with: "",
+                                              options: .regularExpression)
+        var candidate = (pathPart as NSString).expandingTildeInPath
+        if !candidate.hasPrefix("/") {
+            let cwd = (tabs.indices.contains(activeIndex)
+                       ? tabs[activeIndex] as? TerminalController : nil)?
+                .currentWorkingDirectory ?? NSHomeDirectory()
+            candidate = (cwd as NSString).appendingPathComponent(candidate)
+        }
+        if FileManager.default.fileExists(atPath: candidate) {
+            return .file(URL(fileURLWithPath: candidate))
+        }
+        return nil
+    }
+
+    private func openSelectionTarget() {
+        switch selectionOpenTarget() {
+        case .url(let s):     openBrowserTab(loading: s)
+        case .file(let url):  NSWorkspace.shared.open(url)
+        case nil:             break
+        }
+    }
+
+    /// Opens a new in-app browser tab loading `text` (URL or search query).
+    private func openBrowserTab(loading text: String) {
+        addBrowserTab()
+        (tabs.indices.contains(activeIndex)
+         ? tabs[activeIndex] as? BrowserController : nil)?.load(text)
+    }
+
+    // MARK: - Context Snap (give the terminal agent eyes on what's behind)
+
+    /// Captures what this window is overlaying and points the active terminal
+    /// agent (Claude / Fable) at it. Flow: a ⇧⌘4-style region picker appears —
+    /// drag to capture a portion, click for the whole screen behind, Esc to
+    /// cancel — then:
+    /// - image mode: PNG saved, its path typed at the prompt;
+    /// - asText (⌥): local OCR, then a review sheet where the wanted portion
+    ///   of the text can be selected before inserting.
+    private func captureContext(asText: Bool) {
+        guard activeTabIsTerminal else { return }   // needs a prompt to type into
+        guard ContextSnap.ensurePermission() else { return }
+        RegionSelector.begin(on: panel.screen) { [weak self] region in
+            guard let self, let region else { return }   // nil = Esc
+            let area: NSRect? = region.isEmpty ? nil : region
+            guard let image = ContextSnap.captureBehind(self.panel, region: area) else {
+                NSLog("FloatyTerm: context snap capture returned nil")
+                return
+            }
+            if asText {
+                ContextSnap.recognizeText(in: image) { [weak self] text in
+                    self?.presentOCRReview(text ?? "")
+                }
+            } else if let url = ContextSnap.saveImage(image) {
+                self.insertSnapPath(url)
+            }
+        }
+    }
+
+    /// Shows the recognized text for review: the user selects just the portion
+    /// they want (or leaves it all), then inserts it as typed text or as a
+    /// saved .txt path.
+    private func presentOCRReview(_ text: String) {
+        NSApp.activate(ignoringOtherApps: true)
+        guard !text.isEmpty else {
+            let alert = NSAlert()
+            alert.alertStyle = .informational
+            alert.messageText = "No text recognized"
+            alert.informativeText = "The captured area didn't contain readable text."
+            alert.runModal()
+            return
+        }
+
+        let alert = NSAlert()
+        alert.messageText = "Captured text"
+        alert.informativeText = "Select just the part you want — or leave it unselected to use everything."
+        alert.addButton(withTitle: "Insert Text")
+        alert.addButton(withTitle: "Insert as File")
+        alert.addButton(withTitle: "Cancel")
+
+        let scroll = NSScrollView(frame: NSRect(x: 0, y: 0, width: 480, height: 260))
+        let textView = NSTextView(frame: scroll.bounds)
+        textView.string = text
+        textView.isEditable = false
+        textView.isSelectable = true
+        textView.font = .monospacedSystemFont(ofSize: 12, weight: .regular)
+        textView.autoresizingMask = [.width]
+        scroll.documentView = textView
+        scroll.hasVerticalScroller = true
+        scroll.borderType = .bezelBorder
+        alert.accessoryView = scroll
+
+        let response = alert.runModal()
+        let range = textView.selectedRange()
+        let chosen = range.length > 0 ? (text as NSString).substring(with: range) : text
+        switch response {
+        case .alertFirstButtonReturn:
+            activeTerminalView?.send(txt: chosen)
+            focusActiveTab()
+        case .alertSecondButtonReturn:
+            if let url = ContextSnap.saveText(chosen) { insertSnapPath(url) }
+        default:
+            break
+        }
+    }
+
+    /// Types the snap's path at the prompt (trailing space so the user can
+    /// continue with their question) and focuses the terminal.
+    private func insertSnapPath(_ url: URL) {
+        activeTerminalView?.send(txt: url.path + " ")
+        focusActiveTab()
+    }
+
+    // MARK: - Snap history (right-click the camera button)
+
+    /// Rebuilds the camera button's history menu: recent snaps (thumbnails for
+    /// images), each insertable with a click or revealable with ⌥-click.
+    private func buildSnapHistoryMenu(_ menu: NSMenu) {
+        menu.removeAllItems()
+        let snaps = ContextSnap.listSnaps()
+
+        if snaps.isEmpty {
+            let empty = NSMenuItem(title: "No snaps yet", action: nil, keyEquivalent: "")
+            empty.isEnabled = false
+            menu.addItem(empty)
+        }
+
+        for url in snaps.prefix(12) {
+            let item = NSMenuItem(title: url.lastPathComponent,
+                                  action: #selector(insertSnapFromMenu(_:)), keyEquivalent: "")
+            item.target = self
+            item.representedObject = url
+            item.image = url.pathExtension == "png"
+                ? Self.snapThumbnail(url)
+                : NSImage(systemSymbolName: "doc.text", accessibilityDescription: "Text snap")
+            menu.addItem(item)
+
+            // ⌥ variant of the same row: reveal in Finder instead of insert.
+            let alt = NSMenuItem(title: "Reveal \(url.lastPathComponent) in Finder",
+                                 action: #selector(revealSnapFromMenu(_:)), keyEquivalent: "")
+            alt.target = self
+            alt.representedObject = url
+            alt.isAlternate = true
+            alt.keyEquivalentModifierMask = [.option]
+            menu.addItem(alt)
+        }
+
+        menu.addItem(.separator())
+        let reveal = NSMenuItem(title: "Reveal Snaps Folder",
+                                action: #selector(revealSnapsFolder), keyEquivalent: "")
+        reveal.target = self
+        menu.addItem(reveal)
+        if !snaps.isEmpty {
+            let clear = NSMenuItem(title: "Delete All Snaps",
+                                   action: #selector(deleteAllSnaps), keyEquivalent: "")
+            clear.target = self
+            menu.addItem(clear)
+        }
+    }
+
+    @objc private func insertSnapFromMenu(_ sender: NSMenuItem) {
+        guard let url = sender.representedObject as? URL else { return }
+        if activeTabIsTerminal {
+            insertSnapPath(url)
+        } else {
+            // No prompt to type into — make the path available anyway.
+            NSPasteboard.general.clearContents()
+            NSPasteboard.general.setString(url.path, forType: .string)
+        }
+    }
+
+    @objc private func revealSnapFromMenu(_ sender: NSMenuItem) {
+        guard let url = sender.representedObject as? URL else { return }
+        NSWorkspace.shared.activateFileViewerSelecting([url])
+    }
+
+    @objc private func revealSnapsFolder() {
+        NSWorkspace.shared.activateFileViewerSelecting([ContextSnap.snapsDirectory])
+    }
+
+    @objc private func deleteAllSnaps() {
+        let alert = NSAlert()
+        alert.alertStyle = .warning
+        alert.messageText = "Delete all snaps?"
+        alert.informativeText = "Sessions that reference these paths will no longer find them."
+        alert.addButton(withTitle: "Delete All")
+        alert.addButton(withTitle: "Cancel")
+        NSApp.activate(ignoringOtherApps: true)
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        ContextSnap.deleteAllSnaps()
+    }
+
+    /// Small menu thumbnail for an image snap.
+    private static func snapThumbnail(_ url: URL) -> NSImage? {
+        guard let image = NSImage(contentsOf: url) else { return nil }
+        let size = NSSize(width: 46, height: 29)
+        let thumb = NSImage(size: size)
+        thumb.lockFocus()
+        image.draw(in: NSRect(origin: .zero, size: size),
+                   from: .zero, operation: .copy, fraction: 1)
+        thumb.unlockFocus()
+        return thumb
+    }
+
+    // MARK: - Transcript reader
+
+    /// A subtle button in the content area's bottom-right corner — "next to
+    /// what the agent is outputting" — toggling the live transcript reader.
+    private func setupReaderButton() {
+        readerButton.image = NSImage(systemSymbolName: "doc.plaintext",
+                                     accessibilityDescription: "Live transcript")
+        readerButton.isBordered = false
+        readerButton.contentTintColor = NSColor.white.withAlphaComponent(0.45)
+        readerButton.toolTip = "Live transcript — scroll & search this session's output as it streams"
+        readerButton.target = self
+        readerButton.action = #selector(toggleTranscriptReader)
+        readerButton.translatesAutoresizingMaskIntoConstraints = false
+        root.addSubview(readerButton)
+        NSLayoutConstraint.activate([
+            readerButton.trailingAnchor.constraint(equalTo: contentArea.trailingAnchor, constant: -10),
+            readerButton.bottomAnchor.constraint(equalTo: contentArea.bottomAnchor, constant: -8),
+            readerButton.widthAnchor.constraint(equalToConstant: 24)
+        ])
+    }
+
+    @objc private func toggleTranscriptReader() {
+        if let reader = transcriptReader {
+            reader.close()       // onClosed clears transcriptReader
+            return
+        }
+        guard let tc = tabs.indices.contains(activeIndex)
+                ? tabs[activeIndex] as? TerminalController : nil else { return }
+        let reader = TranscriptReaderController(session: tc, parent: panel,
+                                                displayName: tc.displayName)
+        reader.onClosed = { [weak self] in self?.transcriptReader = nil }
+        transcriptReader = reader
+        reader.show()
+    }
+
+    /// The reader docks to the panel as a child window; close it whenever the
+    /// panel leaves the screen or its session goes away, so it can't orphan.
+    private func closeReaderIfNeeded(forClosing tab: (any TabContent)? = nil) {
+        guard let reader = transcriptReader else { return }
+        if tab == nil || reader.session === (tab as? TerminalController) {
+            reader.close()
+        }
+    }
+
     // MARK: - NSWindowDelegate
 
     func windowShouldClose(_ sender: NSWindow) -> Bool {
@@ -725,6 +1572,16 @@ final class TerminalWindowController: NSObject, NSWindowDelegate {
     }
 
     func windowWillClose(_ notification: Notification) {
+        closeReaderIfNeeded()
+        activityTimer?.invalidate()
+        activityTimer = nil
+        if let m = mouseMonitor { NSEvent.removeMonitor(m); mouseMonitor = nil }
+        // A collapsed/tickered window can be closed (e.g. its tab was borrowed
+        // away); don't leave an orphaned bubble or strip floating around.
+        avatar?.orderOut(nil)
+        avatar = nil
+        ticker?.orderOut(nil)
+        ticker = nil
         DispatchQueue.main.async { [weak self] in
             guard let self else { return }
             self.onClosed?(self)
@@ -733,8 +1590,19 @@ final class TerminalWindowController: NSObject, NSWindowDelegate {
 
     func windowDidBecomeKey(_ notification: Notification) { applyAppearance(focused: true)  }
     func windowDidResignKey(_ notification: Notification) { applyAppearance(focused: false) }
-    func windowDidMove(_ notification: Notification)      { persistFrameIfRoaming() }
-    func windowDidResize(_ notification: Notification)    { persistFrameIfRoaming() }
+    func windowDidMove(_ notification: Notification)      { scheduleFrameSave() }
+    func windowDidResize(_ notification: Notification)    { scheduleFrameSave() }
+
+    /// Move/resize fire continuously during a drag; coalesce into one
+    /// state-record write shortly after the gesture settles. Per-window records
+    /// mean a pinned window's geometry is safe to persist too — it can no
+    /// longer clobber a shared default.
+    private func scheduleFrameSave() {
+        frameSaveWork?.cancel()
+        let work = DispatchWorkItem { [weak self] in self?.onStateChanged?() }
+        frameSaveWork = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.4, execute: work)
+    }
 
     // MARK: - Recent-commands palette (terminal-only)
 
