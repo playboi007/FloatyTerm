@@ -1102,6 +1102,14 @@ final class TerminalWindowController: NSObject, NSWindowDelegate {
     /// Selects a tab by index (public entry for the session switcher).
     func selectTab(at index: Int) { selectTab(index) }
 
+    /// Closes a specific tab (public entry for the session switcher's ✕ /
+    /// ⌘⌫). Runs the same running-job confirmation as ⌘W; closing the last
+    /// tab closes the window.
+    func closeSession(_ tab: any TabContent) {
+        guard let idx = tabs.firstIndex(where: { $0 === tab }) else { return }
+        closeTab(idx)
+    }
+
     /// Lends this window's ONLY tab to a borrower on the user's Space. Unlike
     /// `releaseTab`, the emptied window does NOT close: it stays behind on its
     /// own Space — still pinned, still collapsed / tickered / ghosted, exactly

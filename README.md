@@ -27,7 +27,10 @@ Electron, no web stack — it idles at near-zero CPU and ~30–60 MB RAM.
 - **Session switcher (⌥⌘K)** — fuzzy-search every tab in every window and
   summon it to the Space you're on; tabs borrowed from a pinned window get a
   return arrow that sends them back where they came from (a single-tab window
-  lends its session and waits on its Space, so Return restores it exactly)
+  lends its session and waits on its Space, so Return restores it exactly).
+  Each row shows exactly where the session lives — its window's avatar glyph,
+  a window number, its state, and the app it overlays ("win 2 · in bubble
+  (Chrome)") — and ✕ / ⌘⌫ closes a session right from the list
 - **Summon grid** — pick which of nine screen positions summoned and borrowed
   windows land on (Preferences), so they never cover the terminal you're
   already watching

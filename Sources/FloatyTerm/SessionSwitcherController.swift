@@ -5,9 +5,14 @@ struct SessionEntry {
     weak var window: TerminalWindowController?
     let tab: any TabContent
     let name: String
-    let location: String        // "here" / "another Space" / "hidden" / "in bubble"
+    let location: String        // "win 2 · in bubble (Chrome)" — which window,
+                                // in what state, over which app
     let status: SessionStatus
     let isTerminal: Bool
+    /// The host window's avatar identity (the same symbol + ring color as its
+    /// bubble), so rows are matchable to windows at a glance.
+    let windowSymbol: String
+    let windowColor: NSColor
 }
 
 /// The global session switcher (⌥⌘K, or ⌘K inside a window): a floating
@@ -24,6 +29,13 @@ final class SessionSwitcherController: NSObject, NSTextFieldDelegate,
     var sessionsProvider: () -> [SessionEntry] = { [] }
     /// Called with the chosen entry (palette is dismissed first).
     var onSummon: ((SessionEntry) -> Void)?
+    /// Called with the entry whose ✕ was clicked (or ⌘⌫); the palette stays
+    /// open and refreshes its list afterwards.
+    var onClose: ((SessionEntry) -> Void)?
+
+    /// True while a close runs: its running-job confirmation alert steals key
+    /// from the palette, which must not be mistaken for a click-away dismiss.
+    private var suppressDismissOnResign = false
 
     private var panel: SwitcherPanel?
     private let searchField = NSTextField()
@@ -59,6 +71,7 @@ final class SessionSwitcherController: NSObject, NSTextFieldDelegate,
 
     /// Clicking anywhere else dismisses the palette.
     func windowDidResignKey(_ notification: Notification) {
+        guard !suppressDismissOnResign else { return }
         dismiss()
     }
 
@@ -119,7 +132,7 @@ final class SessionSwitcherController: NSObject, NSTextFieldDelegate,
         scrollView.borderType = .noBorder
         scrollView.translatesAutoresizingMaskIntoConstraints = false
 
-        let hint = NSTextField(labelWithString: "↩ summon here   ↑↓ navigate   esc dismiss")
+        let hint = NSTextField(labelWithString: "↩ summon here   ⌘⌫ close session   ↑↓ navigate   esc dismiss")
         hint.font = .systemFont(ofSize: 10, weight: .light)
         hint.textColor = NSColor.white.withAlphaComponent(0.45)
         hint.alignment = .center
@@ -161,7 +174,7 @@ final class SessionSwitcherController: NSObject, NSTextFieldDelegate,
 
     // MARK: - Filtering / selection
 
-    private func applyFilter(_ text: String) {
+    private func applyFilter(_ text: String, preferredRow: Int = 0) {
         if text.isEmpty {
             filtered = all
         } else {
@@ -173,8 +186,9 @@ final class SessionSwitcherController: NSObject, NSTextFieldDelegate,
         }
         tableView.reloadData()
         if !filtered.isEmpty {
-            tableView.selectRowIndexes(IndexSet(integer: 0), byExtendingSelection: false)
-            tableView.scrollRowToVisible(0)
+            let row = max(0, min(filtered.count - 1, preferredRow))
+            tableView.selectRowIndexes(IndexSet(integer: row), byExtendingSelection: false)
+            tableView.scrollRowToVisible(row)
         }
     }
 
@@ -201,6 +215,26 @@ final class SessionSwitcherController: NSObject, NSTextFieldDelegate,
         summonSelected()
     }
 
+    /// Closes one session in place: the palette stays open, refreshes its
+    /// list, and keeps the selection near where it was.
+    private func close(_ entry: SessionEntry) {
+        let keepRow = tableView.selectedRow
+        suppressDismissOnResign = true
+        onClose?(entry)
+        suppressDismissOnResign = false
+        all = sessionsProvider()
+        applyFilter(searchField.stringValue, preferredRow: max(0, keepRow))
+        // The confirmation alert (if any) took key — reclaim it.
+        panel?.makeKey()
+        panel?.makeFirstResponder(searchField)
+    }
+
+    private func closeSelected() {
+        let row = tableView.selectedRow
+        guard row >= 0, row < filtered.count else { return }
+        close(filtered[row])
+    }
+
     // MARK: - NSTextFieldDelegate
 
     func controlTextDidChange(_ obj: Notification) {
@@ -214,6 +248,10 @@ final class SessionSwitcherController: NSObject, NSTextFieldDelegate,
         case #selector(NSResponder.moveUp(_:)):          moveSelection(by: -1); return true
         case #selector(NSResponder.cancelOperation(_:)): dismiss(); return true
         case #selector(NSResponder.insertNewline(_:)):   summonSelected(); return true
+        // ⌘⌫ in a text field arrives as delete-to-beginning-of-line; here it
+        // means "close the selected session" (the hint line documents it).
+        case #selector(NSResponder.deleteToBeginningOfLine(_:)):
+            closeSelected(); return true
         default: return false
         }
     }
@@ -232,7 +270,9 @@ final class SessionSwitcherController: NSObject, NSTextFieldDelegate,
             cell = SessionCellView()
             cell.identifier = id
         }
-        cell.configure(filtered[row])
+        let entry = filtered[row]
+        cell.configure(entry)
+        cell.onClose = { [weak self] in self?.close(entry) }
         return cell
     }
 
@@ -255,12 +295,16 @@ private final class SwitcherRowView: NSTableRowView {
     }
 }
 
-/// Row layout: [status dot] [type icon] [name ……………] [location].
+/// Row layout: [status dot] [type icon] [name ……………] [window avatar] [location] [✕].
 private final class SessionCellView: NSTableCellView {
     private let dot = NSView()
     private let icon = NSImageView()
     private let nameLabel = NSTextField(labelWithString: "")
+    private let avatarIcon = NSImageView()
     private let locationLabel = NSTextField(labelWithString: "")
+    private let closeButton = NSButton()
+
+    var onClose: (() -> Void)?
 
     init() {
         super.init(frame: .zero)
@@ -278,15 +322,30 @@ private final class SessionCellView: NSTableCellView {
         nameLabel.translatesAutoresizingMaskIntoConstraints = false
         nameLabel.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
 
+        // The host window's avatar, in its ring color — the same identity as
+        // its collapsed bubble, so "which window is this in" reads at a glance.
+        avatarIcon.translatesAutoresizingMaskIntoConstraints = false
+
         locationLabel.font = .systemFont(ofSize: 11)
-        locationLabel.textColor = NSColor.white.withAlphaComponent(0.45)
+        locationLabel.textColor = NSColor.white.withAlphaComponent(0.6)
         locationLabel.translatesAutoresizingMaskIntoConstraints = false
         locationLabel.setContentHuggingPriority(.required, for: .horizontal)
+
+        closeButton.image = NSImage(systemSymbolName: "xmark.circle.fill",
+                                    accessibilityDescription: "Close session")
+        closeButton.isBordered = false
+        closeButton.contentTintColor = NSColor.white.withAlphaComponent(0.35)
+        closeButton.target = self
+        closeButton.action = #selector(closeTapped)
+        closeButton.toolTip = "Close this session (⌘⌫)"
+        closeButton.translatesAutoresizingMaskIntoConstraints = false
 
         addSubview(dot)
         addSubview(icon)
         addSubview(nameLabel)
+        addSubview(avatarIcon)
         addSubview(locationLabel)
+        addSubview(closeButton)
 
         NSLayoutConstraint.activate([
             dot.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 14),
@@ -301,10 +360,20 @@ private final class SessionCellView: NSTableCellView {
 
             nameLabel.leadingAnchor.constraint(equalTo: icon.trailingAnchor, constant: 8),
             nameLabel.centerYAnchor.constraint(equalTo: centerYAnchor),
-            nameLabel.trailingAnchor.constraint(lessThanOrEqualTo: locationLabel.leadingAnchor, constant: -8),
+            nameLabel.trailingAnchor.constraint(lessThanOrEqualTo: avatarIcon.leadingAnchor, constant: -8),
 
-            locationLabel.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -14),
-            locationLabel.centerYAnchor.constraint(equalTo: centerYAnchor)
+            avatarIcon.trailingAnchor.constraint(equalTo: locationLabel.leadingAnchor, constant: -5),
+            avatarIcon.centerYAnchor.constraint(equalTo: centerYAnchor),
+            avatarIcon.widthAnchor.constraint(equalToConstant: 13),
+            avatarIcon.heightAnchor.constraint(equalToConstant: 13),
+
+            locationLabel.trailingAnchor.constraint(equalTo: closeButton.leadingAnchor, constant: -6),
+            locationLabel.centerYAnchor.constraint(equalTo: centerYAnchor),
+
+            closeButton.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -10),
+            closeButton.centerYAnchor.constraint(equalTo: centerYAnchor),
+            closeButton.widthAnchor.constraint(equalToConstant: 18),
+            closeButton.heightAnchor.constraint(equalToConstant: 18)
         ])
     }
 
@@ -315,6 +384,11 @@ private final class SessionCellView: NSTableCellView {
         icon.image = NSImage(systemSymbolName: entry.isTerminal ? "terminal" : "globe",
                              accessibilityDescription: entry.isTerminal ? "Terminal" : "Browser")
         nameLabel.stringValue = entry.name
+        avatarIcon.image = NSImage(systemSymbolName: entry.windowSymbol,
+                                   accessibilityDescription: "Window avatar")
+        avatarIcon.contentTintColor = entry.windowColor
         locationLabel.stringValue = entry.location
     }
+
+    @objc private func closeTapped() { onClose?() }
 }

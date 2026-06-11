@@ -30,6 +30,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         switcher.sessionsProvider = { [weak self] in self?.sessionEntries() ?? [] }
         switcher.onSummon = { [weak self] entry in self?.summon(entry) }
+        switcher.onClose = { [weak self] entry in
+            guard let self, let wc = entry.window,
+                  self.windows.contains(where: { $0 === wc }) else { return }
+            wc.closeSession(entry.tab)
+        }
 
         // Feed the menu the list of individually-minimized windows so each can
         // be restored on its own, and provide the restore action.
@@ -342,15 +347,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     /// Snapshot of every session (tab) across every window for the switcher.
+    /// With multiple windows the location carries a "win N" prefix, and every
+    /// row gets its window's avatar identity — together they pin down exactly
+    /// which window (and overlaid app) a session lives in.
     private func sessionEntries() -> [SessionEntry] {
-        windows.flatMap { wc in
-            wc.tabs.map { tab in
+        let many = windows.count > 1
+        return windows.enumerated().flatMap { i, wc in
+            let prefix = many ? "win \(i + 1) · " : ""
+            return wc.tabs.map { tab in
                 SessionEntry(window: wc,
                              tab: tab,
                              name: tab.displayName,
-                             location: location(of: wc),
+                             location: prefix + location(of: wc),
                              status: wc.status(of: tab),
-                             isTerminal: tab is TerminalController)
+                             isTerminal: tab is TerminalController,
+                             windowSymbol: wc.avatarStyle.symbol,
+                             windowColor: wc.avatarStyle.color)
             }
         }
     }
