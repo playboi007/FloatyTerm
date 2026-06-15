@@ -8,11 +8,35 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private let settingsWC = SettingsWindowController()
     private let switcher = SessionSwitcherController()
 
+    /// Drives the menu-bar fleet summary (working / waiting counts across
+    /// every terminal tab in every window). Strong reference — a scheduled
+    /// Timer is only retained by its run loop while valid.
+    private var fleetSummaryTimer: Timer?
+
     func applicationDidFinishLaunching(_ notification: Notification) {
+        // Loopback relay for remote devtools awareness: external pages that
+        // include http://127.0.0.1:7777/floaty.js stream console/network
+        // events into agent-tailable logs under App Support/FloatyTerm/Devtools.
+        DevtoolsRelay.shared.start()
+
+        // Keep per-feature data (Devtools logs, Browser Context captures,
+        // Context Snaps) within the user's retention/size budget: one sweep
+        // now, then hourly.
+        StorageJanitor.shared.start()
+
         // Restore every window from the per-window records (frame + avatar
         // style). No records (first run / legacy install) → one fresh window,
         // which falls back to the old shared-frame slot for migration.
         let records = WindowStateStore.load()
+
+        // Sweep transcript logs no saved tab claims. Sessions discarded while
+        // the app runs delete their own file; this catches what they can't —
+        // "Quit Without Saving", crashed-away windows, pinned windows dropped
+        // at quit. Runs before any restored tab re-opens its log.
+        let liveSessionIDs = Set(records.flatMap { $0.tabs ?? [] }
+                                        .compactMap { $0.sessionID })
+        TranscriptDisk.purgeOrphans(keeping: liveSessionIDs)
+
         if records.isEmpty {
             makeWindow()
         } else {
@@ -24,6 +48,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         statusItem.onToggle        = { [weak self] in self?.toggle() }
         statusItem.onNewWindow     = { [weak self] in self?.makeWindow() }
+        statusItem.onRunBackgroundTask = { [weak self] in self?.runBackgroundTask() }
         statusItem.onNewTab        = { [weak self] in self?.newTerminalTabInCurrentWindow() }
         statusItem.onNewBrowserTab = { [weak self] in self?.newBrowserTabInCurrentWindow() }
         statusItem.onPreferences   = { [weak self] in self?.settingsWC.show() }
@@ -57,6 +82,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         statusItem.onUnghostWindow = { [weak self] id in
             self?.windows.first { $0.id == id }?.setGhosted(false)
         }
+
+        // Fleet summary: periodically count terminal sessions that are
+        // working vs. blocked waiting on the user, and surface the totals
+        // beside the menu-bar icon.
+        let timer = Timer.scheduledTimer(withTimeInterval: 3, repeats: true) { [weak self] _ in
+            guard let self else { return }
+            let terminals = self.windows.flatMap(\.tabs)
+                .compactMap { $0 as? TerminalController }
+            let waiting = terminals.filter(\.awaitingInput).count
+            let working = terminals.filter { $0.hasRunningForegroundJob && !$0.awaitingInput }.count
+            self.statusItem.updateSummary(working: working, waiting: waiting)
+        }
+        timer.tolerance = 1
+        fleetSummaryTimer = timer
 
         // Re-register the global hotkey if it changes in Preferences.
         NotificationCenter.default.addObserver(
@@ -237,10 +276,62 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         wc.onStateChanged = { [weak self] in self?.persistWindowState() }
         wc.onOpenSwitcher = { [weak self] in self?.toggleSwitcher() }
+        wc.onSessionDone = { [weak self] tab in self?.summonForAttention(tab) }
+    }
+
+    /// An armed "notify when done" session finished: bring it to the user's
+    /// current Space via the switcher's summon path (which handles every
+    /// window state — hidden, collapsed, tickered, pinned-away via borrow),
+    /// then pulse whichever window hosts the tab now so the arrival is seen.
+    private func summonForAttention(_ tab: any TabContent) {
+        guard let wc = windows.first(where: { w in w.tabs.contains { $0 === tab } }) else { return }
+        summon(SessionEntry(window: wc, tab: tab, name: tab.displayName,
+                            location: "", status: .idle,
+                            isTerminal: tab is TerminalController,
+                            isAgent: (tab as? TerminalController)?.isAgentSession == true,
+                            windowSymbol: wc.avatarStyle.symbol,
+                            windowColor: wc.avatarStyle.color))
+        // Re-resolve the host: a pinned-away source lends the tab to a fresh
+        // borrower window created by summon().
+        windows.first(where: { w in w.tabs.contains { $0 === tab } })?.pulseAttention()
     }
 
     private func currentWindow() -> TerminalWindowController? {
         windows.first(where: { $0.isKey }) ?? windows.last
+    }
+
+    /// Fire-and-forget: ask for a command, run it in a fresh session that
+    /// immediately collapses to a bubble, armed to summon the user when it
+    /// finishes (the window's 2s tick → onSessionDone → summonForAttention
+    /// handles the rest).
+    private func runBackgroundTask() {
+        let alert = NSAlert()
+        alert.alertStyle = .informational
+        alert.messageText = "Run Task in Background"
+        alert.informativeText = "Runs in a new session collapsed to a bubble; "
+            + "it will summon you when it finishes."
+        let field = NSTextField(frame: NSRect(x: 0, y: 0, width: 280, height: 24))
+        field.placeholderString = "e.g. npm test"
+        alert.accessoryView = field
+        alert.addButton(withTitle: "Run")
+        alert.addButton(withTitle: "Cancel")
+        alert.window.initialFirstResponder = field
+        NSApp.activate(ignoringOtherApps: true)
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        let command = field.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !command.isEmpty else { return }
+
+        // Inherit the directory the user is currently working in.
+        let wc = makeWindow(initialDirectory: currentWindow()?.activeTerminalWorkingDirectory)
+        // Give the shell a beat to start (the pty buffers input regardless),
+        // then type the command, arm notify-when-done, and get out of the way.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) { [weak self, weak wc] in
+            guard let self, let wc, self.windows.contains(where: { $0 === wc }),
+                  let session = wc.tabs.first as? TerminalController else { return }
+            session.run(command: command)
+            session.notifyWhenDone = true
+            wc.collapseToAvatar()
+        }
     }
 
     private func newTerminalTabInCurrentWindow() {
@@ -361,6 +452,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                              location: prefix + location(of: wc),
                              status: wc.status(of: tab),
                              isTerminal: tab is TerminalController,
+                             isAgent: (tab as? TerminalController)?.isAgentSession == true,
                              windowSymbol: wc.avatarStyle.symbol,
                              windowColor: wc.avatarStyle.color)
             }
@@ -373,6 +465,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if wc.isCollapsed { return wc.isPinned ? "in bubble\(app)" : "in bubble" }
         if wc.isTicker { return wc.isPinned ? "in ticker\(app)" : "in ticker" }
         if wc.isGhosted { return "ghosted" }
+        if let linked = wc.linkedAppName {
+            return wc.isVisible ? "over \(linked)" : "waiting for \(linked)"
+        }
         if wc.isMinimized || !wc.isVisible { return wc.isPinned ? "hidden\(app)" : "hidden" }
         if wc.isPinned {
             // Judge by actual on-screen presence, not the hidden-panel guess.
@@ -438,9 +533,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     /// The user's summon grid point on the active screen, sized to `size` —
     /// where borrowed and whole-summoned windows land, away from whatever
-    /// terminal is already in view.
+    /// terminal is already in view. The screen under the mouse is "where the
+    /// user is" — NSScreen.main tracks the key window, which is wrong when
+    /// summoning over another app (e.g. fullscreen on a second display).
     private func summonTargetFrame(size: NSSize) -> NSRect? {
-        guard let vis = (NSScreen.main ?? NSScreen.screens.first)?.visibleFrame else { return nil }
+        let mouse = NSEvent.mouseLocation
+        let screen = NSScreen.screens.first { NSMouseInRect(mouse, $0.frame, false) }
+            ?? NSScreen.main ?? NSScreen.screens.first
+        guard let vis = screen?.visibleFrame else { return nil }
         return Settings.shared.summonPosition.frame(forSize: size, in: vis)
     }
 
