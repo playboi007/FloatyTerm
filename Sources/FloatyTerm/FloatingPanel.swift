@@ -71,6 +71,8 @@ final class FloatingPanel: NSPanel {
     func reassertFloatingBehavior() {
         // High window level so it floats above ordinary windows.
         level = .statusBar
+        // Privacy: excluded from screen capture when the setting is on.
+        sharingType = Settings.shared.hideFromScreenCapture ? .none : .readOnly
         if isPinned {
             // Linked: bound to ONE Space (managed). Keep fullScreenAuxiliary so
             // it can live on another app's fullscreen Space. NO canJoinAllSpaces

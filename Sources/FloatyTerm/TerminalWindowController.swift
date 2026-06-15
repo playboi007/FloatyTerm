@@ -136,6 +136,10 @@ final class TerminalWindowController: NSObject, NSWindowDelegate {
     /// Parameters: the live tab object and the screen point where the drag ended.
     var onDetachTab: ((any TabContent, NSPoint) -> Void)?
 
+    /// An armed session ("Notify When Done") just finished — the app should
+    /// summon it to the user's current Space.
+    var onSessionDone: ((any TabContent) -> Void)?
+
     /// - Parameter initialDirectory: The directory in which to open the first
     ///   terminal tab. nil → $HOME (the default / original behaviour).
     /// - Parameter startEmpty: When true, no initial tab is created.  Used by
@@ -207,6 +211,7 @@ final class TerminalWindowController: NSObject, NSWindowDelegate {
         header.onToggleURLBar = { [weak self] in self?.toggleURLBarCollapsed() }
         header.onMinimize       = { [weak self] in self?.minimize() }
         header.onTogglePin      = { [weak self] in self?.togglePin() }
+        header.onBuildAppLinkMenu = { [weak self] menu in self?.buildAppLinkMenu(menu) }
         header.onCollapse       = { [weak self] in self?.collapseToAvatar() }
         header.onCollapseTicker = { [weak self] in self?.collapseToTicker() }
         header.onGhost          = { [weak self] in self?.setGhosted(true) }
@@ -215,6 +220,7 @@ final class TerminalWindowController: NSObject, NSWindowDelegate {
         tabStrip.onSelect     = { [weak self] i in self?.selectTab(i) }
         tabStrip.onCloseTab   = { [weak self] i in self?.closeTab(i) }
         tabStrip.onRenameTab  = { [weak self] i in self?.promptRename(i) }
+        tabStrip.onToggleNotifyTab = { [weak self] i in self?.toggleNotifyWhenDone(i) }
         tabStrip.onReturnTab  = { [weak self] i in self?.returnBorrowedTab(at: i) }
         header.onReturnTab    = { [weak self] in self?.returnBorrowedTab() }
 
@@ -240,11 +246,16 @@ final class TerminalWindowController: NSObject, NSWindowDelegate {
             self, selector: #selector(activeSpaceChanged),
             name: NSWorkspace.activeSpaceDidChangeNotification, object: nil
         )
+        NSWorkspace.shared.notificationCenter.addObserver(
+            self, selector: #selector(frontAppChanged(_:)),
+            name: NSWorkspace.didActivateApplicationNotification, object: nil
+        )
 
         setupFindBar()
         setupRecentPalette()
         setupURLBar()
         setupSelectionBar()
+        setupAskAgentChip()
         setupReaderButton()
         installSelectionMonitor()
         if !_startEmpty {
@@ -341,7 +352,9 @@ final class TerminalWindowController: NSObject, NSWindowDelegate {
                      avatarSymbol: avatarStyle.symbol,
                      avatarColor: avatarStyle.colorName,
                      tabs: tabs.map(tabRecord(for:)),
-                     activeIndex: activeIndex)
+                     activeIndex: activeIndex,
+                     linkedAppBundleID: linkedAppBundleID,
+                     linkedAppName: linkedAppName)
     }
 
     private func tabRecord(for tab: any TabContent) -> TabRecord {
@@ -351,7 +364,8 @@ final class TerminalWindowController: NSObject, NSWindowDelegate {
         }
         let tc = tab as? TerminalController
         return TabRecord(kind: "terminal", customName: tab.customName,
-                         directory: tc?.currentWorkingDirectory, url: nil)
+                         directory: tc?.currentWorkingDirectory, url: nil,
+                         sessionID: tc?.sessionID)
     }
 
     /// Recreates tabs from a saved session: terminals restart in their last
@@ -369,7 +383,10 @@ final class TerminalWindowController: NSObject, NSWindowDelegate {
                 tab.onNavChanged = { [weak self] in self?.syncURLBar() }
                 insertTab(tab)
             } else {
-                let tab = TerminalController(startDirectory: record.directory)
+                // Hand back the saved sessionID so the tab reclaims its
+                // transcript log; a pre-sessionID record just mints a new one.
+                let tab = TerminalController(startDirectory: record.directory,
+                                             sessionID: record.sessionID)
                 tab.customName = record.customName
                 tab.onTerminated = { [weak self, weak tab] in
                     guard let self, let tab,
@@ -394,6 +411,19 @@ final class TerminalWindowController: NSObject, NSWindowDelegate {
             panel.setFrame(panel.clampToVisibleScreen(f), display: false)
         } else {
             panel.restoreSavedFrame()   // corrupt record → legacy fallback
+        }
+        if let bundleID = record.linkedAppBundleID {
+            linkedAppBundleID = bundleID
+            linkedAppName = record.linkedAppName
+            header.setLinkedApp(record.linkedAppName)
+            // makeWindow() calls show() right after this — defer one runloop
+            // turn so the link's verdict (is the app frontmost right now?)
+            // lands last and the window doesn't start visible over the
+            // wrong app.
+            DispatchQueue.main.async { [weak self] in
+                self?.applyAppLinkVisibility(
+                    frontmost: NSWorkspace.shared.frontmostApplication)
+            }
         }
     }
 
@@ -434,6 +464,7 @@ final class TerminalWindowController: NSObject, NSWindowDelegate {
     private func showAvatar(at frame: NSRect) {
         let av = avatar ?? AvatarPanel()
         avatar = av
+        av.sharingType = Settings.shared.hideFromScreenCapture ? .none : .readOnly
         av.onExpand = { [weak self] in self?.expandFromAvatar() }
         av.apply(style: avatarStyle)
         av.onStyleChange = { [weak self] style in
@@ -515,6 +546,7 @@ final class TerminalWindowController: NSObject, NSWindowDelegate {
 
         let t = ticker ?? TickerPanel()
         ticker = t
+        t.sharingType = Settings.shared.hideFromScreenCapture ? .none : .readOnly
         t.onExpand = { [weak self] in self?.expandFromTicker() }
         // The strip takes the window's top edge, so it stays where the eye was.
         let f = savedFrameForExpand
@@ -589,6 +621,13 @@ final class TerminalWindowController: NSObject, NSWindowDelegate {
     /// them; the pin button reflects the new state.
     private func togglePin() {
         panel.setPinned(!panel.isPinned)
+        if panel.isPinned, linkedAppBundleID != nil {
+            // Space pin and app link can't both drive visibility.
+            linkedAppBundleID = nil
+            linkedAppName = nil
+            header.setLinkedApp(nil)
+            onStateChanged?()
+        }
         header.setPinned(panel.isPinned)
         // FloatyTerm never activates itself, so the frontmost app right now is
         // the one this window is being pinned OVER — the session switcher
@@ -602,6 +641,109 @@ final class TerminalWindowController: NSObject, NSWindowDelegate {
     /// The app that was frontmost when this window was pinned — i.e. what it
     /// overlays on its Space. Runtime-only, cleared on unpin.
     private(set) var pinnedAppName: String?
+
+    // MARK: - Pin to app (show only while a chosen app is frontmost)
+
+    /// When set, this window follows that app's activation instead of a
+    /// Space: it appears (without stealing focus) whenever the app becomes
+    /// frontmost — on whatever Space that happens — and tucks away when the
+    /// user switches to anything else. A build terminal that only exists
+    /// while its IDE does. Mutually exclusive with pin-to-Space; persisted
+    /// (bundle IDs are stable across launches, unlike Spaces).
+    private(set) var linkedAppBundleID: String?
+    private(set) var linkedAppName: String?
+
+    func linkToApp(bundleID: String?, name: String?) {
+        linkedAppBundleID = bundleID
+        linkedAppName = name
+        if bundleID != nil, panel.isPinned {
+            // Space pin and app link can't both drive visibility.
+            panel.setPinned(false)
+            pinnedAppName = nil
+        }
+        header.setPinned(panel.isPinned)
+        header.setLinkedApp(name)
+        onStateChanged?()   // persist the link with the window record
+        if bundleID == nil {
+            show()          // unlinked: back to a normal always-available window
+        } else {
+            applyAppLinkVisibility(frontmost: NSWorkspace.shared.frontmostApplication)
+        }
+    }
+
+    /// Builds the pin button's right-click menu: every regular running app,
+    /// the linked one checkmarked, plus Unlink.
+    private func buildAppLinkMenu(_ menu: NSMenu) {
+        menu.removeAllItems()
+        let caption = NSMenuItem(title: "Show Only While Active:", action: nil, keyEquivalent: "")
+        caption.isEnabled = false
+        menu.addItem(caption)
+        let apps = NSWorkspace.shared.runningApplications
+            .filter { $0.activationPolicy == .regular && $0.bundleIdentifier != nil }
+            .sorted { ($0.localizedName ?? "") < ($1.localizedName ?? "") }
+        for app in apps {
+            guard let name = app.localizedName else { continue }
+            let item = NSMenuItem(title: name, action: #selector(appLinkPicked(_:)),
+                                  keyEquivalent: "")
+            item.target = self
+            item.representedObject = app.bundleIdentifier
+            item.state = app.bundleIdentifier == linkedAppBundleID ? .on : .off
+            if let icon = app.icon?.copy() as? NSImage {
+                icon.size = NSSize(width: 16, height: 16)
+                item.image = icon
+            }
+            menu.addItem(item)
+        }
+        menu.addItem(.separator())
+        let unlink = NSMenuItem(title: "Always Available (Unlink)",
+                                action: #selector(appLinkCleared), keyEquivalent: "")
+        unlink.target = self
+        unlink.state = linkedAppBundleID == nil ? .on : .off
+        menu.addItem(unlink)
+    }
+
+    @objc private func appLinkPicked(_ sender: NSMenuItem) {
+        guard let bundleID = sender.representedObject as? String else { return }
+        // Picking the already-linked app unlinks it (toggle semantics).
+        if bundleID == linkedAppBundleID {
+            linkToApp(bundleID: nil, name: nil)
+        } else {
+            linkToApp(bundleID: bundleID, name: sender.title)
+        }
+    }
+
+    @objc private func appLinkCleared() {
+        linkToApp(bundleID: nil, name: nil)
+    }
+
+    /// NSWorkspace app-activation events drive linked visibility.
+    @objc private func frontAppChanged(_ note: Notification) {
+        guard linkedAppBundleID != nil,
+              let app = note.userInfo?[NSWorkspace.applicationUserInfoKey]
+                            as? NSRunningApplication,
+              // Our own activations (settings window, alerts) must not hide
+              // the terminal the user is working over.
+              app.processIdentifier != ProcessInfo.processInfo.processIdentifier
+        else { return }
+        applyAppLinkVisibility(frontmost: app)
+    }
+
+    private func applyAppLinkVisibility(frontmost: NSRunningApplication?) {
+        guard let linked = linkedAppBundleID else { return }
+        // The link only drives the plain window; modes the user chose
+        // explicitly (minimized, bubble, ticker, lent-away husk) keep
+        // owning their own visibility.
+        guard !isMinimized, !isCollapsed, !isTicker, !isLent else { return }
+        if frontmost?.bundleIdentifier == linked {
+            // Appear WITHOUT taking key — the user just focused their app;
+            // stealing its keyboard would defeat the point.
+            panel.reassertFloatingBehavior()
+            panel.orderFrontRegardless()
+        } else {
+            panel.orderOut(nil)
+        }
+        updateViewedFlags()
+    }
 
     /// A short title for menus, taken from the active tab (honours renames).
     var displayTitle: String {
@@ -750,6 +892,13 @@ final class TerminalWindowController: NSObject, NSWindowDelegate {
         if isGhosted {            // live-apply a ghost-opacity slider change
             panel.alphaValue = CGFloat(max(0.1, Settings.shared.ghostOpacity))
         }
+        // Live-apply screen-capture privacy to every surface this window owns
+        // (the panel also reasserts it on every show).
+        let sharing: NSWindow.SharingType =
+            Settings.shared.hideFromScreenCapture ? .none : .readOnly
+        panel.sharingType = sharing
+        avatar?.sharingType = sharing
+        ticker?.sharingType = sharing
     }
 
     /// Collapses/expands the browser URL bar (persisted; applies to all windows).
@@ -784,11 +933,11 @@ final class TerminalWindowController: NSObject, NSWindowDelegate {
         insertTab(tab)
     }
 
-    func addBrowserTab() {
+    func addBrowserTab(initialURL: String? = nil) {
         // One-time resource notice.
         showBrowserResourceNoticeIfNeeded()
 
-        let tab = BrowserController()
+        let tab = BrowserController(initialURL: initialURL)
         tab.onTitleChanged = { [weak self] in
             self?.refreshTabStrip()
             self?.syncURLBar()
@@ -819,6 +968,15 @@ final class TerminalWindowController: NSObject, NSWindowDelegate {
         ])
 
         tabs.append(tab)
+        // (Re)wire the selection bridge here — insertTab is the single entry
+        // for tabs joining a window (new, restored, AND adopted from another
+        // window), so the chip always reports to the current host.
+        if let bc = tab as? BrowserController {
+            bc.onSelectionChanged = { [weak self, weak bc] sel in
+                guard let self, let bc else { return }
+                self.browserSelectionChanged(bc, sel)
+            }
+        }
         selectTab(tabs.count - 1)
         applyAppearance(focused: panel.isKeyWindow)
         scheduleFrameSave()   // tabs are part of the persisted session now
@@ -830,6 +988,7 @@ final class TerminalWindowController: NSObject, NSWindowDelegate {
         if isFindBarVisible   { hideFindBar()       }
         if isPaletteVisible   { hideRecentPalette() }
         hideSelectionBar()
+        askAgentBar.isHidden = true
         activeIndex = index
         for (i, tab) in tabs.enumerated() {
             tab.view.isHidden = (i != index)
@@ -961,8 +1120,13 @@ final class TerminalWindowController: NSObject, NSWindowDelegate {
     /// Updates the tab strip contents and shows/hides it (only visible with 2+ tabs).
     private func refreshTabStrip() {
         let items = tabs.map {
-            TabStripView.Item(title: $0.displayName, status: status(of: $0),
-                              canReturn: isBorrowed($0))
+            // "✦" marks agent sessions on the chip only — displayName itself
+            // stays clean (it feeds persistence and menus).
+            TabStripView.Item(title: (($0 as? TerminalController)?.isAgentSession == true ? "✦ " : "") + $0.displayName,
+                              status: status(of: $0),
+                              canReturn: isBorrowed($0),
+                              canNotify: $0 is TerminalController,
+                              notifyArmed: ($0 as? TerminalController)?.notifyWhenDone == true)
         }
         tabStrip.reload(items: items, activeIndex: activeIndex)
         let show = tabs.count >= 2
@@ -972,8 +1136,10 @@ final class TerminalWindowController: NSObject, NSWindowDelegate {
 
     // MARK: - Session status / activity refresh
 
-    /// The attention state of one tab (unseen output wins over running).
+    /// The attention state of one tab
+    /// (needs-input wins over unseen output wins over running).
     func status(of tab: any TabContent) -> SessionStatus {
+        if let tc = tab as? TerminalController, tc.awaitingInput { return .needsInput }
         if tab.hasUnseenOutput { return .unseenOutput }
         if let tc = tab as? TerminalController, tc.hasRunningForegroundJob { return .running }
         return .idle
@@ -989,14 +1155,30 @@ final class TerminalWindowController: NSObject, NSWindowDelegate {
             panel.close()
             return
         }
+        // Armed "notify when done" sessions are checked regardless of how this
+        // window is presented — the whole point is that a hidden / collapsed /
+        // away window comes to the user when its work finishes.
+        for tab in tabs {
+            guard let tc = tab as? TerminalController else { continue }
+            if tc.checkDoneIfArmed() { onSessionDone?(tc) }
+        }
+        // Keep the "waiting on you" state fresh regardless of presentation —
+        // the bubble badge and the menu-bar fleet summary read it even while
+        // this window is collapsed, tickered, or hidden.
+        for tab in tabs {
+            (tab as? TerminalController)?.updateAttentionState()
+        }
         if isTicker {
             refreshTicker()
             return
         }
         if isCollapsed {
-            // Aggregate across tabs for the bubble badge.
+            // Aggregate across tabs for the bubble badge
+            // (needsInput > unseenOutput > running).
             let agg: SessionStatus
-            if tabs.contains(where: { $0.hasUnseenOutput }) {
+            if tabs.contains(where: { ($0 as? TerminalController)?.awaitingInput == true }) {
+                agg = .needsInput
+            } else if tabs.contains(where: { $0.hasUnseenOutput }) {
                 agg = .unseenOutput
             } else if tabs.contains(where: { ($0 as? TerminalController)?.hasRunningForegroundJob == true }) {
                 agg = .running
@@ -1017,6 +1199,35 @@ final class TerminalWindowController: NSObject, NSWindowDelegate {
         let viewing = panel.isVisible && !isCollapsed
         for (i, tab) in tabs.enumerated() {
             tab.isCurrentlyViewed = viewing && i == activeIndex
+        }
+    }
+
+    /// Right-click → Notify When Done: arms/disarms the one-shot summon.
+    private func toggleNotifyWhenDone(_ index: Int) {
+        guard tabs.indices.contains(index),
+              let tc = tabs[index] as? TerminalController else { return }
+        tc.notifyWhenDone.toggle()
+        refreshTabStrip()
+    }
+
+    /// Flashes an accent ring around the window — the "I just arrived because
+    /// you asked to be notified" cue after an armed session summons itself.
+    func pulseAttention() {
+        guard let root = panel.contentView else { return }
+        let ring = NSView(frame: root.bounds)
+        ring.autoresizingMask = [.width, .height]
+        ring.wantsLayer = true
+        ring.layer?.borderColor = NSColor.controlAccentColor.cgColor
+        ring.layer?.borderWidth = 3
+        ring.layer?.cornerRadius = 12
+        ring.layer?.opacity = 0
+        root.addSubview(ring)
+        let pulse = CAKeyframeAnimation(keyPath: "opacity")
+        pulse.values = [0, 1, 0.15, 1, 0]
+        pulse.duration = 1.2
+        ring.layer?.add(pulse, forKey: "pulse")
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.25) {
+            ring.removeFromSuperview()
         }
     }
 
@@ -1248,6 +1459,154 @@ final class TerminalWindowController: NSObject, NSWindowDelegate {
     }
 
     // MARK: - Selection action bar (terminal-only)
+
+    // MARK: - Browser selection → agent ("Ask Agent" chip)
+
+    private let askAgentBar = NSVisualEffectView()
+    private let askAgentButton = NSButton()
+
+    /// A one-button floating chip that appears next to a text selection in a
+    /// browser tab. Clicking it stages the selection (plus a context file
+    /// with the full page text) at the prompt of an agent terminal in this
+    /// window — the user types their actual question and submits.
+    private func setupAskAgentChip() {
+        askAgentBar.material = .hudWindow
+        askAgentBar.blendingMode = .withinWindow
+        askAgentBar.state = .active
+        askAgentBar.wantsLayer = true
+        askAgentBar.layer?.cornerRadius = 8
+        askAgentBar.layer?.masksToBounds = true
+        askAgentBar.layer?.borderWidth = 1
+        askAgentBar.layer?.borderColor = NSColor.white.withAlphaComponent(0.14).cgColor
+        askAgentBar.isHidden = true
+
+        askAgentButton.title = "✦ Ask Agent"
+        askAgentButton.font = .systemFont(ofSize: 11, weight: .medium)
+        askAgentButton.isBordered = false
+        askAgentButton.contentTintColor = NSColor.white.withAlphaComponent(0.9)
+        askAgentButton.target = self
+        askAgentButton.action = #selector(askAgentTapped)
+        askAgentButton.toolTip = "Stage this selection (plus page context) at the agent's prompt"
+        askAgentButton.translatesAutoresizingMaskIntoConstraints = false
+        askAgentBar.addSubview(askAgentButton)
+        NSLayoutConstraint.activate([
+            askAgentButton.topAnchor.constraint(equalTo: askAgentBar.topAnchor, constant: 4),
+            askAgentButton.bottomAnchor.constraint(equalTo: askAgentBar.bottomAnchor, constant: -4),
+            askAgentButton.leadingAnchor.constraint(equalTo: askAgentBar.leadingAnchor, constant: 8),
+            askAgentButton.trailingAnchor.constraint(equalTo: askAgentBar.trailingAnchor, constant: -8)
+        ])
+        root.addSubview(askAgentBar)
+    }
+
+    private func browserSelectionChanged(_ bc: BrowserController, _ sel: BrowserSelection?) {
+        guard let sel,
+              tabs.indices.contains(activeIndex), tabs[activeIndex] === bc,
+              panel.isVisible, !isCollapsed, !isTicker else {
+            askAgentBar.isHidden = true
+            return
+        }
+        let p = bc.webView.convert(sel.viewPoint, to: root)
+        let size = NSSize(width: 110, height: 26)
+        var origin = NSPoint(x: p.x - size.width / 2, y: p.y + 8)
+        origin.x = max(4, min(origin.x, root.bounds.width - size.width - 4))
+        origin.y = max(4, min(origin.y, root.bounds.height - size.height - 4))
+        askAgentBar.frame = NSRect(origin: origin, size: size)
+        askAgentBar.isHidden = false
+    }
+
+    @objc private func askAgentTapped() {
+        askAgentBar.isHidden = true
+        guard tabs.indices.contains(activeIndex),
+              let bc = tabs[activeIndex] as? BrowserController,
+              let sel = bc.latestSelection else { return }
+        // Snapshot the full page text at send time (not on every mouseup —
+        // pages like the BigQuery console have enormous innerText).
+        bc.fetchFullPageText { [weak self, weak bc] fullText in
+            guard let bc else { return }
+            self?.stageBrowserContext(sel, fullText: fullText, from: bc)
+        }
+    }
+
+    /// Writes the capture to a context file and stages a one-line pointer at
+    /// the agent's prompt — WITHOUT pressing Enter, so the user appends their
+    /// actual question ("write a query that joins these…") and submits.
+    private func stageBrowserContext(_ sel: BrowserSelection, fullText: String,
+                                     from bc: BrowserController) {
+        // Target: an agent session in this window, else any terminal tab,
+        // else a fresh one.
+        var index = tabs.firstIndex { ($0 as? TerminalController)?.isAgentSession == true }
+            ?? tabs.firstIndex { $0 is TerminalController }
+        if index == nil {
+            addTerminalTab()
+            index = tabs.indices.last
+        }
+        guard let idx = index, let tc = tabs[idx] as? TerminalController else { return }
+
+        let path = Self.writeBrowserContextFile(
+            sel, fullText: fullText,
+            devtoolsEvents: Array(bc.recentDevtoolsEvents.suffix(40)))
+        let inline = sel.text
+            .components(separatedBy: .whitespacesAndNewlines)
+            .filter { !$0.isEmpty }.joined(separator: " ")
+            .prefix(300)
+        var message = "[from browser] \"\(inline)\" — on \(sel.pageTitle)"
+        if let path { message += ". Full page context: \(path)" }
+        if let log = bc.devtoolsLogPath {
+            message += ". Live console/network log (tail it): \(log)"
+        }
+        message += " — "
+        selectTab(idx)
+        show()
+        tc.terminalView.send(txt: message)
+    }
+
+    /// One markdown file per capture under Application Support, pruned to the
+    /// most recent 50 — big page context goes here for the agent to read,
+    /// instead of being dumped into the prompt. (StorageJanitor additionally
+    /// enforces age- and size-based limits on this directory.)
+    private static func writeBrowserContextFile(_ sel: BrowserSelection,
+                                                fullText: String,
+                                                devtoolsEvents: [String]) -> String? {
+        let dir = FileManager.default.urls(for: .applicationSupportDirectory,
+                                           in: .userDomainMask)[0]
+            .appendingPathComponent("FloatyTerm/BrowserContext", isDirectory: true)
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let stamp = DateFormatter()
+        stamp.dateFormat = "yyyyMMdd-HHmmss"
+        let url = dir.appendingPathComponent("ctx-\(stamp.string(from: Date())).md")
+        let content = """
+        # Browser context
+
+        - Page: \(sel.pageTitle)
+        - URL: \(sel.urlString)
+
+        ## Highlighted by the user
+
+        \(sel.text)
+
+        ## Surrounding block
+
+        \(sel.context)
+
+        ## Recent console & network (newest last)
+
+        \(devtoolsEvents.isEmpty ? "(no events captured)" : devtoolsEvents.joined(separator: "\n"))
+
+        ## Page content (structured markdown — headings, sections, tables, controls)
+
+        \(fullText)
+        """
+        guard (try? content.write(to: url, atomically: true, encoding: .utf8)) != nil else {
+            return nil
+        }
+        if let files = try? FileManager.default.contentsOfDirectory(
+                at: dir, includingPropertiesForKeys: nil) {
+            let captures = files.filter { $0.lastPathComponent.hasPrefix("ctx-") }
+                .sorted { $0.lastPathComponent < $1.lastPathComponent }
+            for old in captures.dropLast(50) { try? FileManager.default.removeItem(at: old) }
+        }
+        return url.path
+    }
 
     private func setupSelectionBar() {
         selectionBar.isHidden = true
@@ -1632,6 +1991,12 @@ final class TerminalWindowController: NSObject, NSWindowDelegate {
 
     func windowWillClose(_ notification: Notification) {
         closeReaderIfNeeded()
+        // Closing a window discards its sessions for good (every tab-removal
+        // path that keeps a session alive — tear-off, borrow, lend — empties
+        // `tabs` before closing the panel), so clean them up like closed tabs:
+        // their transcript logs must not linger as orphans. At quit the saved
+        // records still reference them, so cleanup() keeps the files then.
+        tabs.forEach { $0.cleanup() }
         activityTimer?.invalidate()
         activityTimer = nil
         if let m = mouseMonitor { NSEvent.removeMonitor(m); mouseMonitor = nil }
