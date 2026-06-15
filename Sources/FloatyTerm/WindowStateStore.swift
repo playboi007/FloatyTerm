@@ -3,11 +3,14 @@ import AppKit
 /// One persisted tab: enough to recreate the session's CONTEXT (not its live
 /// process — a terminal restarts as a fresh shell in its last directory, a
 /// browser reloads its URL).
+/// `sessionID` is optional so records saved before transcript persistence
+/// still decode — a restored tab without one simply starts a fresh identity.
 struct TabRecord: Codable {
     var kind: String           // "terminal" | "browser"
     var customName: String?
     var directory: String?     // terminal: last working directory
     var url: String?           // browser: last page
+    var sessionID: String?     // terminal: stable identity → its transcript log
 }
 
 /// One persisted window: its frame, avatar personalization, and tabs.
@@ -21,6 +24,10 @@ struct WindowRecord: Codable {
     var avatarColor: String
     var tabs: [TabRecord]?
     var activeIndex: Int?
+    /// App link ("show only while this app is active"). Bundle IDs are stable
+    /// across launches, so unlike a Space pin this survives restarts.
+    var linkedAppBundleID: String?
+    var linkedAppName: String?
 }
 
 enum WindowStateStore {

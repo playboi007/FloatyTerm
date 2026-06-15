@@ -8,11 +8,13 @@ import AppKit
 /// find-bar, foreground-job check, recent-commands palette) is reached via
 /// conditional downcasts to `TerminalController`.
 /// Passive attention state of a session, surfaced as a colored dot on tab
-/// chips, avatar bubbles, and switcher rows. Priority: unseenOutput > running.
+/// chips, avatar bubbles, and switcher rows.
+/// Priority: needsInput > unseenOutput > running.
 enum SessionStatus {
     case idle           // nothing notable
     case running        // a foreground job is executing
     case unseenOutput   // produced output/changes since the user last viewed it
+    case needsInput     // an agent is blocked waiting on the user
 
     /// Dot color for this status (idle is a faint neutral placeholder).
     var color: NSColor {
@@ -20,6 +22,7 @@ enum SessionStatus {
         case .idle:         return NSColor.white.withAlphaComponent(0.18)
         case .running:      return .systemGreen
         case .unseenOutput: return .controlAccentColor
+        case .needsInput:   return .systemOrange
         }
     }
 }
