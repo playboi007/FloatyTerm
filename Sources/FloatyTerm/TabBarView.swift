@@ -128,10 +128,16 @@ final class TabChip: NSView, NSDraggingSource {
     var onClose:  () -> Void = {}
     var onRename: () -> Void = {}
     var onReturn: () -> Void = {}
+    var onToggleNotify: () -> Void = {}
 
     /// True when this chip's tab is borrowed (offers "Return to Original
     /// Window" in the context menu).
     private var canReturn = false
+
+    /// Terminal tabs offer "Notify When Done" in the context menu (browser
+    /// tabs have no notion of a running job); `notifyArmed` is its checkmark.
+    private var canNotify = false
+    private var notifyArmed = false
 
     // Set by TabStripView so the chip knows what to put in the registry.
     var tabIndex: Int = 0
@@ -199,7 +205,8 @@ final class TabChip: NSView, NSDraggingSource {
 
     /// Refreshes the chip's label, active styling, and status dot in place —
     /// used by the strip's diffing reload so updates don't recreate chips.
-    func update(title: String, active: Bool, status: SessionStatus, canReturn: Bool = false) {
+    func update(title: String, active: Bool, status: SessionStatus, canReturn: Bool = false,
+                canNotify: Bool = false, notifyArmed: Bool = false) {
         titleLabel.stringValue = title
         titleLabel.textColor = active ? .white : NSColor.white.withAlphaComponent(0.7)
         layer?.backgroundColor = active
@@ -207,7 +214,9 @@ final class TabChip: NSView, NSDraggingSource {
             : NSColor.white.withAlphaComponent(0.06).cgColor
         statusDot.layer?.backgroundColor = status.color.cgColor
         self.canReturn = canReturn
-        toolTip = title
+        self.canNotify = canNotify
+        self.notifyArmed = notifyArmed
+        toolTip = notifyArmed ? "\(title) — will summon when done" : title
     }
 
     @objc private func closeTapped()  { onClose()  }
@@ -219,6 +228,14 @@ final class TabChip: NSView, NSDraggingSource {
         let rename = NSMenuItem(title: "Rename Tab…", action: #selector(renameTapped), keyEquivalent: "")
         rename.target = self
         menu.addItem(rename)
+        if canNotify {
+            let notify = NSMenuItem(title: "Notify When Done",
+                                    action: #selector(notifyTapped), keyEquivalent: "")
+            notify.target = self
+            notify.state = notifyArmed ? .on : .off
+            notify.image = NSImage(systemSymbolName: "bell", accessibilityDescription: nil)
+            menu.addItem(notify)
+        }
         if canReturn {
             let ret = NSMenuItem(title: "Return to Original Window",
                                  action: #selector(returnFromMenu), keyEquivalent: "")
@@ -234,6 +251,7 @@ final class TabChip: NSView, NSDraggingSource {
     }
 
     @objc private func renameTapped()  { onRename() }
+    @objc private func notifyTapped()  { onToggleNotify() }
     @objc private func returnFromMenu() { onReturn() }
     @objc private func closeFromMenu() { onClose()  }
 
@@ -363,12 +381,15 @@ final class TabStripView: DragHandleView, TabChipDragDelegate {
     var onCloseTab:   (Int) -> Void = { _ in }
     var onRenameTab:  (Int) -> Void = { _ in }
     var onReturnTab:  (Int) -> Void = { _ in }
+    var onToggleNotifyTab: (Int) -> Void = { _ in }
 
     /// One row of strip data: what a chip shows.
     struct Item {
         let title: String
         let status: SessionStatus
         var canReturn: Bool = false
+        var canNotify: Bool = false
+        var notifyArmed: Bool = false
     }
 
     /// Set by TerminalWindowController so we can call releaseTab/adoptTab.
@@ -427,7 +448,9 @@ final class TabStripView: DragHandleView, TabChipDragDelegate {
                 existing[index].update(title: item.title.isEmpty ? "Tab \(index + 1)" : item.title,
                                        active: index == activeIndex,
                                        status: item.status,
-                                       canReturn: item.canReturn)
+                                       canReturn: item.canReturn,
+                                       canNotify: item.canNotify,
+                                       notifyArmed: item.notifyArmed)
                 existing[index].tabIndex = index
             }
             return
@@ -444,7 +467,9 @@ final class TabStripView: DragHandleView, TabChipDragDelegate {
             chip.update(title: item.title.isEmpty ? "Tab \(index + 1)" : item.title,
                         active: index == activeIndex,
                         status: item.status,
-                        canReturn: item.canReturn)
+                        canReturn: item.canReturn,
+                        canNotify: item.canNotify,
+                        notifyArmed: item.notifyArmed)
             chip.tabIndex = index
             chip.dragDelegate = self
             chip.onSelect = { [weak self, weak chip] in
@@ -462,6 +487,10 @@ final class TabStripView: DragHandleView, TabChipDragDelegate {
             chip.onReturn = { [weak self, weak chip] in
                 guard let self, let chip else { return }
                 self.onReturnTab(chip.tabIndex)
+            }
+            chip.onToggleNotify = { [weak self, weak chip] in
+                guard let self, let chip else { return }
+                self.onToggleNotifyTab(chip.tabIndex)
             }
             stack.addArrangedSubview(chip)
         }
@@ -579,6 +608,7 @@ final class HeaderControlsView: DragHandleView, NSMenuDelegate {
     var onSnap:          (_ asText: Bool) -> Void = { _ in }
     /// Populates the camera button's right-click history menu.
     var onBuildSnapMenu: ((NSMenu) -> Void)?
+    var onBuildAppLinkMenu: ((NSMenu) -> Void)?
 
     /// Set by TerminalWindowController — used when a tab is dropped onto the header.
     weak var tabStripView: TabStripView?
@@ -611,8 +641,13 @@ final class HeaderControlsView: DragHandleView, NSMenuDelegate {
         pinButton.contentTintColor = NSColor.white.withAlphaComponent(0.8)
         pinButton.target = self
         pinButton.action = #selector(pinTapped)
-        pinButton.toolTip = "Pin this window to the current Space"
+        pinButton.toolTip = "Pin this window to the current Space. Right-click to link to an app."
         pinButton.translatesAutoresizingMaskIntoConstraints = false
+        // Right-click on the pin → "show only over app X" link menu, built
+        // fresh on every open (the running-app list changes constantly).
+        let linkMenu = NSMenu(title: "AppLink")
+        linkMenu.delegate = self
+        pinButton.menu = linkMenu
 
         // Collapse: morphs THIS window into a small floating avatar bubble.
         collapseButton.image = NSImage(systemSymbolName: "arrow.down.right.and.arrow.up.left",
@@ -726,11 +761,11 @@ final class HeaderControlsView: DragHandleView, NSMenuDelegate {
             pinButton.centerYAnchor.constraint(equalTo: centerYAnchor),
             pinButton.widthAnchor.constraint(equalToConstant: 24),
 
-            collapseButton.trailingAnchor.constraint(equalTo: minimizeButton.leadingAnchor, constant: -4),
+            collapseButton.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -10),
             collapseButton.centerYAnchor.constraint(equalTo: centerYAnchor),
             collapseButton.widthAnchor.constraint(equalToConstant: 24),
 
-            minimizeButton.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -10),
+            minimizeButton.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 30),
             minimizeButton.centerYAnchor.constraint(equalTo: centerYAnchor),
             minimizeButton.widthAnchor.constraint(equalToConstant: 24)
         ])
@@ -742,6 +777,29 @@ final class HeaderControlsView: DragHandleView, NSMenuDelegate {
 
     /// Reflects the window's pinned/linked state on the pin button.
     func setPinned(_ pinned: Bool) {
+        self.pinned = pinned
+        renderPinButton()
+    }
+
+    /// Reflects an app link (nil = unlinked) on the pin button — linking to
+    /// an app and pinning to a Space are mutually exclusive, so the one
+    /// button carries both states.
+    func setLinkedApp(_ name: String?) {
+        linkedAppName = name
+        renderPinButton()
+    }
+
+    private var pinned = false
+    private var linkedAppName: String?
+
+    private func renderPinButton() {
+        if let app = linkedAppName {
+            pinButton.image = NSImage(systemSymbolName: "macwindow.on.rectangle",
+                                      accessibilityDescription: "Linked to \(app)")
+            pinButton.contentTintColor = .controlAccentColor
+            pinButton.toolTip = "Shows only while \(app) is active — right-click to change or unlink"
+            return
+        }
         pinButton.image = NSImage(
             systemSymbolName: pinned ? "pin.fill" : "pin",
             accessibilityDescription: pinned ? "Unpin window" : "Pin window to this Space")
@@ -749,8 +807,8 @@ final class HeaderControlsView: DragHandleView, NSMenuDelegate {
             ? NSColor.controlAccentColor
             : NSColor.white.withAlphaComponent(0.8)
         pinButton.toolTip = pinned
-            ? "Linked to this Space — click to unlink (float over all Spaces)"
-            : "Pin this window to the current Space"
+            ? "Linked to this Space — click to unlink (float over all Spaces). Right-click to link to an app."
+            : "Pin this window to the current Space. Right-click to link to an app."
     }
 
     /// Shows/hides the address-bar toggle (only relevant for browser tabs).
@@ -798,10 +856,14 @@ final class HeaderControlsView: DragHandleView, NSMenuDelegate {
         onSnap(asText)
     }
 
-    // MARK: - NSMenuDelegate (snap history)
+    // MARK: - NSMenuDelegate (snap history / app-link)
 
     func menuNeedsUpdate(_ menu: NSMenu) {
-        onBuildSnapMenu?(menu)
+        if menu.title == "AppLink" {
+            onBuildAppLinkMenu?(menu)
+        } else {
+            onBuildSnapMenu?(menu)
+        }
     }
 
     /// Plain click → avatar bubble; ⌥-click → one-line ticker strip.

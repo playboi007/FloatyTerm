@@ -105,8 +105,19 @@ final class FloatyTerminalView: LocalProcessTerminalView {
 
     // MARK: - Right-click context menu
 
+    /// Wired by TerminalController: current armed state and toggle for the
+    /// "Notify When Done" item — so the action is reachable even on a
+    /// single-tab window, where no tab chip exists to right-click.
+    var notifyWhenDoneState: (() -> Bool)?
+    var onToggleNotifyWhenDone: (() -> Void)?
+
     override func menu(for event: NSEvent) -> NSMenu? {
         let menu = NSMenu(title: "Terminal")
+        // SwiftTerm's validateUserInterfaceItem returns false for selectors
+        // it doesn't know (Tail DevTools Log, Notify When Done…), which the
+        // auto-enabling menu turns into permanently grayed-out items. Manual
+        // isEnabled below is authoritative instead.
+        menu.autoenablesItems = false
 
         // Copy — enabled only when there is an active selection.
         let copyItem = menu.addItem(
@@ -152,7 +163,67 @@ final class FloatyTerminalView: LocalProcessTerminalView {
         scrollBottomItem.target = self
         scrollBottomItem.isEnabled = canScroll && scrollPosition < 1.0
 
+        menu.addItem(.separator())
+
+        // Stage "tail -f <newest devtools log>" at the prompt — the one-step
+        // way to point an agent at the live browser console/network feed.
+        let tailItem = menu.addItem(
+            withTitle: "Tail DevTools Log",
+            action: #selector(tailDevtoolsLog(_:)),
+            keyEquivalent: ""
+        )
+        tailItem.target = self
+        tailItem.image = NSImage(systemSymbolName: "waveform.path.ecg",
+                                 accessibilityDescription: nil)
+        let logs = DevtoolsRelay.allLogs()
+        tailItem.isEnabled = !logs.isEmpty
+        // Progressive disclosure: one log = plain click (latest); several =
+        // a submenu, latest on top, then everything by provenance.
+        if logs.count > 1 {
+            let sub = NSMenu(title: "Logs")
+            sub.autoenablesItems = false
+            let latest = sub.addItem(withTitle: "Latest — \(logs[0].name)",
+                                     action: #selector(tailSpecificLog(_:)), keyEquivalent: "")
+            latest.target = self
+            latest.representedObject = logs[0].path
+            sub.addItem(.separator())
+            for log in logs {
+                let item = sub.addItem(withTitle: "\(log.category)/\(log.name)",
+                                       action: #selector(tailSpecificLog(_:)), keyEquivalent: "")
+                item.target = self
+                item.representedObject = log.path
+            }
+            tailItem.submenu = sub
+        }
+
+        if let armed = notifyWhenDoneState?() {
+            let notify = menu.addItem(
+                withTitle: "Notify When Done",
+                action: #selector(toggleNotifyWhenDone(_:)),
+                keyEquivalent: ""
+            )
+            notify.target = self
+            notify.state = armed ? .on : .off
+            notify.image = NSImage(systemSymbolName: "bell", accessibilityDescription: nil)
+        }
+
         return menu
+    }
+
+    @objc private func toggleNotifyWhenDone(_ sender: Any?) {
+        onToggleNotifyWhenDone?()
+    }
+
+    @objc private func tailDevtoolsLog(_ sender: Any?) {
+        guard let path = DevtoolsRelay.newestLogPath() else { return }
+        // Staged, not executed: at a shell it's ready to run with ↩; at an
+        // agent prompt the user can prepend/append instructions first.
+        send(txt: "tail -f \"\(path)\" ")
+    }
+
+    @objc private func tailSpecificLog(_ sender: NSMenuItem) {
+        guard let path = sender.representedObject as? String else { return }
+        send(txt: "tail -f \"\(path)\" ")
     }
 
     /// Sends Ctrl-L to the shell, which triggers the `clear` built-in in most shells.
