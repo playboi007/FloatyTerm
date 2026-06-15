@@ -20,6 +20,9 @@ final class SettingsWindowController: NSObject {
     private let browserTransparencyCheckbox = NSButton(checkboxWithTitle: "Transparent browser backgrounds (new tabs; some dark sites look better off)", target: nil, action: nil)
     private let recordButton = NSButton(title: "", target: nil, action: nil)
     private var summonGridButtons: [NSButton] = []   // 9 buttons, row-major
+    private let retentionPopup = NSPopUpButton()
+    private let capPopup = NSPopUpButton()
+    private let usageStack = NSStackView()           // per-category usage rows
 
     // Hotkey recording state.
     private var recording = false
@@ -28,6 +31,7 @@ final class SettingsWindowController: NSObject {
     func show() {
         if window == nil { build() }
         syncControls()
+        refreshUsage()   // usage numbers are live — recompute on every appearance
         window?.center()
         window?.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
@@ -37,7 +41,7 @@ final class SettingsWindowController: NSObject {
 
     private func build() {
         let w = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 420, height: 400),
+            contentRect: NSRect(x: 0, y: 0, width: 420, height: 740),
             styleMask: [.titled, .closable], backing: .buffered, defer: false
         )
         w.title = "FloatyTerm Preferences"
@@ -151,6 +155,54 @@ final class SettingsWindowController: NSObject {
         spawnHint.textColor = .secondaryLabelColor
         stack.addArrangedSubview(spawnHint)
 
+        // ── Storage ──────────────────────────────────────────────────────
+        // Per-feature data on disk (devtools logs, page captures, snaps):
+        // usage readouts with manual Clear, plus the two auto-clean knobs.
+        let storageSeparator = NSBox()
+        storageSeparator.boxType = .separator
+        storageSeparator.widthAnchor.constraint(equalToConstant: 380).isActive = true
+        stack.addArrangedSubview(storageSeparator)
+
+        let storageHeader = NSTextField(labelWithString: "Storage")
+        storageHeader.font = .boldSystemFont(ofSize: 13)
+        stack.addArrangedSubview(storageHeader)
+
+        // Per-category usage rows, rebuilt by refreshUsage().
+        usageStack.orientation = .vertical
+        usageStack.alignment = .leading
+        usageStack.spacing = 6
+        stack.addArrangedSubview(usageStack)
+
+        // Retention: how long files live before the hourly sweep removes them.
+        for (title, days) in [("Keep 1 day", 1), ("Keep 3 days", 3), ("Keep 7 days", 7),
+                              ("Keep 14 days", 14), ("Keep 30 days", 30), ("Forever", 0)] {
+            retentionPopup.addItem(withTitle: title)
+            retentionPopup.lastItem?.tag = days
+        }
+        retentionPopup.target = self
+        retentionPopup.action = #selector(retentionChanged(_:))
+        retentionPopup.widthAnchor.constraint(equalToConstant: 200).isActive = true
+        stack.addArrangedSubview(row("Auto-clean", retentionPopup))
+
+        // Cap: per-root size budget (Devtools full; Browser Context & Snaps ¼).
+        for (title, mb) in [("50 MB", 50), ("100 MB", 100), ("250 MB", 250),
+                            ("500 MB", 500), ("1 GB", 1024)] {
+            capPopup.addItem(withTitle: title)
+            capPopup.lastItem?.tag = mb
+        }
+        capPopup.target = self
+        capPopup.action = #selector(capChanged(_:))
+        capPopup.widthAnchor.constraint(equalToConstant: 200).isActive = true
+        stack.addArrangedSubview(row("Total cap", capPopup))
+
+        let storageHint = NSTextField(wrappingLabelWithString:
+            "Auto-clean runs hourly — removes items older than the retention, " +
+            "then trims oldest first to stay under the cap. Transcripts manage themselves.")
+        storageHint.font = .systemFont(ofSize: 11)
+        storageHint.textColor = .secondaryLabelColor
+        storageHint.preferredMaxLayoutWidth = 380
+        stack.addArrangedSubview(storageHint)
+
         // If the window closes mid-recording, tear the monitor down — a live
         // local monitor that returns nil would silently eat every keystroke.
         NotificationCenter.default.addObserver(
@@ -202,6 +254,43 @@ final class SettingsWindowController: NSObject {
         for b in summonGridButtons {
             b.state = (b.identifier?.rawValue == current) ? .on : .off
         }
+        _ = retentionPopup.selectItem(withTag: Settings.shared.storageRetentionDays)
+        _ = capPopup.selectItem(withTag: Settings.shared.storageCapMB)
+    }
+
+    /// Rebuilds the per-category usage rows (name · size · file count · Clear).
+    /// Called when the window appears and after a manual clear.
+    private func refreshUsage() {
+        usageStack.arrangedSubviews.forEach { $0.removeFromSuperview() }
+        for entry in StorageJanitor.shared.usage() {
+            let detail = NSTextField(labelWithString:
+                "\(Self.formatBytes(entry.bytes)) · \(entry.files) file\(entry.files == 1 ? "" : "s")")
+            detail.font = .systemFont(ofSize: 11)
+            detail.textColor = .secondaryLabelColor
+            detail.widthAnchor.constraint(equalToConstant: 140).isActive = true
+            // Transcripts have their own lifecycle — display-only, no Clear.
+            if entry.name == StorageJanitor.Category.transcripts.rawValue {
+                usageStack.addArrangedSubview(row(entry.name, detail))
+            } else {
+                let clear = NSButton(title: "Clear", target: self,
+                                     action: #selector(clearStorageTapped(_:)))
+                clear.bezelStyle = .rounded
+                clear.controlSize = .small
+                clear.identifier = NSUserInterfaceItemIdentifier(entry.name)
+                clear.toolTip = "Delete all files in \(entry.path)"
+                usageStack.addArrangedSubview(row(entry.name, detail, clear))
+            }
+        }
+    }
+
+    /// "12.4 MB"-style size for the Storage usage rows.
+    private static func formatBytes(_ bytes: Int64) -> String {
+        if bytes < 1024 { return "\(bytes) B" }
+        let kb = Double(bytes) / 1024
+        if kb < 1024 { return String(format: "%.1f KB", kb) }
+        let mb = kb / 1024
+        if mb < 1024 { return String(format: "%.1f MB", mb) }
+        return String(format: "%.2f GB", mb / 1024)
     }
 
     // MARK: - Actions
@@ -248,6 +337,23 @@ final class SettingsWindowController: NSObject {
     @objc private func opacityChanged(_ sender: NSSlider) {
         Settings.shared.unfocusedOpacity = sender.doubleValue
         opacityValueLabel.stringValue = "\(Int(sender.doubleValue * 100))%"
+    }
+
+    @objc private func retentionChanged(_ sender: NSPopUpButton) {
+        Settings.shared.storageRetentionDays = sender.selectedTag()
+        StorageJanitor.shared.sweep()   // apply the tighter policy right away
+    }
+
+    @objc private func capChanged(_ sender: NSPopUpButton) {
+        Settings.shared.storageCapMB = sender.selectedTag()
+        StorageJanitor.shared.sweep()
+    }
+
+    @objc private func clearStorageTapped(_ sender: NSButton) {
+        guard let raw = sender.identifier?.rawValue,
+              let category = StorageJanitor.Category(rawValue: raw) else { return }
+        StorageJanitor.shared.clear(category: category)
+        refreshUsage()
     }
 
     @objc private func loginToggled(_ sender: NSButton) {

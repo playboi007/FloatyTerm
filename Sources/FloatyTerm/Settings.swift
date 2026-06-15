@@ -64,7 +64,10 @@ final class Settings {
             "inheritWorkingDirectory": true,
             "browserTransparency": true,
             "summonPosition": SummonPosition.center.rawValue,
-            "ghostOpacity": 0.35
+            "ghostOpacity": 0.35,
+            "hideFromScreenCapture": false,
+            "storageRetentionDays": 3,
+            "storageCapMB": 100
         ])
     }
 
@@ -133,6 +136,17 @@ final class Settings {
         set { d.set(newValue, forKey: "ghostOpacity"); notify() }
     }
 
+    /// When true, every FloatyTerm surface (terminal windows, bubbles, ticker
+    /// strips, transcript readers, the switcher) is excluded from screen
+    /// capture: invisible in screen recordings and screen-sharing sessions
+    /// (Zoom, Meet…) while staying fully visible to the user. Terminals are
+    /// full of secrets and these windows float over everything — this keeps
+    /// them private when presenting.
+    var hideFromScreenCapture: Bool {
+        get { d.bool(forKey: "hideFromScreenCapture") }
+        set { d.set(newValue, forKey: "hideFromScreenCapture"); notify() }
+    }
+
     /// Grid point where the session switcher and summoned windows appear.
     var summonPosition: SummonPosition {
         get { SummonPosition(rawValue: d.string(forKey: "summonPosition") ?? "") ?? .center }
@@ -153,6 +167,25 @@ final class Settings {
     var inheritWorkingDirectory: Bool {
         get { d.bool(forKey: "inheritWorkingDirectory") }
         set { d.set(newValue, forKey: "inheritWorkingDirectory"); notify() }
+    }
+
+    /// How many days StorageJanitor keeps per-feature data on disk — Devtools
+    /// logs, Browser Context captures and Context Snap files — before its
+    /// hourly sweep deletes them. 0 = keep forever (the retention pass is
+    /// skipped; the size cap below still applies). One shared knob for all
+    /// managed directories; enforcement is per directory.
+    var storageRetentionDays: Int {
+        get { d.integer(forKey: "storageRetentionDays") }
+        set { d.set(newValue, forKey: "storageRetentionDays"); notify() }
+    }
+
+    /// Size budget (megabytes) StorageJanitor trims the managed directories
+    /// down to, oldest files first. Applied per managed root: Devtools gets
+    /// the full cap; Browser Context and Snaps get a quarter of it each. One
+    /// shared knob for all managed directories; enforcement is per directory.
+    var storageCapMB: Int {
+        get { d.integer(forKey: "storageCapMB") }
+        set { d.set(newValue, forKey: "storageCapMB"); notify() }
     }
 
     private func notify() {
