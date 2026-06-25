@@ -7,6 +7,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private let statusItem = StatusItemController()
     private let settingsWC = SettingsWindowController()
     private let switcher = SessionSwitcherController()
+    private let ruler = RulerController()
 
     /// Drives the menu-bar fleet summary (working / waiting counts across
     /// every terminal tab in every window). Strong reference — a scheduled
@@ -18,6 +19,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // include http://127.0.0.1:7777/floaty.js stream console/network
         // events into agent-tailable logs under App Support/FloatyTerm/Devtools.
         DevtoolsRelay.shared.start()
+        // Shell shim (`ftdiff a b`) POSTs to the relay's /diff route; open the
+        // resulting side-by-side diff in the current (or a fresh) window.
+        DevtoolsRelay.shared.onOpenDiff = { [weak self] left, right in
+            self?.compareFilesInCurrentWindow(left: left, right: right)
+        }
 
         // Keep per-feature data (Devtools logs, Browser Context captures,
         // Context Snaps) within the user's retention/size budget: one sweep
@@ -51,7 +57,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         statusItem.onRunBackgroundTask = { [weak self] in self?.runBackgroundTask() }
         statusItem.onNewTab        = { [weak self] in self?.newTerminalTabInCurrentWindow() }
         statusItem.onNewBrowserTab = { [weak self] in self?.newBrowserTabInCurrentWindow() }
+        statusItem.onNewNote       = { [weak self] in self?.newNoteTabInCurrentWindow() }
+        statusItem.onMirrorWindow  = { [weak self] in self?.newMirrorTabInCurrentWindow() }
+        statusItem.onCompareFiles  = { [weak self] in self?.compareFilesInCurrentWindow() }
+        statusItem.onShowRuler     = { [weak self] in self?.ruler.toggle() }
         statusItem.onPreferences   = { [weak self] in self?.settingsWC.show() }
+
+        // The `ruler` terminal helper emits a private OSC that TerminalController
+        // turns into this notification — summon (toggle) the ruler from any shell.
+        NotificationCenter.default.addObserver(
+            forName: .floatySummonRuler, object: nil, queue: .main
+        ) { [weak self] _ in self?.ruler.toggle() }
 
         switcher.sessionsProvider = { [weak self] in self?.sessionEntries() ?? [] }
         switcher.onSummon = { [weak self] entry in self?.summon(entry) }
@@ -352,6 +368,44 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             let wc = makeWindow()
             wc.openNewBrowserTab()
         }
+    }
+
+    private func newNoteTabInCurrentWindow() {
+        if let wc = currentWindow() {
+            wc.openNewNote()
+            wc.show()
+        } else {
+            // No window yet — make one (starts with a terminal tab), then add note.
+            let wc = makeWindow()
+            wc.openNewNote()
+        }
+    }
+
+    private func newMirrorTabInCurrentWindow() {
+        if let wc = currentWindow() {
+            wc.openNewMirror()
+            wc.show()
+        } else {
+            // No window yet — make one (starts with a terminal tab), then add mirror.
+            let wc = makeWindow()
+            wc.openNewMirror()
+        }
+    }
+
+    /// Menu / ⇧⌘D entry: present the two-file picker in the current window
+    /// (creating one if none exists), then open a diff tab.
+    private func compareFilesInCurrentWindow() {
+        let wc = currentWindow() ?? makeWindow()
+        wc.show()
+        wc.openCompareFilesPanel()
+    }
+
+    /// Relay entry (shell shim): paths are already resolved — open the diff tab
+    /// directly in the current window, creating one if needed.
+    private func compareFilesInCurrentWindow(left: URL, right: URL) {
+        let wc = currentWindow() ?? makeWindow()
+        wc.show()
+        wc.addDiffTab(left: left, right: right)
     }
 
     /// A FloatyTerm window the user can actually see on the CURRENT Space:

@@ -21,6 +21,9 @@ final class URLBarView: NSVisualEffectView, NSTextFieldDelegate {
     var onForward: (() -> Void)?
     /// Called when the reload button is tapped.
     var onReload: (() -> Void)?
+    /// Called when the popup/redirect shield is tapped (toggles protection for
+    /// the current site).
+    var onToggleShield: (() -> Void)?
 
     // MARK: - Subviews
 
@@ -28,6 +31,7 @@ final class URLBarView: NSVisualEffectView, NSTextFieldDelegate {
     private let forwardButton = NSButton()
     private let reloadButton  = NSButton()
     private let urlField      = NSTextField()
+    private let shieldButton  = NSButton()
 
     // MARK: - Init
 
@@ -54,6 +58,28 @@ final class URLBarView: NSVisualEffectView, NSTextFieldDelegate {
     func updateNavState(canGoBack: Bool, canGoForward: Bool) {
         backButton.isEnabled    = canGoBack
         forwardButton.isEnabled = canGoForward
+    }
+
+    /// Updates the popup/redirect shield: its glyph, tint, count badge, and
+    /// tooltip. `blocking` is whether protection is active for the current
+    /// site; `count` is how many intrusions this page has dropped.
+    func updateShield(blocking: Bool, count: Int) {
+        let symbol = blocking
+            ? (count > 0 ? "shield.lefthalf.filled" : "shield")
+            : "shield.slash"
+        shieldButton.image = NSImage(systemSymbolName: symbol,
+                                     accessibilityDescription: "Popup blocker")
+        // Count rides as the button title so a busy page reads "🛡 3".
+        shieldButton.title = (blocking && count > 0) ? " \(count)" : ""
+        shieldButton.imagePosition = shieldButton.title.isEmpty ? .imageOnly : .imageLeading
+        shieldButton.contentTintColor = blocking
+            ? NSColor.white.withAlphaComponent(count > 0 ? 1.0 : 0.55)
+            : NSColor.systemOrange.withAlphaComponent(0.9)
+        shieldButton.toolTip = blocking
+            ? (count > 0
+                ? "\(count) popup\(count == 1 ? "" : "s")/redirect\(count == 1 ? "" : "s") blocked on this page — click to allow on this site"
+                : "Popup blocking on — click to allow popups on this site")
+            : "Popups allowed on this site — click to re-enable blocking"
     }
 
     /// Focuses the URL field (selects all text for quick replacement).
@@ -95,8 +121,14 @@ final class URLBarView: NSVisualEffectView, NSTextFieldDelegate {
         urlField.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
         urlField.setContentHuggingPriority(.defaultLow, for: .horizontal)
 
+        // ── Shield (popup / redirect blocker) ────────────────────────────────
+        configureNavButton(shieldButton, symbol: "shield", tooltip: "Popup blocker",
+                           action: #selector(shieldTapped))
+        shieldButton.imageHugsTitle = true
+        shieldButton.font = .systemFont(ofSize: 10, weight: .semibold)
+
         // ── Layout stack ─────────────────────────────────────────────────────
-        let stack = NSStackView(views: [backButton, forwardButton, reloadButton, urlField])
+        let stack = NSStackView(views: [backButton, forwardButton, reloadButton, urlField, shieldButton])
         stack.orientation = .horizontal
         stack.alignment   = .centerY
         stack.spacing     = 6
@@ -129,6 +161,7 @@ final class URLBarView: NSVisualEffectView, NSTextFieldDelegate {
     @objc private func backTapped()    { onBack?()    }
     @objc private func forwardTapped() { onForward?() }
     @objc private func reloadTapped()  { onReload?()  }
+    @objc private func shieldTapped()  { onToggleShield?() }
 
     @objc private func urlFieldCommitted() {
         onLoad?(urlField.stringValue)

@@ -43,6 +43,11 @@ final class BrowserController: NSObject, TabContent, WKNavigationDelegate, WKUID
         return title
     }
 
+    var restorableRecord: TabRecord? {
+        TabRecord(kind: "browser", customName: customName,
+                  url: webView.url?.absoluteString)
+    }
+
     // MARK: - Unseen-change tracking (title changes while not in view)
 
     private(set) var hasUnseenOutput = false
@@ -58,6 +63,44 @@ final class BrowserController: NSObject, TabContent, WKNavigationDelegate, WKUID
 
     var canGoBack:    Bool { webView.canGoBack    }
     var canGoForward: Bool { webView.canGoForward }
+
+    // MARK: - Intrusion blocking (popups / unsolicited redirects)
+
+    /// How many popups / redirects this tab has dropped. Drives the URL-bar
+    /// shield's count. Resets when the page navigates (per-page tally).
+    private(set) var blockedCount = 0
+
+    /// Fired when `blockedCount` changes, so the host can refresh the shield.
+    var onBlockedCountChanged: (() -> Void)?
+
+    /// Per-tab escape hatch: when true, this tab honours popups and redirects
+    /// regardless of the global settings (the shield's "allow on this site").
+    var protectionDisabled = false {
+        didSet { applyPopupPolicy(); onBlockedCountChanged?() }
+    }
+
+    /// Observes `Settings.didChange` so the popup-faker flag tracks the live
+    /// blockPopups setting. Removed in `cleanup`.
+    private var settingsObserver: NSObjectProtocol?
+
+    /// Pushes the current effective popup policy into the page: when blocking
+    /// is on for this site, the faker returns a stub window; when off, it
+    /// defers to the real `window.open`.
+    private func applyPopupPolicy() {
+        let allow = protectionDisabled || !Settings.shared.blockPopups
+        webView.evaluateJavaScript("window.__floatyAllowPopups = \(allow);",
+                                   completionHandler: nil)
+    }
+
+    /// Timestamp of the last real user interaction (pointer/key), reported by
+    /// the gesture beacon. Used to tell a user-driven redirect from an
+    /// unsolicited one.
+    private var lastGestureAt = Date.distantPast
+
+    private func noteBlocked() {
+        blockedCount += 1
+        onBlockedCountChanged?()
+    }
 
     // MARK: - KVO
 
@@ -120,6 +163,33 @@ final class BrowserController: NSObject, TabContent, WKNavigationDelegate, WKUID
             forMainFrameOnly: true
         ))
 
+        // ── User-gesture beacon ──────────────────────────────────────────────
+        // Records the timestamp of the last genuine pointer/key interaction so
+        // the navigation policy can tell a user-driven redirect from an
+        // unsolicited (timer-driven) ad redirect. Capture phase + all frames so
+        // a click in the video-player iframe still counts. Cheap; the native
+        // side only consults it when redirect blocking is enabled.
+        config.userContentController.addUserScript(WKUserScript(
+            source: Self.gestureBeaconJS,
+            injectionTime: .atDocumentStart,
+            forMainFrameOnly: false
+        ))
+
+        // ── Popup faker (anti-adblock gate bypass) ───────────────────────────
+        // Many streaming sites gate their content behind `var w =
+        // window.open(ad); if (w) unlock();` — a hard native block returns null,
+        // the page sees it was blocked, and refuses to play. Instead we replace
+        // window.open with a stub that returns a believable no-op window so the
+        // gate passes while nothing actually opens. Live-gated by the
+        // `__floatyAllowPopups` flag (set from `applyPopupPolicy`) so the per-
+        // site shield can still let real popups through. documentStart + all
+        // frames so it's in place before any page or ad-iframe code runs.
+        config.userContentController.addUserScript(WKUserScript(
+            source: Self.popupFakerJS,
+            injectionTime: .atDocumentStart,
+            forMainFrameOnly: false
+        ))
+
         let wv = WKWebView(frame: .zero, configuration: config)
         wv.translatesAutoresizingMaskIntoConstraints = false
 
@@ -151,6 +221,14 @@ final class BrowserController: NSObject, TabContent, WKNavigationDelegate, WKUID
         let proxy = WeakScriptMessageHandler(self)
         config.userContentController.add(proxy, name: "floatySelection")
         config.userContentController.add(proxy, name: "floatyDevtools")
+        config.userContentController.add(proxy, name: "floatyGesture")
+        config.userContentController.add(proxy, name: "floatyPopup")
+
+        // Keep the in-page popup-faker flag in step with the live settings /
+        // per-site override, without needing a navigation to take effect.
+        settingsObserver = NotificationCenter.default.addObserver(
+            forName: Settings.didChange, object: nil, queue: .main
+        ) { [weak self] _ in self?.applyPopupPolicy() }
 
         // ── KVO: watch the web view's published `title` property ────────────
         titleObservation = webView.observe(\.title, options: [.new]) { [weak self] _, change in
@@ -191,10 +269,18 @@ final class BrowserController: NSObject, TabContent, WKNavigationDelegate, WKUID
             .removeScriptMessageHandler(forName: "floatySelection")
         webView.configuration.userContentController
             .removeScriptMessageHandler(forName: "floatyDevtools")
-        try? devtoolsLogHandle?.close()
-        devtoolsLogHandle = nil
+        webView.configuration.userContentController
+            .removeScriptMessageHandler(forName: "floatyGesture")
+        webView.configuration.userContentController
+            .removeScriptMessageHandler(forName: "floatyPopup")
+        if let observer = settingsObserver {
+            NotificationCenter.default.removeObserver(observer)
+            settingsObserver = nil
+        }
         if let path = devtoolsLogPath {   // ephemeral: log dies with the tab
-            try? FileManager.default.removeItem(atPath: path)
+            let url = URL(fileURLWithPath: path)
+            DevtoolsLog.shared.drop(url)
+            try? FileManager.default.removeItem(at: url)
         }
         webView.stopLoading()
     }
@@ -208,7 +294,6 @@ final class BrowserController: NSObject, TabContent, WKNavigationDelegate, WKUID
     /// The per-tab devtools log on disk (created on the first event). An
     /// agent can `tail -f` this to watch the page live. Deleted with the tab.
     private(set) var devtoolsLogPath: String?
-    private var devtoolsLogHandle: FileHandle?
     private let devtoolsID = UUID().uuidString
 
     private static let timeFormatter: DateFormatter = {
@@ -258,21 +343,21 @@ final class BrowserController: NSObject, TabContent, WKNavigationDelegate, WKUID
     }
 
     private func appendDevtoolsLine(_ line: String) {
-        if devtoolsLogHandle == nil {
+        let url: URL
+        if let path = devtoolsLogPath {
+            url = URL(fileURLWithPath: path)
+        } else {
             // Provenance in the filename: the host this tab was on when its
             // first event arrived, plus a short id so two tabs on the same
             // site don't collide. Lives under Devtools/tabs/ (remote pages
-            // get Devtools/remote/).
+            // get Devtools/remote/). The shared sink owns the handle and
+            // recreates the file if a sweep deletes it mid-session.
             let host = DevtoolsRelay.sanitize(webView.url?.host ?? "tab")
-            let url = DevtoolsRelay.logDirectory(category: "tabs")
+            url = DevtoolsRelay.logDirectory(category: "tabs")
                 .appendingPathComponent("\(host)-\(devtoolsID.prefix(8)).ndjson")
-            FileManager.default.createFile(atPath: url.path, contents: nil)
-            devtoolsLogHandle = try? FileHandle(forWritingTo: url)
             devtoolsLogPath = url.path
         }
-        if let data = (line + "\n").data(using: .utf8) {
-            try? devtoolsLogHandle?.write(contentsOf: data)
-        }
+        DevtoolsLog.shared.append(line + "\n", to: url)
     }
 
     /// Console/error/network tap, installed before page code runs.
@@ -368,6 +453,62 @@ final class BrowserController: NSObject, TabContent, WKNavigationDelegate, WKUID
         };
     })();
     """#
+
+    /// Pings the native side on every genuine user interaction. Capture phase
+    /// so a page can't hide the gesture with stopPropagation; no values are
+    /// read — it only signals "the user just did something".
+    private static let gestureBeaconJS = """
+    (function () {
+        if (window.__floatyGesture) return; window.__floatyGesture = true;
+        function ping() {
+            try { window.webkit.messageHandlers.floatyGesture.postMessage(1); } catch (e) {}
+        }
+        ['pointerdown', 'keydown', 'wheel', 'touchstart'].forEach(function (t) {
+            document.addEventListener(t, ping, true);
+        });
+    })();
+    """
+
+    /// Replaces `window.open` with a stub that returns a believable but inert
+    /// window object, so anti-adblock gates ("if (window.open(ad)) unlock()")
+    /// pass without anything actually opening. Honours `__floatyAllowPopups`:
+    /// when set (per-site shield off, or blocking disabled) it defers to the
+    /// real opener. The Proxy returns a no-op function for any unknown property
+    /// so however the page pokes at the returned window, nothing throws.
+    private static let popupFakerJS = """
+    (function () {
+        if (window.__floatyPopupFaker) return; window.__floatyPopupFaker = true;
+        var realOpen = window.open;
+        function makeStub() {
+            var loc = { href: '', protocol: '', host: '', pathname: '', search: '', hash: '',
+                        assign: function () {}, replace: function () {}, reload: function () {},
+                        toString: function () { return ''; } };
+            var win = {
+                closed: false, opener: null, name: '', length: 0,
+                close:  function () { win.closed = true; },
+                focus:  function () {}, blur: function () {},
+                postMessage: function () {}, scrollTo: function () {}, scrollBy: function () {},
+                location: loc, self: null, window: null, top: null, frames: [],
+                document: { write: function () {}, writeln: function () {},
+                            open: function () {}, close: function () {} },
+                open: function () { return makeStub(); }
+            };
+            win.self = win; win.window = win; win.top = win;
+            return new Proxy(win, {
+                get: function (t, p) {
+                    if (p in t) return t[p];
+                    return function () { return undefined; };
+                },
+                set: function (t, p, v) { t[p] = v; return true; }
+            });
+        }
+        window.open = function (url, name, features) {
+            if (window.__floatyAllowPopups) return realOpen.apply(window, arguments);
+            try { window.webkit.messageHandlers.floatyPopup.postMessage(String(url || '')); } catch (e) {}
+            return makeStub();
+        };
+    })();
+    """
 
     // MARK: - Selection bridge
 
@@ -506,6 +647,14 @@ final class BrowserController: NSObject, TabContent, WKNavigationDelegate, WKUID
 
     func userContentController(_ controller: WKUserContentController,
                                didReceive message: WKScriptMessage) {
+        if message.name == "floatyGesture" {
+            lastGestureAt = Date()
+            return
+        }
+        if message.name == "floatyPopup" {   // a window.open the faker stubbed
+            noteBlocked()
+            return
+        }
         if message.name == "floatyDevtools" {
             ingestDevtoolsEvent(message.body as? [String: Any])
             return
@@ -581,6 +730,11 @@ final class BrowserController: NSObject, TabContent, WKNavigationDelegate, WKUID
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }
 
+        // An explicit load (URL bar / restore / homepage) is user-intended, so
+        // count it as a gesture — otherwise redirect blocking, which sees a
+        // programmatic cross-site `.other` navigation, would cancel it.
+        lastGestureAt = Date()
+
         let url: URL
         if let explicit = parseURL(trimmed) {
             url = explicit
@@ -621,8 +775,20 @@ final class BrowserController: NSObject, TabContent, WKNavigationDelegate, WKUID
 
     // MARK: - WKNavigationDelegate
 
+    /// New document committed: re-assert the popup policy (the previous page's
+    /// flag doesn't carry over) before the page's gate code runs.
+    func webView(_ webView: WKWebView, didCommit navigation: WKNavigation!) {
+        applyPopupPolicy()
+    }
+
     func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
-        // Title is updated via KVO; no extra work needed here.
+        // Title is updated via KVO; reset the per-page intrusion tally so the
+        // shield's count reflects only the page now in view.
+        if navigation != nil, blockedCount != 0 {
+            blockedCount = 0
+            onBlockedCountChanged?()
+        }
+        applyPopupPolicy()
     }
 
     func webView(_ webView: WKWebView, didFail navigation: WKNavigation!,
@@ -634,17 +800,46 @@ final class BrowserController: NSObject, TabContent, WKNavigationDelegate, WKUID
     func webView(_ webView: WKWebView,
                  decidePolicyFor navigationAction: WKNavigationAction,
                  decisionHandler: @escaping (WKNavigationActionPolicy) -> Void) {
+        if Settings.shared.blockRedirects, !protectionDisabled,
+           isUnsolicitedRedirect(navigationAction) {
+            noteBlocked()
+            decisionHandler(.cancel)
+            return
+        }
         decisionHandler(.allow)
+    }
+
+    /// True for a main-frame navigation to a *different* site that fires with
+    /// no recent user interaction — the timer-driven ad-redirect signature.
+    /// Same-site navigations, downloads, link clicks, and anything within ~1s
+    /// of a real gesture are treated as legitimate.
+    private func isUnsolicitedRedirect(_ action: WKNavigationAction) -> Bool {
+        guard action.targetFrame?.isMainFrame == true,
+              action.navigationType == .other,
+              let destHost = action.request.url?.host,
+              let currentHost = webView.url?.host,
+              destHost != currentHost else { return false }
+        return Date().timeIntervalSince(lastGestureAt) > 1.0
     }
 
     // MARK: - WKUIDelegate stubs
 
-    /// target=_blank links: load in the same web view instead of opening a new
-    /// window, so we don't spawn windows we can't manage.
+    /// A page asked to open a new window (window.open / target=_blank). We
+    /// never spawn a window we can't manage, so the choice is only: drop it, or
+    /// follow it in this same view.
+    ///
+    /// With popup blocking on (and not disabled for this site) we drop it
+    /// entirely — this is the "click play → new ad tab" defence: the user's
+    /// real click still drives the page, the spawned popup just dies. With
+    /// blocking off we preserve the old behaviour and follow the link in place.
     func webView(_ webView: WKWebView,
                  createWebViewWith configuration: WKWebViewConfiguration,
                  for navigationAction: WKNavigationAction,
                  windowFeatures: WKWindowFeatures) -> WKWebView? {
+        if Settings.shared.blockPopups, !protectionDisabled {
+            noteBlocked()
+            return nil
+        }
         if let url = navigationAction.request.url {
             webView.load(URLRequest(url: url))
         }

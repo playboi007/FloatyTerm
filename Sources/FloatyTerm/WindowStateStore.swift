@@ -6,11 +6,12 @@ import AppKit
 /// `sessionID` is optional so records saved before transcript persistence
 /// still decode — a restored tab without one simply starts a fresh identity.
 struct TabRecord: Codable {
-    var kind: String           // "terminal" | "browser"
+    var kind: String           // "terminal" | "browser" | "note"
     var customName: String?
     var directory: String?     // terminal: last working directory
     var url: String?           // browser: last page
     var sessionID: String?     // terminal: stable identity → its transcript log
+    var path: String?          // note: backing markdown file
 }
 
 /// One persisted window: its frame, avatar personalization, and tabs.

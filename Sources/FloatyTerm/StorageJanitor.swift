@@ -39,6 +39,7 @@ final class StorageJanitor {
         case browserContext = "Browser Context"
         case transcripts = "Transcripts"
         case snaps = "Snaps"
+        case notes = "Notes"
 
         var url: URL {
             let appSupport = FileManager.default.urls(
@@ -55,6 +56,8 @@ final class StorageJanitor {
                 // its create-on-access side effect.
                 return URL(fileURLWithPath: NSHomeDirectory())
                     .appendingPathComponent(".floatyterm/snaps", isDirectory: true)
+            case .notes:
+                return NotesStore.directory
             }
         }
 
@@ -66,14 +69,14 @@ final class StorageJanitor {
         var isSwept: Bool { self != .transcripts }
 
         /// This root's share of the user's total cap. Devtools (the
-        /// high-volume event stream) gets the full cap; Browser Context and
-        /// Snaps get a quarter each.
+        /// high-volume event stream) gets the full cap; Browser Context,
+        /// Snaps, and Notes get a quarter each.
         func capBytes(totalMB: Int) -> Int64 {
             let full = Int64(totalMB) * 1_048_576
             switch self {
-            case .devtools:               return full
-            case .browserContext, .snaps: return full / 4
-            case .transcripts:            return .max   // never trimmed here
+            case .devtools:                      return full
+            case .browserContext, .snaps, .notes: return full / 4
+            case .transcripts:                   return .max   // never trimmed here
             }
         }
     }
@@ -138,11 +141,12 @@ final class StorageJanitor {
                 }
             }
 
-            // DevtoolsRelay holds open handles on these logs: once files are
-            // gone, drop the handles so events can't keep streaming into
-            // deleted inodes (invisible, unreachable data).
+            // Both DevtoolsRelay (remote/) and BrowserController (tabs/) keep
+            // open handles on these logs through the shared DevtoolsLog sink:
+            // once files are gone, drop the handles so events can't keep
+            // streaming into deleted inodes (invisible, unreachable data).
             if category == .devtools, deletedAny {
-                DevtoolsRelay.shared.dropHandles()
+                DevtoolsLog.shared.dropHandles()
             }
         }
     }
@@ -174,10 +178,10 @@ final class StorageJanitor {
             for f in Self.files(in: category) {
                 if (try? fm.removeItem(at: f.url)) != nil { deletedAny = true }
             }
-            // Without this, DevtoolsRelay's open handles would silently
-            // resurrect writes into the deleted files' inodes.
+            // Without this, the shared sink's open handles (relay + tabs)
+            // would silently resurrect writes into the deleted files' inodes.
             if category == .devtools, deletedAny {
-                DevtoolsRelay.shared.dropHandles()
+                DevtoolsLog.shared.dropHandles()
             }
         }
     }

@@ -86,6 +86,11 @@ final class TerminalWindowController: NSObject, NSWindowDelegate {
     var tabs: [any TabContent] = []
     private var activeIndex = 0
 
+    /// Viewer child tabs (e.g. images) → their parent terminal tab. In-memory
+    /// only (TabContent is class-bound, so ObjectIdentifier is a stable key for
+    /// the session's lifetime); used so closing a parent closes its viewers.
+    private var parentByChild: [ObjectIdentifier: ObjectIdentifier] = [:]
+
     /// Held only during init so the first addTerminalTab() call can use it.
     /// Cleared after the first tab is created.
     private var pendingInitialDirectory: String?
@@ -351,21 +356,10 @@ final class TerminalWindowController: NSObject, NSWindowDelegate {
         WindowRecord(frame: NSStringFromRect(persistableFrame),
                      avatarSymbol: avatarStyle.symbol,
                      avatarColor: avatarStyle.colorName,
-                     tabs: tabs.map(tabRecord(for:)),
+                     tabs: tabs.compactMap(\.restorableRecord),
                      activeIndex: activeIndex,
                      linkedAppBundleID: linkedAppBundleID,
                      linkedAppName: linkedAppName)
-    }
-
-    private func tabRecord(for tab: any TabContent) -> TabRecord {
-        if let bc = tab as? BrowserController {
-            return TabRecord(kind: "browser", customName: bc.customName,
-                             directory: nil, url: bc.webView.url?.absoluteString)
-        }
-        let tc = tab as? TerminalController
-        return TabRecord(kind: "terminal", customName: tab.customName,
-                         directory: tc?.currentWorkingDirectory, url: nil,
-                         sessionID: tc?.sessionID)
     }
 
     /// Recreates tabs from a saved session: terminals restart in their last
@@ -382,6 +376,14 @@ final class TerminalWindowController: NSObject, NSWindowDelegate {
                 }
                 tab.onNavChanged = { [weak self] in self?.syncURLBar() }
                 insertTab(tab)
+            } else if record.kind == "note" {
+                // Reopen the autosaved markdown file; a path-less record (or a
+                // file the janitor swept) falls back to a fresh scratch note.
+                let url = record.path.map(URL.init(fileURLWithPath:))
+                    ?? NotesStore.newScratchNote()
+                let tab = NoteController(fileURL: url)
+                tab.customName = record.customName
+                installSimpleTab(tab)
             } else {
                 // Hand back the saved sessionID so the tab reclaims its
                 // transcript log; a pre-sessionID record just mints a new one.
@@ -758,6 +760,12 @@ final class TerminalWindowController: NSObject, NSWindowDelegate {
     /// Public entry for the menu bar's "New Browser Tab".
     func openNewBrowserTab() { addBrowserTab() }
 
+    /// Public entry for the menu bar's "New Note".
+    func openNewNote() { addNoteTab() }
+
+    /// Public entry for the menu bar's "Mirror a Window…".
+    func openNewMirror() { addMirrorTab() }
+
     // MARK: - Keyboard commands
 
     private func handleKeyCommand(_ event: NSEvent) -> Bool {
@@ -769,6 +777,13 @@ final class TerminalWindowController: NSObject, NSWindowDelegate {
             switch chars {
             case "t": addTerminalTab(); return true
             case "b": addBrowserTab();  return true
+            case "e": addNoteTab();     return true
+            case "s":
+                // ⌘S saves-as the active note; harmless no-op for other tabs
+                // (notes already autosave, so this is "save a copy / relocate").
+                guard let note = activeNote else { return false }
+                note.presentSaveAs(in: panel)
+                return true
             case "w": closeTab(activeIndex); return true
             case "n": onNewWindow?(); return true
             case ",": onOpenPreferences?(); return true
@@ -816,6 +831,14 @@ final class TerminalWindowController: NSObject, NSWindowDelegate {
             if event.keyCode == 33 { cycleTab(-1); return true }  // ⌘⇧[  prev
             if chars == "g" {
                 if activeTabIsTerminal { findPrevious() }
+                return true
+            }
+            if chars.lowercased() == "d" {   // ⇧⌘D — Compare Two Files…
+                openCompareFilesPanel()
+                return true
+            }
+            if chars.lowercased() == "m" {   // ⇧⌘M — Mirror a Window…
+                addMirrorTab()
                 return true
             }
         }
@@ -872,6 +895,10 @@ final class TerminalWindowController: NSObject, NSWindowDelegate {
         tabs.indices.contains(activeIndex) ? tabs[activeIndex] as? BrowserController : nil
     }
 
+    private var activeNote: NoteController? {
+        tabs.indices.contains(activeIndex) ? tabs[activeIndex] as? NoteController : nil
+    }
+
     // MARK: - Appearance (transparency + blur)
 
     private func applyAppearance(focused: Bool) {
@@ -885,10 +912,14 @@ final class TerminalWindowController: NSObject, NSWindowDelegate {
     }
 
     @objc private func settingsChanged() {
-        // Only apply font to terminal tabs.
-        tabs.compactMap { $0 as? TerminalController }.forEach { $0.applyFont() }
+        // Only apply font / renderer to terminal tabs.
+        tabs.compactMap { $0 as? TerminalController }.forEach {
+            $0.applyFont()
+            $0.applyMetalRenderer()
+        }
         applyAppearance(focused: panel.isKeyWindow)
         updateURLBarVisibility()  // reflect URL-bar collapse state changes
+        syncURLBar()              // reflect popup/redirect blocking toggles in the shield
         if isGhosted {            // live-apply a ghost-opacity slider change
             panel.alphaValue = CGFloat(max(0.1, Settings.shared.ghostOpacity))
         }
@@ -948,7 +979,63 @@ final class TerminalWindowController: NSObject, NSWindowDelegate {
         insertTab(tab)
     }
 
-    private func insertTab(_ tab: any TabContent) {
+    /// Wires the baseline title callback (refresh the strip on rename) and
+    /// inserts the tab — for tab kinds that need no callbacks beyond that.
+    private func installSimpleTab(_ tab: any TabContent) {
+        tab.onTitleChanged = { [weak self] in self?.refreshTabStrip() }
+        insertTab(tab)
+    }
+
+    /// Opens a new markdown note tab, backed by a fresh scratch file in the
+    /// managed Notes directory.
+    func addNoteTab() {
+        installSimpleTab(NoteController(fileURL: NotesStore.newScratchNote()))
+    }
+
+    /// Opens a new tab showing a side-by-side diff of two files.
+    func addDiffTab(left: URL, right: URL) {
+        installSimpleTab(DiffViewerController(left: left, right: right))
+    }
+
+    /// Opens a new tab that live-mirrors another app's window (it starts on a
+    /// window picker, then shows the chosen window's live content).
+    func addMirrorTab() {
+        installSimpleTab(MirrorController())
+    }
+
+    /// Public entry for "Compare Two Files…": pick exactly two files, then open
+    /// a diff tab. Used by the ⇧⌘D shortcut and the status-bar menu.
+    func openCompareFilesPanel() {
+        let panel = NSOpenPanel()
+        panel.title = "Compare Two Files"
+        panel.message = "Choose two files to compare."
+        panel.prompt = "Compare"
+        panel.allowsMultipleSelection = true
+        panel.canChooseDirectories = false
+        panel.canChooseFiles = true
+        if let dir = activeTerminalWorkingDirectory {
+            panel.directoryURL = URL(fileURLWithPath: dir)
+        }
+        NSApp.activate(ignoringOtherApps: true)
+        panel.begin { [weak self] response in
+            guard let self, response == .OK else { return }
+            let urls = panel.urls
+            guard urls.count == 2 else {
+                let alert = NSAlert()
+                alert.alertStyle = .warning
+                alert.messageText = "Select exactly two files"
+                alert.informativeText = "A diff compares two files — you chose \(urls.count)."
+                alert.runModal()
+                return
+            }
+            self.addDiffTab(left: urls[0], right: urls[1])
+        }
+    }
+
+    /// Inserts `tab` into the window. When `at` is provided the tab lands at
+    /// that index (used for child tabs placed next to a parent); otherwise it is
+    /// appended. The inserted tab becomes active either way.
+    private func insertTab(_ tab: any TabContent, at index: Int? = nil) {
         // A tab arriving — the lent one coming home, or a fresh one — means
         // this window is a real session host again, not a waiting husk.
         if isLent {
@@ -967,7 +1054,14 @@ final class TerminalWindowController: NSObject, NSWindowDelegate {
             v.trailingAnchor.constraint(equalTo: contentArea.trailingAnchor)
         ])
 
-        tabs.append(tab)
+        let insertionIndex: Int
+        if let index, index >= 0, index <= tabs.count {
+            tabs.insert(tab, at: index)
+            insertionIndex = index
+        } else {
+            tabs.append(tab)
+            insertionIndex = tabs.count - 1
+        }
         // (Re)wire the selection bridge here — insertTab is the single entry
         // for tabs joining a window (new, restored, AND adopted from another
         // window), so the chip always reports to the current host.
@@ -976,10 +1070,49 @@ final class TerminalWindowController: NSObject, NSWindowDelegate {
                 guard let self, let bc else { return }
                 self.browserSelectionChanged(bc, sel)
             }
+            // Refresh the shield's count live — but only while this tab is the
+            // one on screen (a background tab's blocks shouldn't move the bar).
+            bc.onBlockedCountChanged = { [weak self, weak bc] in
+                guard let self, let bc, bc === self.activeBrowser else { return }
+                self.syncURLBar()
+            }
         }
-        selectTab(tabs.count - 1)
+        // Terminals route "Open in Image Viewer" through here — insertTab is the
+        // single entry for every terminal tab (new, restored, adopted), so the
+        // child-tab hook is always wired to the current host.
+        if let tc = tab as? TerminalController {
+            tc.onOpenChildTab = { [weak self, weak tc] viewer in
+                guard let self, let tc else { return }
+                self.insertChildTab(viewer, after: tc)
+            }
+        }
+        selectTab(insertionIndex)
         applyAppearance(focused: panel.isKeyWindow)
         scheduleFrameSave()   // tabs are part of the persisted session now
+    }
+
+    /// Inserts `child` immediately after `parent`'s tab and records the link so
+    /// the child closes with its parent. Used for viewer tabs (e.g. images)
+    /// spawned from a terminal.
+    private func insertChildTab(_ child: any TabContent, after parent: any TabContent) {
+        child.onTitleChanged = { [weak self] in self?.refreshTabStrip() }
+        parentByChild[ObjectIdentifier(child)] = ObjectIdentifier(parent)
+        let at = tabs.firstIndex(where: { $0 === parent }).map { $0 + 1 }
+        insertTab(child, at: at)
+    }
+
+    /// Closes every viewer child tab of `parent`. Children always sit at a
+    /// higher index than their parent (inserted at parentIndex+1), so closing
+    /// them never shifts the parent's own index.
+    private func closeChildren(of parent: any TabContent) {
+        let parentID = ObjectIdentifier(parent)
+        let childIDs = parentByChild.compactMap { $0.value == parentID ? $0.key : nil }
+        for cid in childIDs {
+            parentByChild.removeValue(forKey: cid)
+            if let idx = tabs.firstIndex(where: { ObjectIdentifier($0) == cid }) {
+                closeTab(idx)
+            }
+        }
     }
 
     private func selectTab(_ index: Int) {
@@ -1018,6 +1151,14 @@ final class TerminalWindowController: NSObject, NSWindowDelegate {
             NSApp.activate(ignoringOtherApps: true)
             guard alert.runModal() == .alertFirstButtonReturn else { return }
         }
+
+        // Committed to closing now (any running-job prompt has been accepted).
+        // Drop this tab's own parent link (it may itself be a viewer child),
+        // then close any viewer children it owns. Children sit after `index`,
+        // so it stays valid for the removal below.
+        parentByChild.removeValue(forKey: ObjectIdentifier(tabs[index]))
+        closeChildren(of: tabs[index])
+        guard tabs.indices.contains(index) else { return }
 
         if index == activeIndex && isFindBarVisible  { hideFindBar()       }
         if index == activeIndex && isPaletteVisible  { hideRecentPalette() }
@@ -1759,16 +1900,21 @@ final class TerminalWindowController: NSObject, NSWindowDelegate {
         RegionSelector.begin(on: panel.screen) { [weak self] region in
             guard let self, let region else { return }   // nil = Esc
             let area: NSRect? = region.isEmpty ? nil : region
-            guard let image = ContextSnap.captureBehind(self.panel, region: area) else {
-                NSLog("FloatyTerm: context snap capture returned nil")
-                return
-            }
-            if asText {
-                ContextSnap.recognizeText(in: image) { [weak self] text in
-                    self?.presentOCRReview(text ?? "")
+            // captureBehind is async (ScreenCaptureKit one-shot); hop to the main
+            // actor to read the window/screen, then await the capture off it.
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                guard let image = await ContextSnap.captureBehind(self.panel, region: area) else {
+                    NSLog("FloatyTerm: context snap capture returned nil")
+                    return
                 }
-            } else if let url = ContextSnap.saveImage(image) {
-                self.insertSnapPath(url)
+                if asText {
+                    ContextSnap.recognizeText(in: image) { [weak self] text in
+                        self?.presentOCRReview(text ?? "")
+                    }
+                } else if let url = ContextSnap.saveImage(image) {
+                    self.insertSnapPath(url)
+                }
             }
         }
     }
@@ -2093,6 +2239,11 @@ final class TerminalWindowController: NSObject, NSWindowDelegate {
         urlBar.onBack    = { [weak self] in self?.activeBrowser?.goBack()    }
         urlBar.onForward = { [weak self] in self?.activeBrowser?.goForward() }
         urlBar.onReload  = { [weak self] in self?.activeBrowser?.reload()    }
+        urlBar.onToggleShield = { [weak self] in
+            guard let bc = self?.activeBrowser else { return }
+            bc.protectionDisabled.toggle()
+            self?.syncURLBar()
+        }
     }
 
     private func browserLoad(_ text: String) {
@@ -2120,6 +2271,9 @@ final class TerminalWindowController: NSObject, NSWindowDelegate {
         let urlString = bc.webView.url?.absoluteString ?? ""
         urlBar.updateURL(urlString)
         urlBar.updateNavState(canGoBack: bc.canGoBack, canGoForward: bc.canGoForward)
+        let blocking = (Settings.shared.blockPopups || Settings.shared.blockRedirects)
+            && !bc.protectionDisabled
+        urlBar.updateShield(blocking: blocking, count: bc.blockedCount)
     }
 
     /// Called after selectTab / settings change to show/hide the URL bar based

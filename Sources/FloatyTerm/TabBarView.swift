@@ -80,6 +80,13 @@ final class WindowDropView: NSView {
             setHighlighted(false)
             return []
         }
+        // Hold ⌘ over this window to merge the dragged tab in NOW, without
+        // releasing onto the highlight. Consumes the drag; mouse-up no-ops.
+        if let wc = windowController,
+           TabDragRegistry.shared.commitHotkeyMerge(token: token, into: wc) {
+            setHighlighted(false)
+            return []
+        }
         setHighlighted(true)
         return .move
     }
@@ -543,7 +550,13 @@ final class TabStripView: DragHandleView, TabChipDragDelegate {
     }
 
     override func draggingUpdated(_ sender: NSDraggingInfo) -> NSDragOperation {
-        guard tokenFromSender(sender) != nil else { return [] }
+        guard let token = tokenFromSender(sender) else { return [] }
+        // ⌘ held over another window's strip merges the tab in immediately
+        // (cross-window only; same-window drags fall through to reorder).
+        if let wc = windowController,
+           TabDragRegistry.shared.commitHotkeyMerge(token: token, into: wc) {
+            return []
+        }
         return .move
     }
 

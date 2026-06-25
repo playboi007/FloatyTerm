@@ -18,6 +18,10 @@ final class SettingsWindowController: NSObject {
     private let dimCheckbox = NSButton(checkboxWithTitle: "Dim terminal when unfocused", target: nil, action: nil)
     private let inheritCwdCheckbox = NSButton(checkboxWithTitle: "Open new tabs in the current directory", target: nil, action: nil)
     private let browserTransparencyCheckbox = NSButton(checkboxWithTitle: "Transparent browser backgrounds (new tabs; some dark sites look better off)", target: nil, action: nil)
+    private let blockPopupsCheckbox = NSButton(checkboxWithTitle: "Block popups & new-window ads in browser tabs", target: nil, action: nil)
+    private let blockRedirectsCheckbox = NSButton(checkboxWithTitle: "Block unsolicited redirects (aggressive; may break some logins)", target: nil, action: nil)
+    private let mirrorSmoothCheckbox = NSButton(checkboxWithTitle: "Smooth window mirroring (higher frame rate, more CPU)", target: nil, action: nil)
+    private let metalRendererCheckbox = NSButton(checkboxWithTitle: "GPU (Metal) terminal rendering — experimental", target: nil, action: nil)
     private let recordButton = NSButton(title: "", target: nil, action: nil)
     private var summonGridButtons: [NSButton] = []   // 9 buttons, row-major
     private let retentionPopup = NSPopUpButton()
@@ -40,12 +44,22 @@ final class SettingsWindowController: NSObject {
     // MARK: - Build UI
 
     private func build() {
+        // The full preferences list is taller than many laptop screens, so the
+        // window is height-constrained and the content scrolls. Cap to whatever
+        // the active screen can comfortably show (with room for the title bar
+        // and Dock), never exceeding the natural content height.
+        let visibleHeight = NSScreen.main?.visibleFrame.height ?? 740
+        let height = min(740, visibleHeight - 80)
         let w = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 420, height: 740),
-            styleMask: [.titled, .closable], backing: .buffered, defer: false
+            contentRect: NSRect(x: 0, y: 0, width: 420, height: height),
+            styleMask: [.titled, .closable, .resizable], backing: .buffered, defer: false
         )
         w.title = "FloatyTerm Preferences"
         w.isReleasedWhenClosed = false
+        // Resizable for taller screens, but never below a usable width or above
+        // the natural content height (past which there's only empty space).
+        w.contentMinSize = NSSize(width: 420, height: 240)
+        w.contentMaxSize = NSSize(width: 420, height: 740)
 
         let stack = NSStackView()
         stack.orientation = .vertical
@@ -89,6 +103,32 @@ final class SettingsWindowController: NSObject {
         browserTransparencyCheckbox.target = self
         browserTransparencyCheckbox.action = #selector(browserTransparencyToggled(_:))
         stack.addArrangedSubview(browserTransparencyCheckbox)
+
+        // Popup / redirect ad blocking
+        blockPopupsCheckbox.target = self
+        blockPopupsCheckbox.action = #selector(blockPopupsToggled(_:))
+        stack.addArrangedSubview(blockPopupsCheckbox)
+        blockRedirectsCheckbox.target = self
+        blockRedirectsCheckbox.action = #selector(blockRedirectsToggled(_:))
+        stack.addArrangedSubview(blockRedirectsCheckbox)
+
+        // Window-mirror frame rate (low-power vs smooth)
+        mirrorSmoothCheckbox.target = self
+        mirrorSmoothCheckbox.action = #selector(mirrorSmoothToggled(_:))
+        stack.addArrangedSubview(mirrorSmoothCheckbox)
+
+        // GPU (Metal) terminal rendering — opt-in, off by default. Falls back
+        // to CoreText automatically on hardware without a usable Metal device.
+        metalRendererCheckbox.target = self
+        metalRendererCheckbox.action = #selector(metalRendererToggled(_:))
+        stack.addArrangedSubview(metalRendererCheckbox)
+        let metalHint = NSTextField(wrappingLabelWithString:
+            "Draws terminal text on the GPU instead of the CPU. Experimental — " +
+            "if your Mac can't use Metal it quietly stays on the standard renderer.")
+        metalHint.font = .systemFont(ofSize: 11)
+        metalHint.textColor = .secondaryLabelColor
+        metalHint.preferredMaxLayoutWidth = 380
+        stack.addArrangedSubview(metalHint)
 
         // Unfocused opacity (same floor as focused)
         opacitySlider.minValue = 0.1
@@ -214,12 +254,37 @@ final class SettingsWindowController: NSObject {
             self.syncControls()
         }
 
-        w.contentView?.addSubview(stack)
+        // Host the stack inside a scroll view so the (tall) preferences list
+        // stays reachable when the window is height-constrained. A flipped
+        // document view anchors content to the top and lets it grow downward.
+        let document = FlippedClipView()
+        document.translatesAutoresizingMaskIntoConstraints = false
+        document.addSubview(stack)
+
+        let scroll = NSScrollView()
+        scroll.translatesAutoresizingMaskIntoConstraints = false
+        scroll.hasVerticalScroller = true
+        scroll.hasHorizontalScroller = false
+        scroll.autohidesScrollers = true
+        scroll.drawsBackground = false
+        scroll.documentView = document
+
         if let cv = w.contentView {
+            cv.addSubview(scroll)
             NSLayoutConstraint.activate([
-                stack.topAnchor.constraint(equalTo: cv.topAnchor),
-                stack.leadingAnchor.constraint(equalTo: cv.leadingAnchor),
-                stack.trailingAnchor.constraint(equalTo: cv.trailingAnchor)
+                scroll.topAnchor.constraint(equalTo: cv.topAnchor),
+                scroll.leadingAnchor.constraint(equalTo: cv.leadingAnchor),
+                scroll.trailingAnchor.constraint(equalTo: cv.trailingAnchor),
+                scroll.bottomAnchor.constraint(equalTo: cv.bottomAnchor),
+
+                // Document tracks the scroll's content width (no horizontal
+                // scroll); its height is driven by the stack's intrinsic size.
+                document.widthAnchor.constraint(equalTo: scroll.contentView.widthAnchor),
+
+                stack.topAnchor.constraint(equalTo: document.topAnchor),
+                stack.leadingAnchor.constraint(equalTo: document.leadingAnchor),
+                stack.trailingAnchor.constraint(equalTo: document.trailingAnchor),
+                stack.bottomAnchor.constraint(equalTo: document.bottomAnchor)
             ])
         }
         window = w
@@ -247,6 +312,10 @@ final class SettingsWindowController: NSObject {
         opacityValueLabel.stringValue = "\(Int(Settings.shared.unfocusedOpacity * 100))%"
         inheritCwdCheckbox.state = Settings.shared.inheritWorkingDirectory ? .on : .off
         browserTransparencyCheckbox.state = Settings.shared.browserTransparency ? .on : .off
+        blockPopupsCheckbox.state = Settings.shared.blockPopups ? .on : .off
+        blockRedirectsCheckbox.state = Settings.shared.blockRedirects ? .on : .off
+        mirrorSmoothCheckbox.state = Settings.shared.mirrorSmoothCapture ? .on : .off
+        metalRendererCheckbox.state = Settings.shared.metalRenderer ? .on : .off
         ghostSlider.doubleValue = Settings.shared.ghostOpacity
         ghostValueLabel.stringValue = "\(Int(Settings.shared.ghostOpacity * 100))%"
         recordButton.title = recording ? "Press a shortcut…" : Settings.shared.hotKeyDisplay
@@ -320,6 +389,22 @@ final class SettingsWindowController: NSObject {
 
     @objc private func browserTransparencyToggled(_ sender: NSButton) {
         Settings.shared.browserTransparency = (sender.state == .on)
+    }
+
+    @objc private func mirrorSmoothToggled(_ sender: NSButton) {
+        Settings.shared.mirrorSmoothCapture = (sender.state == .on)
+    }
+
+    @objc private func metalRendererToggled(_ sender: NSButton) {
+        Settings.shared.metalRenderer = (sender.state == .on)
+    }
+
+    @objc private func blockPopupsToggled(_ sender: NSButton) {
+        Settings.shared.blockPopups = (sender.state == .on)
+    }
+
+    @objc private func blockRedirectsToggled(_ sender: NSButton) {
+        Settings.shared.blockRedirects = (sender.state == .on)
     }
 
     @objc private func ghostOpacityChanged(_ sender: NSSlider) {
@@ -441,4 +526,12 @@ final class SettingsWindowController: NSObject {
         if carbon & UInt32(cmdKey)     != 0 { s += "⌘" }
         return s
     }
+}
+
+/// Document view for the Preferences scroll view. Flipped so its content lays
+/// out from the top down (an unflipped document pins short content to the
+/// bottom of the clip view), letting the settings stack grow downward as rows
+/// are added.
+private final class FlippedClipView: NSView {
+    override var isFlipped: Bool { true }
 }

@@ -22,11 +22,16 @@ final class DevtoolsRelay {
     static let shared = DevtoolsRelay()
     static let port: UInt16 = 7777
 
+    /// Set by the app: open a side-by-side diff tab for two resolved file URLs.
+    /// Invoked on the main thread in response to a `POST /diff` from the shell
+    /// shim. Loopback-only by construction (the listener binds 127.0.0.1), so
+    /// only local processes can ask the app to open a diff.
+    var onOpenDiff: ((URL, URL) -> Void)?
+
     private var listener: NWListener?
     private let queue = DispatchQueue(label: "floatyterm.devtools-relay")
     private let aggQueue = DispatchQueue(label: "floatyterm.aggregator")
 
-    private var handles: [String: FileHandle] = [:]   // origin key → open log
     private var aggregators: [String: EventAggregator] = [:]  // origin key → deduplicator
     private var lastFileHandleCleanup: Date = Date()
 
@@ -95,6 +100,8 @@ final class DevtoolsRelay {
         case ("POST", "/log"):
             ingest(Data(body.prefix(contentLength)))
             return response(200, "text/plain", "ok")
+        case ("POST", "/diff"):
+            return handleDiff(Data(body.prefix(contentLength)))
         default:
             return response(404, "text/plain", "not found")
         }
@@ -106,10 +113,58 @@ final class DevtoolsRelay {
         var head = "HTTP/1.1 \(status) \(reason)\r\n"
         head += "Access-Control-Allow-Origin: *\r\n"
         head += "Access-Control-Allow-Headers: *\r\n"
+        // Without an explicit Allow-Methods the browser preflight (OPTIONS)
+        // for a non-simple POST fails, so the Dart Dio hook — which sends
+        // application/json, unlike the JS fetch's text/plain "simple" body —
+        // would be silently blocked on web. List the methods we serve.
+        head += "Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n"
+        head += "Access-Control-Max-Age: 86400\r\n"
         if let type { head += "Content-Type: \(type)\r\n" }
         let data = Data(body.utf8)
         head += "Content-Length: \(data.count)\r\nConnection: close\r\n\r\n"
         return Data(head.utf8) + data
+    }
+
+    // MARK: - Diff trigger (shell shim → diff tab)
+
+    /// Parses a `{ "left": …, "right": …, "cwd": … }` body, resolves the two
+    /// paths (relative ones against `cwd`), validates they're readable files,
+    /// and asks the app (on the main thread) to open a diff tab. Returns 400 for
+    /// malformed input, 404 when a path doesn't resolve to a regular file.
+    private func handleDiff(_ body: Data) -> Data {
+        guard
+            let obj = try? JSONSerialization.jsonObject(with: body) as? [String: Any],
+            let left = obj["left"] as? String,
+            let right = obj["right"] as? String,
+            !left.isEmpty, !right.isEmpty
+        else {
+            return response(400, "text/plain", "expected {left, right}")
+        }
+        let cwd = (obj["cwd"] as? String).map { URL(fileURLWithPath: $0, isDirectory: true) }
+
+        func resolve(_ path: String) -> URL? {
+            let expanded = (path as NSString).expandingTildeInPath
+            let url = expanded.hasPrefix("/")
+                ? URL(fileURLWithPath: expanded)
+                : (cwd ?? URL(fileURLWithPath: FileManager.default.currentDirectoryPath))
+                    .appendingPathComponent(expanded)
+            var isDir: ObjCBool = false
+            guard FileManager.default.fileExists(atPath: url.path, isDirectory: &isDir),
+                  !isDir.boolValue else { return nil }
+            return url.standardizedFileURL
+        }
+
+        guard let leftURL = resolve(left) else {
+            return response(404, "text/plain", "not a file: \(left)")
+        }
+        guard let rightURL = resolve(right) else {
+            return response(404, "text/plain", "not a file: \(right)")
+        }
+
+        DispatchQueue.main.async { [weak self] in
+            self?.onOpenDiff?(leftURL, rightURL)
+        }
+        return response(200, "text/plain", "ok")
     }
 
     // MARK: - Event ingestion → per-provenance NDJSON files with deduplication
@@ -234,16 +289,15 @@ final class DevtoolsRelay {
 
         let mode = (payload["mode"] as? String) ?? "browser"
         let label = (payload["label"] as? String).flatMap { $0.isEmpty ? nil : $0 }
-        // ONE canonical (sanitized) key for both the file handle and the
+        // ONE canonical (sanitized) key for both the log filename and the
         // aggregator — a raw "localhost:5173" here vs the sanitized
-        // "localhost_5173" in logHandle would orphan the aggregator and
-        // silently drop every event.
+        // "localhost_5173" used to build the path below would orphan the
+        // aggregator and silently drop every event.
         let key = Self.sanitize(label ?? host)
 
         aggQueue.async { [weak self] in
             guard let self else { return }
-            // Created here (not in logHandle) so aggregator state is only
-            // ever touched on aggQueue.
+            // Aggregator state is only ever touched on aggQueue.
             var agg = self.aggregators[key] ?? EventAggregator()
 
             var out = ""
@@ -285,16 +339,13 @@ final class DevtoolsRelay {
             // Update aggregator state
             self.aggregators[key] = agg
 
-            if !out.isEmpty, let data = out.data(using: .utf8) {
-                self.queue.async {
-                    // Resolve the handle AT WRITE TIME, on the relay queue.
-                    // A handle captured back in ingest() can be closed before
-                    // this block runs — closeIdleHandles() or the janitor's
-                    // dropHandles() enqueue ahead of it — and a write to a
-                    // closed FileHandle fails silently under `try?`, eating
-                    // the events. logHandle reopens (and recreates) on demand.
-                    try? self.logHandle(forKey: key)?.write(contentsOf: data)
-                }
+            if !out.isEmpty {
+                // The shared sink resolves (and reopens) the handle at write
+                // time on its own queue, so a sweep's dropHandles() between
+                // here and the write can't make us append into a deleted inode.
+                let url = Self.logDirectory(category: "remote")
+                    .appendingPathComponent("\(key).ndjson")
+                DevtoolsLog.shared.append(out, to: url)
             }
         }
 
@@ -305,39 +356,12 @@ final class DevtoolsRelay {
         }
     }
 
-    /// One stable, appendable log per provenance key — survives reloads, so
-    /// the agent tails a single path per dev server / label
-    /// ("Devtools/remote/flutter-app.ndjson").
-    private func logHandle(forKey rawKey: String) -> FileHandle? {
-        let key = Self.sanitize(rawKey)
-        if let h = handles[key] { return h }
-        let url = Self.logDirectory(category: "remote").appendingPathComponent("\(key).ndjson")
-        if !FileManager.default.fileExists(atPath: url.path) {
-            FileManager.default.createFile(atPath: url.path, contents: nil)
-        }
-        guard let h = try? FileHandle(forWritingTo: url) else { return nil }
-        _ = try? h.seekToEnd()
-        handles[key] = h
-        return h
-    }
-
-    /// Close idle file handles to avoid descriptor leak.
+    /// Periodically release handles on origins that have gone quiet, so a
+    /// long session doesn't leak descriptors. The shared sink owns every
+    /// devtools handle (relay + browser tabs); the next event reopens on
+    /// demand, so dropping the lot here is safe.
     private func closeIdleHandles() {
-        dropHandles()
-    }
-
-    /// Closes and forgets every open log handle (on the relay's queue, where
-    /// `handles` lives). StorageJanitor calls this after deleting Devtools
-    /// files: an open handle would keep appending to the deleted inode —
-    /// events vanishing silently into a file no path reaches. With the
-    /// handles dropped, the next event re-opens (and recreates) its log.
-    func dropHandles() {
-        queue.async { [weak self] in
-            self?.handles.forEach { _, h in
-                try? h.close()
-            }
-            self?.handles.removeAll()
-        }
+        DevtoolsLog.shared.dropHandles()
     }
 
     /// Filesystem-safe provenance key ("localhost:5173" → "localhost_5173").

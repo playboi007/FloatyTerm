@@ -343,6 +343,20 @@ final class TerminalController: NSObject, LocalProcessTerminalViewDelegate, TabC
         defer { oscBytes.removeAll(keepingCapacity: true) }
         guard oscBytes.count >= 5 else { return }   // "133;" + command char
         let payload = String(decoding: oscBytes, as: UTF8.self)
+
+        // FloatyTerm private OSC (`ESC ] 5152 ; <name> BEL`): emitted by the
+        // PATH-injected helper scripts (see startShell) so commands like `ruler`
+        // work in any shell with no setup and never print "command not found".
+        if payload.hasPrefix("\(TerminalCommandTools.oscCode);") {
+            let name = String(payload.dropFirst(TerminalCommandTools.oscCode.count + 1))
+            if name == "ruler" {
+                DispatchQueue.main.async {
+                    NotificationCenter.default.post(name: .floatySummonRuler, object: nil)
+                }
+            }
+            return
+        }
+
         guard payload.hasPrefix("133;") else { return }
         let body = payload.dropFirst(4)
         switch body.first {
@@ -493,6 +507,11 @@ final class TerminalController: NSObject, LocalProcessTerminalViewDelegate, TabC
     /// Called when the terminal title changes, so the tab label can update.
     var onTitleChanged: (() -> Void)?
 
+    /// Set by the window controller: opens `tab` as a child tab placed
+    /// immediately after this terminal (e.g. an image viewer launched from the
+    /// right-click menu). The child closes with this terminal.
+    var onOpenChildTab: ((any TabContent) -> Void)?
+
     /// The directory to start the shell in. nil means $HOME (the default).
     private let startDirectory: String?
 
@@ -516,6 +535,19 @@ final class TerminalController: NSObject, LocalProcessTerminalViewDelegate, TabC
         // even when this is the window's only tab (no chip to right-click).
         terminalView.notifyWhenDoneState = { [weak self] in self?.notifyWhenDone ?? false }
         terminalView.onToggleNotifyWhenDone = { [weak self] in self?.notifyWhenDone.toggle() }
+
+        // "Open in Image Viewer" (right-click on a selected image path): resolve
+        // relative paths against the live cwd, then open the image in a child
+        // tab next to this terminal.
+        terminalView.currentDirectoryProvider = { [weak self] in self?.currentWorkingDirectory }
+        terminalView.onOpenImageInViewer = { [weak self] path in
+            guard let self, let viewer = ImageViewerController(path: path) else { return }
+            self.onOpenChildTab?(viewer)
+        }
+        terminalView.onOpenMarkdownInViewer = { [weak self] path in
+            guard let self, let viewer = MarkdownViewerController(path: path) else { return }
+            self.onOpenChildTab?(viewer)
+        }
 
         // Restore the previous run's transcript before any shell output can
         // commit, so old history sits cleanly below the new session's lines.
@@ -548,6 +580,7 @@ final class TerminalController: NSObject, LocalProcessTerminalViewDelegate, TabC
         }
 
         applyFont()
+        applyMetalRenderer()
         // Opaque dark background; see-through is handled by fading the whole
         // content area's opacity in the window controller (reliable for this
         // terminal engine), not by the background color's alpha.
@@ -567,6 +600,13 @@ final class TerminalController: NSObject, LocalProcessTerminalViewDelegate, TabC
         let pid = process.shellPid
         guard pid > 0 else { return nil }
         return Self.workingDirectory(ofPID: pid)
+    }
+
+    var restorableRecord: TabRecord? {
+        // A terminal restarts as a fresh shell in its last directory; the
+        // sessionID lets the restored tab reclaim its transcript log.
+        TabRecord(kind: "terminal", customName: customName,
+                  directory: currentWorkingDirectory, sessionID: sessionID)
     }
 
     /// Reads the cwd of `pid` via proc_pidinfo / PROC_PIDVNODEPATHINFO.
@@ -620,6 +660,21 @@ final class TerminalController: NSObject, LocalProcessTerminalViewDelegate, TabC
             ?? NSFont.monospacedSystemFont(ofSize: size, weight: .regular)
     }
 
+    /// Applies the user's Metal-renderer preference to this terminal's view.
+    /// SwiftTerm's GPU path is opt-in and experimental: if the device can't
+    /// build a Metal pipeline, `setUseMetal` throws and we stay on CoreText.
+    /// Idempotent — `isUsingMetalRenderer` short-circuits a no-op toggle, so
+    /// it's safe to call on every `Settings.didChange`.
+    func applyMetalRenderer() {
+        let wanted = Settings.shared.metalRenderer
+        guard terminalView.isUsingMetalRenderer != wanted else { return }
+        do {
+            try terminalView.setUseMetal(wanted)
+        } catch {
+            NSLog("FloatyTerm: Metal renderer unavailable, staying on CoreText: \(error)")
+        }
+    }
+
     /// True if a foreground command (other than the shell itself) is running —
     /// i.e. the pty's foreground process group differs from the shell's pid.
     var hasRunningForegroundJob: Bool {
@@ -639,6 +694,12 @@ final class TerminalController: NSObject, LocalProcessTerminalViewDelegate, TabC
         vars["TERM"] = "xterm-256color"
         vars["COLORTERM"] = "truecolor"
         vars["LANG"] = vars["LANG"] ?? "en_US.UTF-8"
+        // Prepend FloatyTerm's helper-command directory so `ruler` (and future
+        // utils) resolve in any shell without rc edits — each is a tiny script
+        // that emits a private OSC the parser intercepts.
+        if let bin = TerminalCommandTools.binDirectory()?.path {
+            vars["PATH"] = bin + ":" + (vars["PATH"] ?? "")
+        }
         let env = vars.map { "\($0.key)=\($0.value)" }
 
         // Determine start directory: honour the requested directory when it is a

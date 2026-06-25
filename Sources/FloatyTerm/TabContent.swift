@@ -57,6 +57,12 @@ protocol TabContent: AnyObject {
     /// Not all tab types need to fire this; browser tabs never auto-close.
     var onTerminated: (() -> Void)? { get set }
 
+    /// How this tab persists across launches, or nil when it's ephemeral and
+    /// not worth restoring (e.g. a diff view of two files carries no live
+    /// session). Each tab type owns its own serialization, so the window
+    /// controller never has to switch on concrete types to save state.
+    var restorableRecord: TabRecord? { get }
+
     /// Give focus to this tab's primary interactive view.
     func focus(in panel: NSWindow)
 

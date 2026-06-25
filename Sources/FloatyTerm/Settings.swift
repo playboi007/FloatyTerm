@@ -63,9 +63,13 @@ final class Settings {
             "hotKeyDisplay": "⌥⌘7",
             "inheritWorkingDirectory": true,
             "browserTransparency": true,
+            "blockPopups": true,
+            "blockRedirects": false,
             "summonPosition": SummonPosition.center.rawValue,
             "ghostOpacity": 0.35,
             "hideFromScreenCapture": false,
+            "mirrorSmoothCapture": false,
+            "metalRenderer": false,
             "storageRetentionDays": 3,
             "storageCapMB": 100
         ])
@@ -160,6 +164,49 @@ final class Settings {
     var browserTransparency: Bool {
         get { d.bool(forKey: "browserTransparency") }
         set { d.set(newValue, forKey: "browserTransparency"); notify() }
+    }
+
+    /// When true, browser tabs block popups / new windows (window.open and
+    /// target=_blank that try to spawn a window) — the "click play → new ad
+    /// tab" pattern on streaming sites. The user's real click still works; the
+    /// spawned popup is dropped. A per-tab shield in the URL bar can disable
+    /// this for the current site. Read live on each popup, so it applies to
+    /// open tabs immediately (no reload needed).
+    var blockPopups: Bool {
+        get { d.bool(forKey: "blockPopups") }
+        set { d.set(newValue, forKey: "blockPopups"); notify() }
+    }
+
+    /// When true, browser tabs cancel *unsolicited* navigations — a cross-site
+    /// main-frame redirect that fires with no recent click or keypress behind
+    /// it (the timer-driven "page yanked to an ad site" pattern). Aggressive:
+    /// it can also cancel legitimate automatic cross-site redirects (some OAuth
+    /// hops, link shorteners), so it's off by default and gated per-tab by the
+    /// same shield. Read live on each navigation.
+    var blockRedirects: Bool {
+        get { d.bool(forKey: "blockRedirects") }
+        set { d.set(newValue, forKey: "blockRedirects"); notify() }
+    }
+
+    /// Frame rate for window-mirror tabs. Off (default) = low-power ~12 fps,
+    /// fine for glancing at code/ideas and easy on CPU. On = smooth ~30 fps for
+    /// scrolling/animation, at higher CPU cost. A live mirror tab observes
+    /// `Settings.didChange` and re-applies this without a restart.
+    var mirrorSmoothCapture: Bool {
+        get { d.bool(forKey: "mirrorSmoothCapture") }
+        set { d.set(newValue, forKey: "mirrorSmoothCapture"); notify() }
+    }
+
+    /// When true, terminals render through SwiftTerm's experimental Metal (GPU)
+    /// path instead of the default CoreText/CPU drawing: glyphs are rasterized
+    /// into a texture atlas and cells drawn as GPU quads, which can lighten CPU
+    /// load on heavy scrollback. Opt-in and off by default — the GPU path is
+    /// still evolving (image caching is basic) and hardware without a usable
+    /// Metal device silently falls back to CoreText. Applied live per terminal
+    /// via `TerminalController.applyMetalRenderer()` on `Settings.didChange`.
+    var metalRenderer: Bool {
+        get { d.bool(forKey: "metalRenderer") }
+        set { d.set(newValue, forKey: "metalRenderer"); notify() }
     }
 
     /// When true, new terminal tabs and new windows inherit the working directory
