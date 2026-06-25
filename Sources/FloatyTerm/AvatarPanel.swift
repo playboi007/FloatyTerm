@@ -180,7 +180,7 @@ private final class AvatarContentView: NSView {
         switch status {
         case .idle:
             badge.isHidden = true
-        case .running, .unseenOutput:
+        case .running, .unseenOutput, .needsInput:
             badge.isHidden = false
             badge.layer?.backgroundColor = status.color.cgColor
         }

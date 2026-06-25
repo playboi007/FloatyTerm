@@ -7,7 +7,7 @@
     <key>CFBundleDisplayName</key>
     <string>FloatyTerm</string>
     <key>CFBundleIdentifier</key>
-    <string>tech.reduzer.floatyterm</string>
+    <string>vin.floatyterm</string>
     <key>CFBundleVersion</key>
     <string>0.1.0</string>
     <key>CFBundleShortVersionString</key>

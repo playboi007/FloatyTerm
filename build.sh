@@ -26,9 +26,18 @@ IDENTITY="${FLOATY_SIGN_ID:-$(security find-identity -v -p codesigning 2>/dev/nu
 if [[ -n "${IDENTITY:-}" ]]; then
     echo "==> Signing with: $IDENTITY"
     codesign --force --deep --sign "$IDENTITY" "$APP"
-else
-    echo "==> No signing identity found — ad-hoc signing (TCC grants won't persist across builds)"
+elif [[ "${FLOATY_ALLOW_ADHOC:-}" == "1" ]]; then
+    echo "==> No identity; FLOATY_ALLOW_ADHOC=1 — ad-hoc signing (TCC grants WON'T persist across builds)"
     codesign --force --deep --sign - "$APP"
+else
+    # Silent ad-hoc signing is exactly what produces a "stale build" that loses
+    # the Screen Recording grant every rebuild. Refuse it by default so it can't
+    # happen by accident; opt in with FLOATY_ALLOW_ADHOC=1 if you truly want it.
+    echo "==> ERROR: no code-signing identity found." >&2
+    echo "    Create one in Keychain Access (Certificate Assistant ->" >&2
+    echo "    Create a Certificate -> Code Signing), or set FLOATY_ALLOW_ADHOC=1" >&2
+    echo "    to ad-hoc sign (Screen Recording grant won't persist across builds)." >&2
+    exit 1
 fi
 
 echo "==> Done. Launch with: open $APP"

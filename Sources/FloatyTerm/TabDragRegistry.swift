@@ -13,7 +13,7 @@ final class TabDragRegistry {
     private init() {}
 
     /// The custom UTI written to and read from the pasteboard.
-    static let uti = "tech.reduzer.floatyterm.tab"
+    static let uti = "vin.floatyterm.tab"
 
     struct Entry {
         weak var sourceController: TerminalWindowController?
@@ -32,5 +32,33 @@ final class TabDragRegistry {
 
     func remove(token: String) {
         store.removeValue(forKey: token)
+    }
+
+    // MARK: - Hotkey merge (mid-drag)
+
+    /// The modifier held during a drag to merge the dragged tab into the window
+    /// under the cursor *immediately* — instead of releasing onto the sometimes
+    /// flaky drop highlight. AppKit suppresses ordinary key events for the
+    /// duration of a drag session, so only modifier state is observable; the
+    /// "hotkey" is therefore a modifier chord, read live from
+    /// `NSEvent.modifierFlags` inside a hovered destination's `draggingUpdated`.
+    static let mergeModifier: NSEvent.ModifierFlags = .command
+
+    /// Invoked from a drop destination's `draggingUpdated` while `token` hovers
+    /// it. If `mergeModifier` is held and the drag is cross-window, moves the
+    /// dragged tab into `destWC` right then and returns true so the caller can
+    /// stop highlighting — the drag is spent. Removing the registry entry routes
+    /// the eventual mouse-up through the existing token-consumed guards, so it
+    /// neither double-merges nor tears off.
+    func commitHotkeyMerge(token: String, into destWC: TerminalWindowController) -> Bool {
+        let flags = NSEvent.modifierFlags.intersection(.deviceIndependentFlagsMask)
+        guard flags.isSuperset(of: Self.mergeModifier) else { return false }
+        guard let entry = store[token],
+              let sourceWC = entry.sourceController,
+              sourceWC !== destWC else { return false }
+        store.removeValue(forKey: token)
+        sourceWC.releaseTab(entry.tab)
+        destWC.adoptTab(entry.tab)
+        return true
     }
 }

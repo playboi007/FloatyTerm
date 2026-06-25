@@ -9,6 +9,9 @@ struct SessionEntry {
                                 // in what state, over which app
     let status: SessionStatus
     let isTerminal: Bool
+    /// True when a known agent CLI (claude, codex, aider…) is this tab's
+    /// foreground process — the row gets a "sparkles" icon.
+    let isAgent: Bool
     /// The host window's avatar identity (the same symbol + ring color as its
     /// bubble), so rows are matchable to windows at a glance.
     let windowSymbol: String
@@ -54,6 +57,15 @@ final class SessionSwitcherController: NSObject, NSTextFieldDelegate,
     func show() {
         if panel == nil { build() }
         guard let panel else { return }
+        // Reassert on every show: the window server can silently drop the
+        // level / all-Spaces / fullscreen-overlay flags after display sleep or
+        // fullscreen transitions (same bug FloatingPanel.reassertFloatingBehavior
+        // fixes for terminal windows). Without this the palette degrades to a
+        // managed window bound to one Space and stops appearing over
+        // fullscreen apps.
+        panel.level = .popUpMenu
+        panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .stationary]
+        panel.sharingType = Settings.shared.hideFromScreenCapture ? .none : .readOnly
         all = sessionsProvider()
         searchField.stringValue = ""
         applyFilter("")
@@ -162,10 +174,16 @@ final class SessionSwitcherController: NSObject, NSTextFieldDelegate,
     }
 
     /// Places the palette at the user's configured summon grid point on the
-    /// active screen (center gets a slight Spotlight-style upward nudge).
+    /// screen the user is actually on (center gets a slight Spotlight-style
+    /// upward nudge). The mouse pointer decides which screen that is —
+    /// NSScreen.main is "the screen with the key window", which is wrong
+    /// whenever FloatyTerm isn't frontmost (e.g. summoned over a fullscreen
+    /// app on another display).
     private func positionOnActiveScreen() {
-        guard let panel,
-              let vis = (NSScreen.main ?? NSScreen.screens.first)?.visibleFrame else { return }
+        let mouse = NSEvent.mouseLocation
+        let screen = NSScreen.screens.first { NSMouseInRect(mouse, $0.frame, false) }
+            ?? NSScreen.main ?? NSScreen.screens.first
+        guard let panel, let vis = screen?.visibleFrame else { return }
         let position = Settings.shared.summonPosition
         var frame = position.frame(forSize: panel.frame.size, in: vis, margin: 32)
         if position == .center { frame.origin.y += vis.height * 0.12 }
@@ -381,8 +399,10 @@ private final class SessionCellView: NSTableCellView {
 
     func configure(_ entry: SessionEntry) {
         dot.layer?.backgroundColor = entry.status.color.cgColor
-        icon.image = NSImage(systemSymbolName: entry.isTerminal ? "terminal" : "globe",
-                             accessibilityDescription: entry.isTerminal ? "Terminal" : "Browser")
+        let symbol = entry.isAgent ? "sparkles" : (entry.isTerminal ? "terminal" : "globe")
+        icon.image = NSImage(systemSymbolName: symbol,
+                             accessibilityDescription: entry.isAgent ? "Agent"
+                                : entry.isTerminal ? "Terminal" : "Browser")
         nameLabel.stringValue = entry.name
         avatarIcon.image = NSImage(systemSymbolName: entry.windowSymbol,
                                    accessibilityDescription: "Window avatar")

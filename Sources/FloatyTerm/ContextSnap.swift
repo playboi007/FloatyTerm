@@ -1,4 +1,5 @@
 import AppKit
+import ScreenCaptureKit
 import Vision
 
 /// Captures what a floating window is overlaying — every window BELOW it in
@@ -44,15 +45,18 @@ enum ContextSnap {
     /// RESTARTS — and if it was granted while the app ran (or under an older
     /// signature), preflight keeps failing until relaunch — so the alert
     /// offers a one-click relaunch.
-    static func ensurePermission() -> Bool {
+    /// - Parameter purpose: one sentence explaining why capture is needed, shown
+    ///   in the prompt (so the same flow serves Context Snap, window mirroring, …).
+    static func ensurePermission(
+        purpose: String = "Context Snap captures what's behind this window so your terminal agent can read it."
+    ) -> Bool {
         if CGPreflightScreenCaptureAccess() { return true }
         CGRequestScreenCaptureAccess()
         let alert = NSAlert()
         alert.alertStyle = .informational
         alert.messageText = "Screen Recording permission needed"
         alert.informativeText = """
-            Context Snap captures what's behind this window so your terminal \
-            agent can read it.
+            \(purpose)
 
             1. Grant FloatyTerm access under System Settings → Privacy & \
             Security → Screen Recording.
@@ -94,22 +98,83 @@ enum ContextSnap {
 
     /// Snapshot of everything below `window` on its screen — i.e. exactly what
     /// the floating window is overlaying, without the window itself.
+    ///
+    /// Migrated to ScreenCaptureKit: `CGWindowListCreateImage` (with
+    /// `.optionOnScreenBelowWindow`) was deprecated in macOS 14 and REMOVED in
+    /// macOS 15. We reproduce the same "everything below this window" semantics
+    /// by capturing the whole display through an `SCContentFilter` that excludes
+    /// our own window plus every window stacked in front of it, then cropping to
+    /// the requested region via the configuration's `sourceRect`.
+    ///
     /// - Parameter region: optional rect in AppKit GLOBAL screen coordinates
     ///   (from the ⇧⌘4-style region selector); nil = the whole screen.
-    static func captureBehind(_ window: NSWindow, region: NSRect? = nil) -> CGImage? {
+    @MainActor
+    static func captureBehind(_ window: NSWindow, region: NSRect? = nil) async -> CGImage? {
         guard let screen = window.screen ?? NSScreen.main,
-              let reference = NSScreen.screens.first else { return nil }
+              let displayID = displayID(of: screen) else { return nil }
         let target = region.map { $0.intersection(screen.frame) } ?? screen.frame
         guard !target.isEmpty else { return nil }
-        // AppKit (bottom-left origin, y up) → CG global (top-left origin, y down).
-        let cgRect = CGRect(x: target.origin.x,
-                            y: reference.frame.height - target.maxY,
-                            width: target.width,
-                            height: target.height)
-        return CGWindowListCreateImage(cgRect,
-                                       [.optionOnScreenBelowWindow],
-                                       CGWindowID(window.windowNumber),
-                                       [.bestResolution])
+
+        let content: SCShareableContent
+        do {
+            // Keep desktop windows (the wallpaper shows through behind the panel);
+            // on-screen only — off-screen windows can't be behind anything visible.
+            content = try await SCShareableContent.excludingDesktopWindows(
+                false, onScreenWindowsOnly: true)
+        } catch {
+            NSLog("FloatyTerm: context snap shareable-content failed: \(error)")
+            return nil
+        }
+        guard let scDisplay = content.displays.first(where: { $0.displayID == displayID })
+        else { return nil }
+
+        // Reproduce `.optionOnScreenBelowWindow`: exclude our own window, any
+        // other FloatyTerm window, and everything stacked in front of the panel.
+        // The window-server list (still available on macOS 15) is authoritative
+        // for z-order — front-to-back — so we collect IDs until we reach ours.
+        let panelID = CGWindowID(window.windowNumber)
+        var aboveIDs = Set<CGWindowID>()
+        if let infoList = CGWindowListCopyWindowInfo([.optionOnScreenOnly], kCGNullWindowID) as? [[String: Any]] {
+            for info in infoList {
+                guard let num = (info[kCGWindowNumber as String] as? NSNumber)?.uint32Value else { continue }
+                if num == panelID { break }   // reached our window; the rest are behind it
+                aboveIDs.insert(num)
+            }
+        }
+        let ownBundle = Bundle.main.bundleIdentifier
+        let excluded = content.windows.filter { w in
+            w.windowID == panelID
+                || aboveIDs.contains(w.windowID)
+                || (ownBundle != nil && w.owningApplication?.bundleIdentifier == ownBundle)
+        }
+        let filter = SCContentFilter(display: scDisplay, excludingWindows: excluded)
+
+        // AppKit (bottom-left origin, y up) → display-local points (top-left,
+        // y down) for `sourceRect`, which crops the captured display.
+        let scale = screen.backingScaleFactor
+        let sourceRect = CGRect(x: target.origin.x - screen.frame.origin.x,
+                                y: screen.frame.maxY - target.maxY,
+                                width: target.width,
+                                height: target.height)
+
+        let config = SCStreamConfiguration()
+        config.sourceRect = sourceRect
+        config.width  = max(1, Int((sourceRect.width  * scale).rounded()))  // native pixels (was .bestResolution)
+        config.height = max(1, Int((sourceRect.height * scale).rounded()))
+        config.showsCursor = false
+
+        do {
+            return try await SCScreenshotManager.captureImage(
+                contentFilter: filter, configuration: config)
+        } catch {
+            NSLog("FloatyTerm: context snap capture failed: \(error)")
+            return nil
+        }
+    }
+
+    /// CoreGraphics display ID backing an `NSScreen`, for matching `SCDisplay`.
+    private static func displayID(of screen: NSScreen) -> CGDirectDisplayID? {
+        (screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber)?.uint32Value
     }
 
     // MARK: - Persistence

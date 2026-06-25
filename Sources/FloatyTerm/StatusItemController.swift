@@ -11,7 +11,12 @@ final class StatusItemController: NSObject, NSMenuDelegate {
     var onToggle: () -> Void = {}
     var onNewTab: () -> Void = {}
     var onNewBrowserTab: () -> Void = {}
+    var onNewNote: () -> Void = {}
+    var onMirrorWindow: () -> Void = {}
+    var onCompareFiles: () -> Void = {}
     var onNewWindow: () -> Void = {}
+    var onRunBackgroundTask: () -> Void = {}
+    var onShowRuler: () -> Void = {}
     var onPreferences: () -> Void = {}
 
     /// Returns the windows that are currently minimized (hidden via their own
@@ -37,12 +42,35 @@ final class StatusItemController: NSObject, NSMenuDelegate {
             } else {
                 button.title = "FT"
             }
+            // Fleet summary text renders beside the icon, not instead of it.
+            button.imagePosition = .imageLeading
         }
 
         // Rebuild on each open so the "Hidden Windows" list is always current.
         menu.delegate = self
         item.menu = menu
         rebuild()
+    }
+
+    // MARK: - Fleet summary
+
+    /// Compact fleet readout beside the menu-bar icon: "2⚒ 1⏳" — sessions
+    /// with an agent/job working vs. sessions blocked waiting on the user.
+    /// Only nonzero parts are shown; both zero clears the title entirely.
+    func updateSummary(working: Int, waiting: Int) {
+        guard let button = item.button else { return }
+        var parts: [String] = []
+        if working > 0 { parts.append("\(working)⚒") }
+        if waiting > 0 { parts.append("\(waiting)⏳") }
+        guard !parts.isEmpty else {
+            button.attributedTitle = NSAttributedString(string: "")
+            return
+        }
+        let font = NSFont.monospacedDigitSystemFont(ofSize: 11, weight: .medium)
+        button.attributedTitle = NSAttributedString(
+            string: " " + parts.joined(separator: " "),
+            attributes: [.font: font]
+        )
     }
 
     // MARK: - NSMenuDelegate
@@ -103,8 +131,44 @@ final class StatusItemController: NSObject, NSMenuDelegate {
                               key: "t", mods: [.command]))
         menu.addItem(makeItem("New Browser Tab", action: #selector(newBrowserTab),
                               key: "b", mods: [.command]))
+        menu.addItem(makeItem("New Note", action: #selector(newNote),
+                              key: "e", mods: [.command]))
+        menu.addItem(makeItem("Mirror a Window…", action: #selector(mirrorWindow),
+                              key: "m", mods: [.command, .shift]))
+        menu.addItem(makeItem("Compare Two Files…", action: #selector(compareFiles),
+                              key: "d", mods: [.command, .shift]))
         menu.addItem(makeItem("New Window", action: #selector(newWindow),
                               key: "n", mods: [.command]))
+        // Fire-and-forget: run a command in a fresh session collapsed to a
+        // bubble; it summons the user when it finishes.
+        let runTask = NSMenuItem(title: "Run Task in Background…",
+                                 action: #selector(runBackgroundTask),
+                                 keyEquivalent: "")
+        runTask.target = self
+        runTask.image = NSImage(systemSymbolName: "play.circle",
+                                accessibilityDescription: "Run task in background")
+        menu.addItem(runTask)
+        menu.addItem(.separator())
+        // Privacy toggle: windows excluded from screen recordings and
+        // screen-sharing (Zoom, Meet…) while staying visible to the user.
+        let hideCapture = NSMenuItem(title: "Hide from Screen Sharing",
+                                     action: #selector(toggleHideFromCapture),
+                                     keyEquivalent: "")
+        hideCapture.target = self
+        hideCapture.state = Settings.shared.hideFromScreenCapture ? .on : .off
+        hideCapture.image = NSImage(systemSymbolName: "eye.slash",
+                                    accessibilityDescription: "Hide from screen sharing")
+        menu.addItem(hideCapture)
+        menu.addItem(.separator())
+
+        // Utils: a home for small standalone tools. Grows over time; the ruler
+        // is the first resident.
+        let utils = NSMenuItem(title: "Utils", action: nil, keyEquivalent: "")
+        let utilsMenu = NSMenu()
+        utilsMenu.addItem(makeItem("Ruler", action: #selector(showRuler), key: "", mods: []))
+        utils.submenu = utilsMenu
+        menu.addItem(utils)
+
         menu.addItem(.separator())
         menu.addItem(makeItem("Preferences…", action: #selector(preferences),
                               key: ",", mods: [.command]))
@@ -140,9 +204,19 @@ final class StatusItemController: NSObject, NSMenuDelegate {
     @objc private func toggle()        { onToggle()         }
     @objc private func newTab()        { onNewTab()          }
     @objc private func newBrowserTab() { onNewBrowserTab()   }
+    @objc private func newNote()       { onNewNote()         }
+    @objc private func mirrorWindow()  { onMirrorWindow()    }
+    @objc private func compareFiles()  { onCompareFiles()    }
     @objc private func newWindow()     { onNewWindow()       }
+    @objc private func runBackgroundTask() { onRunBackgroundTask() }
+    @objc private func showRuler()     { onShowRuler()        }
     @objc private func preferences()   { onPreferences()     }
     @objc private func quit()          { NSApp.terminate(nil) }
+
+    @objc private func toggleHideFromCapture() {
+        Settings.shared.hideFromScreenCapture.toggle()
+        // Settings.didChange propagates to every window's settingsChanged().
+    }
 
     @objc private func restoreWindow(_ sender: NSMenuItem) {
         guard let id = sender.representedObject as? UUID else { return }

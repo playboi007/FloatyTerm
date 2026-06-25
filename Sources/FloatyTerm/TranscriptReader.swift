@@ -1,16 +1,16 @@
 import AppKit
-import SwiftTerm
 
 /// A live, clean view of one terminal session's output — for watching an
 /// agent (Claude / Fable) work without fighting the TUI: smooth scrolling,
 /// native ⌘F search with highlight-all, selectable text, and reactive updates
 /// as output streams.
 ///
-/// Reads SwiftTerm's parsed buffer (scroll-invariant lines), so ANSI noise is
-/// already stripped. Lines that scroll past the live screen region are
-/// "committed" and cached here — the reader can retain MORE history than the
-/// terminal's own scrollback. Docked as a child window beside its terminal,
-/// so it travels with it.
+/// Renders the session's always-on transcript store (TerminalController
+/// captures ANSI-stripped lines from the moment the shell starts), so output
+/// that predates opening the reader is already here, and capture keeps
+/// working when the terminal is in alternate-screen mode (TUIs), where the
+/// terminal buffer itself holds no scrollback. Docked as a child window
+/// beside its terminal, so it travels with it.
 final class TranscriptReaderController: NSObject, NSWindowDelegate {
 
     var onClosed: (() -> Void)?
@@ -24,14 +24,23 @@ final class TranscriptReaderController: NSObject, NSWindowDelegate {
     private let titleLabel = NSTextField(labelWithString: "")
     private let followButton = NSButton()
 
-    // MARK: - Transcript state (scroll-invariant buffer mirroring)
+    // MARK: - Transcript state
 
-    private var firstRow = -1          // first valid scroll-invariant row (probed once)
-    private var probedEnd = 0          // rows examined so far
-    private var stableLines: [String] = []
+    /// Absolute index (including lines the store has dropped) of the next
+    /// transcript line to pull from the session.
+    private var nextLineIndex = 0
+    private var stableLines: [String] = []   // committed lines rendered so far
     private var stableCharCount = 0    // textStorage length of the committed region
     private var following = true
     private var refreshWork: DispatchWorkItem?
+
+    /// Absolute line index where "new since last look" begins — captured on
+    /// show() from the session's last-read position. A divider line is
+    /// spliced into the rendered text at this point (render-only; never
+    /// written into the session's transcript), then cleared.
+    private var pendingMarker: Int?
+
+    private static let newSinceLastLookDivider = "── new since last look ──"
 
     private static let textAttributes: [NSAttributedString.Key: Any] = [
         .font: NSFont.monospacedSystemFont(ofSize: 12, weight: .regular),
@@ -62,14 +71,27 @@ final class TranscriptReaderController: NSObject, NSWindowDelegate {
         guard let parent = parentPanel else { return }
         panel.level = parent.level
         panel.collectionBehavior = parent.collectionBehavior
+        panel.sharingType = parent.sharingType   // inherit screen-capture privacy
         panel.setFrame(dockedFrame(beside: parent), display: false)
         parent.addChildWindow(panel, ordered: .above)   // travels with the terminal
         panel.orderFrontRegardless()
+        // Where did the user last leave off? If output has accumulated since,
+        // remember the boundary so refresh() can splice a divider there.
+        if let session {
+            let marker = session.transcriptLastReadIndex
+            let end = session.transcriptDropped + session.transcriptLines.count
+            if marker > 0 && marker < end { pendingMarker = marker }
+        }
         refresh()
         if following { textView.scrollToEndOfDocument(nil) }
     }
 
     func close() {
+        // The user has now seen everything committed so far.
+        if let session {
+            session.transcriptLastReadIndex =
+                session.transcriptDropped + session.transcriptLines.count
+        }
         session?.onOutputActivity = nil
         refreshWork?.cancel()
         parentPanel?.removeChildWindow(panel)
@@ -218,7 +240,7 @@ final class TranscriptReaderController: NSObject, NSWindowDelegate {
         }
     }
 
-    // MARK: - Buffer mirroring
+    // MARK: - Transcript mirroring
 
     private func scheduleRefresh() {
         guard refreshWork == nil else { return }   // trailing-edge throttle
@@ -230,45 +252,47 @@ final class TranscriptReaderController: NSObject, NSWindowDelegate {
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.15, execute: work)
     }
 
+    /// Pulls lines committed to the session's transcript since the last
+    /// refresh and appends them; the live screen renders as a volatile tail
+    /// that's rewritten in place (so TUI frames and progress bars update live
+    /// without disturbing scroll position or selection above).
     private func refresh() {
         guard panel.isVisible, let session else { return }
-        let terminal = session.terminalView.getTerminal()
 
-        // One-time: find the first surviving scroll-invariant row (rows before
-        // it were dropped by the circular scrollback before we attached).
-        if firstRow < 0 {
-            var probe = 0
-            while probe < 500_000, terminal.getScrollInvariantLine(row: probe) == nil {
-                probe += 1
-            }
-            firstRow = probe
-            probedEnd = probe
-        }
+        // Expire old lines first, so `dropped` and `lines` are read from one
+        // consistent state.
+        session.purgeExpiredTranscript()
+        let dropped = session.transcriptDropped
+        let lines = session.transcriptLines
+        // If we fell more than a whole buffer behind (shouldn't happen with a
+        // 10k-line store and a 0.15s refresh), the gap is silently skipped.
+        let start = max(nextLineIndex - dropped, 0)
+        var newStable = start < lines.count ? Array(lines[start...]) : []
+        let batchStart = dropped + start   // absolute index of newStable[0]
+        nextLineIndex = dropped + lines.count
 
-        // Extend to the current end of the buffer.
-        var end = max(probedEnd, firstRow + stableLines.count)
-        while terminal.getScrollInvariantLine(row: end) != nil { end += 1 }
-        probedEnd = end
-
-        // Everything above the live screen region (+margin) is immutable.
-        let liveWindow = terminal.rows + 4
-        let stableEnd = max(firstRow + stableLines.count, end - liveWindow)
-
-        var newStable: [String] = []
-        for row in (firstRow + stableLines.count)..<stableEnd {
-            newStable.append(lineText(terminal, row))
+        // Splice the "new since last look" divider once the batch reaches the
+        // marker. Absolute → array offset: marker − batchStart (clamped to 0
+        // in case the marked line itself already aged out of the store). The
+        // divider exists only in the rendered text — the session's transcript
+        // is untouched; the reader's own line/char bookkeeping just treats it
+        // as one more line.
+        if let marker = pendingMarker, marker < nextLineIndex, !newStable.isEmpty {
+            newStable.insert(Self.newSinceLastLookDivider,
+                             at: max(marker - batchStart, 0))
+            pendingMarker = nil
         }
         stableLines.append(contentsOf: newStable)
 
-        var volatileLines = (stableEnd..<end).map { lineText(terminal, $0) }
-        while let last = volatileLines.last, last.isEmpty { volatileLines.removeLast() }
+        // While following the tail live, the user is caught up.
+        if following { session.transcriptLastReadIndex = nextLineIndex }
+
+        // The mirror's live screen (or a TUI's current frame): rewritten in
+        // place on every refresh rather than committed.
+        let volatileLines = session.transcriptVolatile
 
         render(newStable: newStable, volatile: volatileLines)
         capIfNeeded(volatile: volatileLines)
-    }
-
-    private func lineText(_ terminal: Terminal, _ row: Int) -> String {
-        terminal.getScrollInvariantLine(row: row)?.translateToString(trimRight: true) ?? ""
     }
 
     /// Appends newly-committed lines and rewrites only the volatile tail, so
