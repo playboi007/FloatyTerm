@@ -35,6 +35,15 @@ final class TerminalWindowController: NSObject, NSWindowDelegate {
     /// summoning the session (the window itself can't be clicked).
     private(set) var isGhosted = false
 
+    /// Per-window opacity override (0.1–1.0) set from the double-click header
+    /// overlay. When non-nil it wins over the global focused/unfocused-dim
+    /// settings for this window. Session-scoped (not persisted).
+    private var opacityOverride: Double?
+
+    /// The window-options popover (opacity + ghost), opened from the header
+    /// utils button; at most one at a time.
+    private var optionsPopover: NSPopover?
+
     // Avatar (bubble) collapse state.
     private var avatar: AvatarPanel?
     private var collapsedSnapshot: NSImage?
@@ -219,7 +228,7 @@ final class TerminalWindowController: NSObject, NSWindowDelegate {
         header.onBuildAppLinkMenu = { [weak self] menu in self?.buildAppLinkMenu(menu) }
         header.onCollapse       = { [weak self] in self?.collapseToAvatar() }
         header.onCollapseTicker = { [weak self] in self?.collapseToTicker() }
-        header.onGhost          = { [weak self] in self?.setGhosted(true) }
+        header.onShowUtils      = { [weak self] button in self?.showWindowOptions(from: button) }
         header.onSnap           = { [weak self] asText in self?.captureContext(asText: asText) }
         header.onBuildSnapMenu  = { [weak self] menu in self?.buildSnapHistoryMenu(menu) }
         tabStrip.onSelect     = { [weak self] i in self?.selectTab(i) }
@@ -903,12 +912,56 @@ final class TerminalWindowController: NSObject, NSWindowDelegate {
 
     private func applyAppearance(focused: Bool) {
         contentBlur.isHidden = !Settings.shared.backgroundBlur
-        let alpha = (Settings.shared.dimWhenUnfocused && !focused)
-            ? Settings.shared.unfocusedOpacity
-            : Settings.shared.focusedOpacity
+        // A per-window override (from the header double-click overlay) wins over
+        // the global focused/unfocused-dim settings for this window.
+        let alpha: Double
+        if let override = opacityOverride {
+            alpha = override
+        } else {
+            alpha = (Settings.shared.dimWhenUnfocused && !focused)
+                ? Settings.shared.unfocusedOpacity
+                : Settings.shared.focusedOpacity
+        }
         // Floor at 0.1: the alpha applies to the terminal text itself, so 0
         // would render the content invisible with no way to see what you type.
         contentArea.alphaValue = CGFloat(max(0.1, alpha))
+    }
+
+    // MARK: - Window options popover (header utils button)
+
+    /// Shows the per-window options popover (opacity slider + ghost toggle)
+    /// anchored to the header utils `button`. Re-invoking while it's open
+    /// toggles it closed.
+    private func showWindowOptions(from button: NSButton) {
+        if let p = optionsPopover, p.isShown {
+            p.close()
+            optionsPopover = nil
+            return
+        }
+        let vc = WindowOptionsViewController()
+        vc.initialOpacity = opacityOverride ?? Settings.shared.focusedOpacity
+        vc.onOpacityChange = { [weak self] value in
+            guard let self else { return }
+            self.opacityOverride = value
+            self.applyAppearance(focused: self.panel.isKeyWindow)
+        }
+        vc.onResetOpacity = { [weak self] in
+            guard let self else { return }
+            self.opacityOverride = nil
+            self.applyAppearance(focused: self.panel.isKeyWindow)
+        }
+        vc.onGhost = { [weak self] in self?.setGhosted(true) }
+
+        let popover = NSPopover()
+        popover.contentViewController = vc
+        popover.behavior = .transient            // auto-closes on outside click
+        popover.show(relativeTo: button.bounds, of: button, preferredEdge: .maxY)
+        optionsPopover = popover
+    }
+
+    private func dismissWindowOptions() {
+        optionsPopover?.close()
+        optionsPopover = nil
     }
 
     @objc private func settingsChanged() {
@@ -2159,7 +2212,10 @@ final class TerminalWindowController: NSObject, NSWindowDelegate {
     }
 
     func windowDidBecomeKey(_ notification: Notification) { applyAppearance(focused: true)  }
-    func windowDidResignKey(_ notification: Notification) { applyAppearance(focused: false) }
+    func windowDidResignKey(_ notification: Notification) {
+        dismissWindowOptions()   // don't leave the overlay floating over an inactive window
+        applyAppearance(focused: false)
+    }
     func windowDidMove(_ notification: Notification)      { scheduleFrameSave() }
     func windowDidResize(_ notification: Notification)    { scheduleFrameSave() }
 

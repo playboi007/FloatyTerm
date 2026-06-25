@@ -615,8 +615,10 @@ final class HeaderControlsView: DragHandleView, NSMenuDelegate {
     var onTogglePin:     () -> Void = {}
     var onCollapse:      () -> Void = {}
     var onCollapseTicker: () -> Void = {}
-    var onGhost:         () -> Void = {}
     var onReturnTab:     () -> Void = {}
+    /// Opens the window-options popover (opacity + ghost). Passes the utils
+    /// button so the caller can anchor the popover to it.
+    var onShowUtils:     (NSButton) -> Void = { _ in }
     /// Context Snap: capture what's behind the window. `asText` = OCR variant.
     var onSnap:          (_ asText: Bool) -> Void = { _ in }
     /// Populates the camera button's right-click history menu.
@@ -628,11 +630,11 @@ final class HeaderControlsView: DragHandleView, NSMenuDelegate {
 
     private let snapButton         = NSButton()
     private let returnButton       = NSButton()
-    private let ghostButton        = NSButton()
     private let urlBarToggleButton = NSButton()
     private let addButton          = NSButton()
     private let newWindowButton    = NSButton()
     private let pinButton          = NSButton()
+    private let utilsButton        = NSButton()
     private let collapseButton     = NSButton()
     private let minimizeButton     = NSButton()
 
@@ -708,17 +710,16 @@ final class HeaderControlsView: DragHandleView, NSMenuDelegate {
         returnButton.isHidden = true
         returnButton.translatesAutoresizingMaskIntoConstraints = false
 
-        // Ghost: click-through + faded, for watching logs over another app.
-        // One-way from here — a ghosted window can't be clicked, so it's
-        // restored from the menu-bar icon (or by summoning via ⌥⌘K).
-        ghostButton.image = NSImage(systemSymbolName: "eye.slash",
-                                    accessibilityDescription: "Ghost window (click-through)")
-        ghostButton.isBordered = false
-        ghostButton.contentTintColor = NSColor.white.withAlphaComponent(0.8)
-        ghostButton.target = self
-        ghostButton.action = #selector(ghostTapped)
-        ghostButton.toolTip = "Ghost: click-through & faded — restore from the menu-bar icon"
-        ghostButton.translatesAutoresizingMaskIntoConstraints = false
+        // Utils/extras: opens a popover with per-window options (opacity slider,
+        // ghost). Designed to gather more window-level extras over time.
+        utilsButton.image = NSImage(systemSymbolName: "ellipsis.circle",
+                                    accessibilityDescription: "Window options")
+        utilsButton.isBordered = false
+        utilsButton.contentTintColor = NSColor.white.withAlphaComponent(0.8)
+        utilsButton.target = self
+        utilsButton.action = #selector(utilsTapped)
+        utilsButton.toolTip = "Window options — opacity & ghost"
+        utilsButton.translatesAutoresizingMaskIntoConstraints = false
 
         // Context Snap: photograph what this window is overlaying and type the
         // snapshot's path into the prompt, so the terminal agent can read it.
@@ -737,11 +738,11 @@ final class HeaderControlsView: DragHandleView, NSMenuDelegate {
 
         addSubview(snapButton)
         addSubview(returnButton)
-        addSubview(ghostButton)
         addSubview(urlBarToggleButton)
         addSubview(addButton)
         addSubview(newWindowButton)
         addSubview(pinButton)
+        addSubview(utilsButton)
         addSubview(collapseButton)
         addSubview(minimizeButton)
 
@@ -750,13 +751,9 @@ final class HeaderControlsView: DragHandleView, NSMenuDelegate {
             snapButton.centerYAnchor.constraint(equalTo: centerYAnchor),
             snapButton.widthAnchor.constraint(equalToConstant: 24),
 
-            returnButton.trailingAnchor.constraint(equalTo: ghostButton.leadingAnchor, constant: -6),
+            returnButton.trailingAnchor.constraint(equalTo: urlBarToggleButton.leadingAnchor, constant: -6),
             returnButton.centerYAnchor.constraint(equalTo: centerYAnchor),
             returnButton.widthAnchor.constraint(equalToConstant: 24),
-
-            ghostButton.trailingAnchor.constraint(equalTo: urlBarToggleButton.leadingAnchor, constant: -6),
-            ghostButton.centerYAnchor.constraint(equalTo: centerYAnchor),
-            ghostButton.widthAnchor.constraint(equalToConstant: 24),
 
             urlBarToggleButton.trailingAnchor.constraint(equalTo: addButton.leadingAnchor, constant: -6),
             urlBarToggleButton.centerYAnchor.constraint(equalTo: centerYAnchor),
@@ -770,9 +767,13 @@ final class HeaderControlsView: DragHandleView, NSMenuDelegate {
             newWindowButton.centerYAnchor.constraint(equalTo: centerYAnchor),
             newWindowButton.widthAnchor.constraint(equalToConstant: 24),
 
-            pinButton.trailingAnchor.constraint(equalTo: collapseButton.leadingAnchor, constant: -4),
+            pinButton.trailingAnchor.constraint(equalTo: utilsButton.leadingAnchor, constant: -4),
             pinButton.centerYAnchor.constraint(equalTo: centerYAnchor),
             pinButton.widthAnchor.constraint(equalToConstant: 24),
+
+            utilsButton.trailingAnchor.constraint(equalTo: collapseButton.leadingAnchor, constant: -4),
+            utilsButton.centerYAnchor.constraint(equalTo: centerYAnchor),
+            utilsButton.widthAnchor.constraint(equalToConstant: 24),
 
             collapseButton.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -10),
             collapseButton.centerYAnchor.constraint(equalTo: centerYAnchor),
@@ -861,8 +862,8 @@ final class HeaderControlsView: DragHandleView, NSMenuDelegate {
     @objc private func toggleURLBarTapped() { onToggleURLBar() }
     @objc private func minimizeTapped()   { onMinimize()     }
     @objc private func pinTapped()        { onTogglePin()    }
-    @objc private func ghostTapped()      { onGhost()        }
     @objc private func returnTapped()     { onReturnTab()    }
+    @objc private func utilsTapped()      { onShowUtils(utilsButton) }
 
     @objc private func snapTapped() {
         let asText = NSApp.currentEvent?.modifierFlags.contains(.option) == true
