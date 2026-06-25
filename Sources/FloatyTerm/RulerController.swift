@@ -140,6 +140,8 @@ final class RulerContentView: NSView {
     private let blur = NSVisualEffectView()
     private let canvas = RulerCanvas()
     private let pencil = NSButton()
+    private let closeNotes = NSButton()
+    private let closeRuler = NSButton()
 
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
@@ -172,11 +174,47 @@ final class RulerContentView: NSView {
         pencil.toolTip = "Add reference notes along the ruler"
         pencil.translatesAutoresizingMaskIntoConstraints = false
         addSubview(pencil)
+
+        // Close: collapses the notes strip back to just the ruler. Shares the
+        // bottom-left slot with the pencil — only one is visible at a time
+        // (pencil when collapsed, × when the notes area is expanded).
+        closeNotes.bezelStyle = .regularSquare
+        closeNotes.isBordered = false
+        closeNotes.image = NSImage(systemSymbolName: "xmark.circle.fill",
+                                   accessibilityDescription: "Close notes")
+        closeNotes.contentTintColor = NSColor.white.withAlphaComponent(0.75)
+        closeNotes.target = self
+        closeNotes.action = #selector(closeNotesTapped)
+        closeNotes.toolTip = "Close the notes area"
+        closeNotes.isHidden = true
+        closeNotes.translatesAutoresizingMaskIntoConstraints = false
+        addSubview(closeNotes)
+
+        for b in [pencil, closeNotes] {
+            NSLayoutConstraint.activate([
+                b.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 5),
+                b.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -4),
+                b.widthAnchor.constraint(equalToConstant: 22),
+                b.heightAnchor.constraint(equalToConstant: 20)
+            ])
+        }
+
+        // Close the whole ruler — pinned to the top-right corner.
+        closeRuler.bezelStyle = .regularSquare
+        closeRuler.isBordered = false
+        closeRuler.image = NSImage(systemSymbolName: "xmark.circle.fill",
+                                   accessibilityDescription: "Close ruler")
+        closeRuler.contentTintColor = NSColor.white.withAlphaComponent(0.75)
+        closeRuler.target = self
+        closeRuler.action = #selector(closeRulerTapped)
+        closeRuler.toolTip = "Close the ruler"
+        closeRuler.translatesAutoresizingMaskIntoConstraints = false
+        addSubview(closeRuler)
         NSLayoutConstraint.activate([
-            pencil.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 5),
-            pencil.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -4),
-            pencil.widthAnchor.constraint(equalToConstant: 22),
-            pencil.heightAnchor.constraint(equalToConstant: 20)
+            closeRuler.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -5),
+            closeRuler.topAnchor.constraint(equalTo: topAnchor, constant: 4),
+            closeRuler.widthAnchor.constraint(equalToConstant: 18),
+            closeRuler.heightAnchor.constraint(equalToConstant: 18)
         ])
 
         toolTip = "Drag to move · drag right edge to widen · hold ⇧ to magnify"
@@ -184,11 +222,14 @@ final class RulerContentView: NSView {
 
     required init?(coder: NSCoder) { fatalError() }
 
-    @objc private func togglePencil() {
-        canvas.setAnnotating(!canvas.annotating)
-        pencil.contentTintColor = canvas.annotating
-            ? NSColor.controlAccentColor
-            : NSColor.white.withAlphaComponent(0.75)
+    @objc private func togglePencil()     { setAnnotating(!canvas.annotating) }
+    @objc private func closeNotesTapped() { setAnnotating(false) }
+    @objc private func closeRulerTapped() { panel?.orderOut(nil) }
+
+    private func setAnnotating(_ on: Bool) {
+        canvas.setAnnotating(on)
+        pencil.isHidden = on            // bottom-left slot shows × while expanded
+        closeNotes.isHidden = !on
     }
 }
 
@@ -205,7 +246,8 @@ final class RulerCanvas: NSView {
     private struct Marker {
         let id = UUID()
         var point: CGFloat          // distance in points from the left edge (x = 0)
-        let field: NSTextField
+        let field: NoteField
+        let badge: NSButton         // × quick-delete badge at the note's top-right
     }
     private var markers: [Marker] = []
 
@@ -230,41 +272,73 @@ final class RulerCanvas: NSView {
 
     func setAnnotating(_ on: Bool) {
         annotating = on
-        markers.forEach { $0.field.isHidden = !on }
+        markers.forEach { $0.field.isHidden = !on; $0.badge.isHidden = !on }
         panel?.lockHeight(on ? RulerPanel.rulerHeight + RulerPanel.stripHeight
                              : RulerPanel.rulerHeight)
         needsDisplay = true
     }
 
+    /// Adds a note pinned to point `x`. Multiple notes are supported — each
+    /// click on the ruler band in annotate mode drops another.
     private func addMarker(at x: CGFloat) {
-        let field = NSTextField(frame: .zero)
+        let field = NoteField(frame: .zero)
         field.placeholderString = "note…"
         field.font = .systemFont(ofSize: 11)
         field.bezelStyle = .roundedBezel
         field.isBezeled = true
         field.drawsBackground = true
         field.delegate = self
+        // Double-click the note to delete it quickly.
+        field.onDoubleClick = { [weak self, weak field] in
+            guard let self, let field else { return }
+            self.removeMarker(for: field)
+        }
         addSubview(field)
-        markers.append(Marker(point: x, field: field))
+
+        // × badge for one-click deletion, overlapping the note's top-right.
+        let badge = NSButton()
+        badge.isBordered = false
+        badge.bezelStyle = .regularSquare
+        badge.image = NSImage(systemSymbolName: "xmark.circle.fill",
+                              accessibilityDescription: "Delete note")
+        badge.contentTintColor = NSColor.white.withAlphaComponent(0.55)
+        badge.target = self
+        badge.action = #selector(deleteBadgeTapped(_:))
+        badge.toolTip = "Delete this note"
+        addSubview(badge)
+
+        markers.append(Marker(point: x, field: field, badge: badge))
         layoutMarkers()
         window?.makeFirstResponder(field)
         needsDisplay = true
     }
 
     private func removeMarker(for field: NSTextField) {
-        field.removeFromSuperview()
+        if let m = markers.first(where: { $0.field === field }) {
+            m.field.removeFromSuperview()
+            m.badge.removeFromSuperview()
+        }
         markers.removeAll { $0.field === field }
         needsDisplay = true
+    }
+
+    @objc private func deleteBadgeTapped(_ sender: NSButton) {
+        guard let m = markers.first(where: { $0.badge === sender }) else { return }
+        removeMarker(for: m.field)
     }
 
     private func layoutMarkers() {
         let w: CGFloat = 132, h: CGFloat = 22
         let top = RulerPanel.rulerHeight + 10
+        let badgeSize: CGFloat = 14
         for (i, m) in markers.enumerated() {
             // Two staggered rows so neighbouring notes don't fully overlap.
             let row = CGFloat(i % 2)
             let x = min(max(m.point, 4), max(4, bounds.width - w - 4))
-            m.field.frame = NSRect(x: x, y: top + row * 30, width: w, height: h)
+            let y = top + row * 30
+            m.field.frame = NSRect(x: x, y: y, width: w, height: h)
+            m.badge.frame = NSRect(x: x + w - badgeSize / 2 - 2, y: y - badgeSize / 2,
+                                   width: badgeSize, height: badgeSize)
         }
     }
 
@@ -412,5 +486,20 @@ extension RulerCanvas: NSTextFieldDelegate {
         if field.stringValue.trimmingCharacters(in: .whitespaces).isEmpty {
             removeMarker(for: field)
         }
+    }
+}
+
+/// A note field whose double-click is a quick-delete gesture rather than the
+/// default word-selection. Reliable when the note isn't being edited; the ×
+/// badge is the always-available delete.
+final class NoteField: NSTextField {
+    var onDoubleClick: () -> Void = {}
+
+    override func mouseDown(with event: NSEvent) {
+        if event.clickCount >= 2 {
+            onDoubleClick()
+            return
+        }
+        super.mouseDown(with: event)
     }
 }
