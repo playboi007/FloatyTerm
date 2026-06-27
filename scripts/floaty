@@ -1,0 +1,116 @@
+#!/usr/bin/env bash
+# floaty — thin agent-control client for FloatyTerm.
+#
+# Sibling of `ftdiff` (scripts/floaty-diff.sh): POSTs JSON to FloatyTerm's
+# loopback relay (127.0.0.1:7777, started by the app on launch) and prints the
+# JSON reply. The long-running FloatyTerm.app holds the Accessibility + Screen
+# Recording grants and does the work — this script holds nothing and needs no
+# permissions (TCC grants are keyed to FloatyTerm.app's code signature, which is
+# why it's a thin client and not its own binary).
+#
+# Install:  cp scripts/floaty ~/.local/bin/floaty && chmod +x ~/.local/bin/floaty
+#           (or /usr/local/bin if you prefer — anywhere on PATH)
+#
+# Pacing (optional, off by default = instant):
+#   --human            human-paced (default duration)
+#   --duration 0.8     human-paced over 0.8s (implies --human)
+#   Human pacing isn't just cosmetic: some apps debounce fast input or need the
+#   cursor to actually travel for hovers/drags to register.
+#
+# Commands:
+#   floaty click  --x 840 --y 412 [--button left|right|center] [--clicks 2]
+#                 [--modifiers cmd,shift] [--human|--duration N] [--target App]
+#   floaty move   --x 600 --y 300 [--human|--duration N] [--target App]
+#   floaty drag   --from-x 100 --from-y 100 --to-x 400 --to-y 400
+#                 [--button left] [--modifiers shift] [--human|--duration N] [--target App]
+#   floaty scroll --dx 0 --dy 400 [--x 700 --y 400] [--human|--duration N] [--target App]
+#                 (pass --x/--y to put the cursor over the area to scroll — wheel
+#                  events go to whatever is UNDER the cursor, not the focused view)
+#   floaty type   --text "hello" [--human|--duration N] [--target Notes]
+#   floaty key    --key return [--modifiers cmd,shift] [--target Cursor]
+#   floaty capture --window "Flutter" [--ocr]           # returns a capture FRAME (frame_id +
+#                                                        # origin/size/scale/image dims) + PNG
+#   floaty capture --window-id 12345 [--ocr]            # exact window from list-windows
+#   floaty click-in-frame --frame cap_… --x <imgpx> --y <imgpx> [--button right] [--clicks 2] [--human]
+#                 (x/y are PIXELS in the captured PNG, as your vision model reads them;
+#                  FloatyTerm inverts to a screen point and clicks — no scale math, no re-capture)
+#   floaty move-in-frame  --frame cap_… --x <imgpx> --y <imgpx>   # same transform, hover only
+#   floaty list-windows [--filter Chrome]               # ids+titles+bounds you can target
+#   floaty query-dom --selector "h3 a" [--port 9222] [--match youtube.com]  # ALL matches
+#   floaty eval     --expression "document.title" [--port 9222] [--match docs]  # run JS, get JSON
+#   floaty navigate --url "https://example.com" [--port 9222] [--match console.cloud]  # drive a tab
+#   floaty tabs     [--port 9222]                       # list open tabs (id/title/url) to pick --match
+#   floaty focus    --match youtube.com [--port 9222]   # raise that tab's window (then key/type land there)
+#
+# --match <substring> selects WHICH tab (url or title contains it) for eval/query-dom/navigate/focus;
+# without it they use the first real page. Use `floaty tabs` to see what's open.
+#   floaty mark     --x 840 --y 412 [--duration 1.2] [--label "submit"]  # flash a crosshair to
+#                                                                        # verify a click target
+#
+# query-dom ports (apps must be LAUNCHED with the flag — Electron apps speak CDP):
+#   Chrome 9222 · VS Code 9223 · Cursor 9224 · Slack 9225
+#   e.g.  cursor --remote-debugging-port=9224
+
+set -euo pipefail
+HOST="127.0.0.1:7777"
+
+cmd="${1:-}"; shift || true
+[ -n "$cmd" ] || { echo "usage: floaty <click|move|drag|scroll|type|key|capture|query-dom|eval|navigate|tabs|focus|list-windows|mark|click-in-frame|move-in-frame> [--flag value ...]" >&2; exit 2; }
+
+args=("$@")
+# Expand the array in a way that's safe when it's EMPTY under `set -u` on the
+# bash 3.2 that ships with macOS (a bare "${args[@]}" trips "unbound variable"
+# for argument-less commands like `list-windows`).
+routed=$(python3 - "$cmd" ${args[@]+"${args[@]}"} <<'PY'
+import sys, json
+cmd = sys.argv[1]; toks = sys.argv[2:]
+obj = {}; i = 0
+# numeric flags → numbers; --modifiers → array; bare flags (--human/--ocr) → true.
+NUM = {"x","y","port","clicks","dx","dy","duration","from_x","from_y","to_x","to_y","window_id"}
+while i < len(toks):
+    if not toks[i].startswith("--"): i += 1; continue
+    key = toks[i][2:].replace("-", "_")
+    if i + 1 >= len(toks) or toks[i+1].startswith("--"):
+        obj[key] = True; i += 1; continue
+    val = toks[i+1]
+    if key in NUM:
+        obj[key] = float(val) if "." in val else int(val)
+    elif key == "modifiers":
+        obj[key] = [m for m in val.split(",") if m]
+    else:
+        obj[key] = val
+    i += 2
+paths = {"click":"/agent/click","move":"/agent/move","drag":"/agent/drag",
+         "scroll":"/agent/scroll","type":"/agent/type","key":"/agent/key",
+         "capture":"/agent/capture","query-dom":"/agent/query-dom",
+         "eval":"/agent/eval","navigate":"/agent/navigate",
+         "tabs":"/agent/tabs","focus":"/agent/focus",
+         "list-windows":"/agent/list-windows","mark":"/agent/mark",
+         "click-in-frame":"/agent/click-in-frame","move-in-frame":"/agent/move-in-frame"}
+print(json.dumps({"path": paths.get(cmd, "/agent/"+cmd), "body": obj}))
+PY
+)
+
+path=$(printf '%s' "$routed" | python3 -c "import sys,json;print(json.load(sys.stdin)['path'])")
+body=$(printf '%s' "$routed" | python3 -c "import sys,json;print(json.dumps(json.load(sys.stdin)['body']))")
+
+# Capture the body and the HTTP status separately. The relay returns 400 with a
+# JSON {"error":…} body for legitimate failures (element not found, port closed,
+# missing permission) — those are real answers, not transport faults, so we
+# print the body regardless of status. ONLY a connect-level failure (curl can't
+# reach the relay → status 000) means "the app isn't running". Conflating the
+# two — as a blanket `curl --fail-with-body || echo "not reachable"` would —
+# made every clean error look like a dead app.
+resp=$(curl -s -w '\n%{http_code}' -H "Content-Type: application/json" \
+       -X POST "http://$HOST$path" -d "$body" 2>/dev/null) || true
+code="${resp##*$'\n'}"
+payload="${resp%$'\n'*}"
+
+if [ "$code" = "000" ] || [ -z "$code" ]; then
+    echo '{"error":"FloatyTerm not reachable on 127.0.0.1:7777 (is the app running?)"}' >&2
+    exit 1
+fi
+printf '%s\n' "$payload"
+# Non-2xx → non-zero exit so scripting callers can branch, but the JSON error
+# has already been printed to stdout for the agent to read.
+[ "${code#2}" != "$code" ] || exit 1

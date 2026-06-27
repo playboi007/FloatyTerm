@@ -25,6 +25,188 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             self?.compareFilesInCurrentWindow(left: left, right: right)
         }
 
+        // Agent-host control routes: the `floaty` CLI POSTs to /agent/* on the
+        // relay and FloatyTerm (holding the Accessibility + Screen Recording
+        // grants) drives the OS — input injection (Layer B / AgentInput),
+        // window capture (Layer C / AgentCapture), and CDP element targeting
+        // (Layer A / AgentDOM). All closures run on the main actor.
+        DevtoolsRelay.shared.onAgentClick = { [weak self] b in
+            guard let self, let p = self.point(b) else { return ["error": "expected {x,y}"] }
+            let clicks = (b["clicks"] as? NSNumber)?.intValue ?? 1
+            let ok = AgentInput.click(at: p, button: self.button(b), modifiers: self.mods(b),
+                                      clicks: clicks, pacing: self.pacing(b), target: self.target(b))
+            return ok ? ["ok": true] : self.inputFailure("click", b)
+        }
+        DevtoolsRelay.shared.onAgentMove = { [weak self] b in
+            guard let self, let p = self.point(b) else { return ["error": "expected {x,y}"] }
+            let ok = AgentInput.move(to: p, pacing: self.pacing(b), target: self.target(b))
+            return ok ? ["ok": true] : self.inputFailure("move", b)
+        }
+        DevtoolsRelay.shared.onAgentDrag = { [weak self] b in
+            guard let self,
+                  let fx = (b["from_x"] as? NSNumber)?.doubleValue,
+                  let fy = (b["from_y"] as? NSNumber)?.doubleValue,
+                  let tx = (b["to_x"] as? NSNumber)?.doubleValue,
+                  let ty = (b["to_y"] as? NSNumber)?.doubleValue
+            else { return ["error": "expected {from_x,from_y,to_x,to_y}"] }
+            let ok = AgentInput.drag(from: CGPoint(x: fx, y: fy), to: CGPoint(x: tx, y: ty),
+                                     button: self.button(b), modifiers: self.mods(b),
+                                     pacing: self.pacing(b), target: self.target(b))
+            return ok ? ["ok": true] : self.inputFailure("drag", b)
+        }
+        DevtoolsRelay.shared.onAgentScroll = { [weak self] b in
+            guard let self else { return ["error": "no self"] }
+            let dx = (b["dx"] as? NSNumber)?.intValue ?? 0
+            let dy = (b["dy"] as? NSNumber)?.intValue ?? 0
+            let ok = AgentInput.scroll(dx: dx, dy: dy, at: self.point(b),
+                                       pacing: self.pacing(b), target: self.target(b))
+            return ok ? ["ok": true] : self.inputFailure("scroll", b)
+        }
+        DevtoolsRelay.shared.onAgentType = { [weak self] b in
+            guard let self, let text = b["text"] as? String else { return ["error": "expected {text}"] }
+            let ok = AgentInput.type(text, pacing: self.pacing(b), target: self.target(b))
+            return ok ? ["ok": true, "typed": text.count] : self.inputFailure("type", b)
+        }
+        DevtoolsRelay.shared.onAgentKey = { [weak self] b in
+            guard let self, let key = b["key"] as? String else { return ["error": "expected {key}"] }
+            // Check the key name first so an unknown key reports its own precise
+            // cause instead of being lumped under the activation failure path.
+            guard AgentInput.isKnownKey(key) else {
+                return ["error": "key failed: \"\(key)\" is not a known key name. Use a single "
+                    + "character (a–z, 0–9, punctuation like / or -), a function key (f1–f12), or a "
+                    + "named key (return, tab, space, delete, escape, left/right/up/down, home, end, "
+                    + "pgup, pgdown). For arbitrary text use `type`, not `key`."]
+            }
+            let ok = AgentInput.pressKey(key, modifiers: self.mods(b), target: self.target(b))
+            return ok ? ["ok": true, "key": key] : self.inputFailure("key", b)
+        }
+        DevtoolsRelay.shared.onAgentCapture = { b in
+            let window = b["window"] as? String
+            let windowID = (b["window_id"] as? NSNumber)?.uint32Value
+            guard window != nil || windowID != nil else {
+                return ["error": "expected {window} or {window_id} (see `floaty list-windows`)"]
+            }
+            let ocr = (b["ocr"] as? NSNumber)?.boolValue ?? false
+            do {
+                let r = try await AgentCapture.captureWindow(named: window, windowID: windowID, ocr: ocr)
+                let f = r.frame
+                // The capture frame: everything click-in-frame needs to map an
+                // image-pixel coordinate back to a global screen point.
+                var out: [String: Any] = [
+                    "ok": true, "path": r.imagePath, "frame_id": f.id,
+                    "origin_x": f.origin.x, "origin_y": f.origin.y,
+                    "width": f.size.width, "height": f.size.height, "scale": f.scale,
+                    "image_width": f.imageWidth, "image_height": f.imageHeight,
+                ]
+                if let t = r.textPath { out["text_path"] = t }          // OCR found text
+                else if ocr { out["note"] = "no text recognized in the capture" }
+                return out
+            } catch { return ["error": error.localizedDescription] }
+        }
+        DevtoolsRelay.shared.onAgentMark = { [weak self] b in
+            guard let self, let p = self.point(b) else { return ["error": "expected {x,y}"] }
+            let duration = (b["duration"] as? NSNumber)?.doubleValue ?? 1.2
+            let label = b["label"] as? String
+            _ = AgentMarker.show(at: p, duration: duration, label: label)
+            return ["ok": true, "x": p.x, "y": p.y]
+        }
+        // click-in-frame / move-in-frame: the agent passes a coordinate its
+        // vision model read off a captured PNG (image pixels) plus the frame_id;
+        // FloatyTerm inverts to a screen point and acts. Breaks the capture →
+        // guess → nudge → re-capture loop on native/canvas apps.
+        DevtoolsRelay.shared.onAgentClickInFrame = { [weak self] b in
+            guard let self else { return ["error": "no self"] }
+            do {
+                let (p, owner) = try self.resolveFrame(b)
+                let clicks = (b["clicks"] as? NSNumber)?.intValue ?? 1
+                let ok = AgentInput.click(at: p, button: self.button(b), modifiers: self.mods(b),
+                                          clicks: clicks, pacing: self.pacing(b), target: owner)
+                return ok ? ["ok": true, "screen_x": p.x, "screen_y": p.y]
+                          : self.inputFailure("click-in-frame", b)
+            } catch { return ["error": error.localizedDescription] }
+        }
+        DevtoolsRelay.shared.onAgentMoveInFrame = { [weak self] b in
+            guard let self else { return ["error": "no self"] }
+            do {
+                let (p, owner) = try self.resolveFrame(b)
+                let ok = AgentInput.move(to: p, pacing: self.pacing(b), target: owner)
+                return ok ? ["ok": true, "screen_x": p.x, "screen_y": p.y]
+                          : self.inputFailure("move-in-frame", b)
+            } catch { return ["error": error.localizedDescription] }
+        }
+        DevtoolsRelay.shared.onAgentListWindows = { b in
+            // Optional `filter` narrows to windows whose owner/title contains it.
+            let filter = (b["filter"] as? String)?.lowercased()
+            let windows = AgentCapture.listWindows()
+                .filter { filter == nil
+                    || $0.owner.lowercased().contains(filter!)
+                    || $0.title.lowercased().contains(filter!) }
+                .sorted { $0.bounds.width * $0.bounds.height > $1.bounds.width * $1.bounds.height }
+                .map { w -> [String: Any] in
+                    ["id": Int(w.id), "owner": w.owner, "title": w.title,
+                     "x": w.bounds.origin.x, "y": w.bounds.origin.y,
+                     "width": w.bounds.width, "height": w.bounds.height]
+                }
+            return ["ok": true, "windows": windows]
+        }
+        DevtoolsRelay.shared.onAgentQueryDOM = { b in
+            guard let selector = b["selector"] as? String else { return ["error": "expected {selector}"] }
+            let port = UInt16((b["port"] as? NSNumber)?.intValue ?? 9222)
+            let match = b["match"] as? String
+            do {
+                let matches = try await AgentDOM.screenRects(selector: selector, port: port, match: match)
+                let arr: [[String: Any]] = matches.map { m in
+                    ["x": m.rect.origin.x, "y": m.rect.origin.y,
+                     "width": m.rect.size.width, "height": m.rect.size.height,
+                     "center_x": m.center.x, "center_y": m.center.y, "text": m.text]
+                }
+                // Top-level fields mirror the FIRST match (back-compat with the
+                // single-result shape); `matches`/`count` expose them all.
+                let f = matches[0]
+                return ["ok": true, "count": matches.count, "matches": arr,
+                        "x": f.rect.origin.x, "y": f.rect.origin.y,
+                        "width": f.rect.size.width, "height": f.rect.size.height,
+                        "center_x": f.center.x, "center_y": f.center.y]
+            } catch { return ["error": error.localizedDescription] }
+        }
+        DevtoolsRelay.shared.onAgentEval = { b in
+            guard let expr = (b["expression"] as? String) ?? (b["js"] as? String) else {
+                return ["error": "expected {expression}"]
+            }
+            let port = UInt16((b["port"] as? NSNumber)?.intValue ?? 9222)
+            let match = b["match"] as? String
+            do {
+                let json = try await AgentDOM.runJavaScript(expression: expr, port: port, match: match)
+                // Re-parse so the value embeds natively in the response (an
+                // array stays an array), not as an escaped string.
+                if let json, let val = try? JSONSerialization.jsonObject(
+                    with: Data(json.utf8), options: [.fragmentsAllowed]) {
+                    return ["ok": true, "result": val]
+                }
+                return ["ok": true, "result": NSNull()]
+            } catch { return ["error": error.localizedDescription] }
+        }
+        DevtoolsRelay.shared.onAgentNavigate = { b in
+            guard let url = b["url"] as? String else { return ["error": "expected {url}"] }
+            let port = UInt16((b["port"] as? NSNumber)?.intValue ?? 9222)
+            let match = b["match"] as? String
+            do { try await AgentDOM.navigate(url: url, port: port, match: match); return ["ok": true, "url": url] }
+            catch { return ["error": error.localizedDescription] }
+        }
+        DevtoolsRelay.shared.onAgentTabs = { b in
+            let port = UInt16((b["port"] as? NSNumber)?.intValue ?? 9222)
+            do { return ["ok": true, "tabs": try await AgentDOM.tabs(port: port)] }
+            catch { return ["error": error.localizedDescription] }
+        }
+        DevtoolsRelay.shared.onAgentFocus = { b in
+            let port = UInt16((b["port"] as? NSNumber)?.intValue ?? 9222)
+            let match = b["match"] as? String
+            do {
+                try await AgentDOM.bringToFront(port: port, match: match)
+                return ["ok": true]
+            } catch { return ["error": error.localizedDescription] }
+        }
+
         // Keep per-feature data (Devtools logs, Browser Context captures,
         // Context Snaps) within the user's retention/size budget: one sweep
         // now, then hourly.
@@ -596,6 +778,70 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             ?? NSScreen.main ?? NSScreen.screens.first
         guard let vis = screen?.visibleFrame else { return nil }
         return Settings.shared.summonPosition.frame(forSize: size, in: vis)
+    }
+
+    // MARK: - Agent route body parsing
+
+    /// Optional pacing from the JSON body: `duration` (seconds) wins, else a
+    /// truthy `human` flag uses a default duration; absent → instant.
+    private func pacing(_ b: [String: Any]) -> AgentInput.Pacing {
+        if let d = (b["duration"] as? NSNumber)?.doubleValue { return .human(duration: d) }
+        if (b["human"] as? NSNumber)?.boolValue == true { return .human(duration: 0.4) }
+        return .instant
+    }
+    private func point(_ b: [String: Any]) -> CGPoint? {
+        guard let x = (b["x"] as? NSNumber)?.doubleValue,
+              let y = (b["y"] as? NSNumber)?.doubleValue else { return nil }
+        return CGPoint(x: x, y: y)
+    }
+    private func button(_ b: [String: Any]) -> AgentInput.MouseButton {
+        AgentInput.MouseButton(rawValue: (b["button"] as? String) ?? "left") ?? .left
+    }
+    private func mods(_ b: [String: Any]) -> [String] {
+        (b["modifiers"] as? [Any])?.compactMap { $0 as? String } ?? []
+    }
+    private func target(_ b: [String: Any]) -> String? { b["target"] as? String }
+
+    /// Parse a frame body ({frame_id|frame, x, y} in image pixels) and resolve
+    /// it to a global screen point + the owning app (to raise before acting).
+    /// Throws a descriptive error for missing fields or a stale/unknown frame.
+    @MainActor
+    private func resolveFrame(_ b: [String: Any]) throws -> (point: CGPoint, owner: String?) {
+        guard let frameID = (b["frame_id"] as? String) ?? (b["frame"] as? String),
+              let ix = (b["x"] as? NSNumber)?.doubleValue,
+              let iy = (b["y"] as? NSNumber)?.doubleValue
+        else { throw SimpleError("expected {frame_id, x, y} (x/y in image pixels)") }
+        return try AgentCapture.resolveInFrame(frameID: frameID, imageX: ix, imageY: iy)
+    }
+
+    /// Minimal error so a missing-field message surfaces as the relay's JSON error.
+    private struct SimpleError: LocalizedError {
+        let message: String
+        init(_ m: String) { message = m }
+        var errorDescription: String? { message }
+    }
+
+    /// An input command returned false. CGEvent drops are silent, so re-derive
+    /// the most likely cause at failure time and report it — otherwise the agent
+    /// gets a bare "type failed" and can't tell a missing permission from a
+    /// not-running target from a target that wouldn't come to the front (the
+    /// last of which is how stray keystrokes used to land in the caller's own
+    /// terminal). `extra` appends a command-specific cause (e.g. unknown key).
+    private func inputFailure(_ verb: String, _ b: [String: Any], extra: String? = nil) -> [String: Any] {
+        let tail = extra.map { " (\($0))" } ?? ""
+        if !AXIsProcessTrusted() {
+            return ["error": "\(verb) failed: FloatyTerm needs Accessibility access — grant it under "
+                + "System Settings → Privacy & Security → Accessibility, then relaunch.\(tail)"]
+        }
+        if let t = target(b) {
+            let running = NSWorkspace.shared.runningApplications.contains {
+                $0.localizedName == t || $0.bundleIdentifier == t
+            }
+            return ["error": running
+                ? "\(verb) failed: couldn't bring \"\(t)\" to the front\(tail)."
+                : "\(verb) failed: target app \"\(t)\" isn't running\(tail)."]
+        }
+        return ["error": "\(verb) failed\(tail)."]
     }
 
 }

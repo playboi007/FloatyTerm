@@ -9,3 +9,6 @@ FloatyTerm.app/
 
 # macOS
 .DS_Store
+
+# Agent-host skill docs (in flux; not versioned yet)
+docs/floaty-ui-control/

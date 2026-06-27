@@ -28,6 +28,28 @@ final class DevtoolsRelay {
     /// only local processes can ask the app to open a diff.
     var onOpenDiff: ((URL, URL) -> Void)?
 
+    /// Agent-control routes (/agent/*). Each closure runs on the main actor,
+    /// drives AgentInput/AgentCapture/AgentDOM, and returns a dict the relay
+    /// serializes back to the `floaty` CLI as JSON (an "error" key → HTTP 400).
+    /// Loopback-only by construction — these synthesize input and read the
+    /// screen as the user, so they must never be reachable off-localhost.
+    var onAgentClick:    (([String: Any]) -> [String: Any])?
+    var onAgentMove:     (([String: Any]) -> [String: Any])?
+    var onAgentDrag:     (([String: Any]) -> [String: Any])?
+    var onAgentScroll:   (([String: Any]) -> [String: Any])?
+    var onAgentType:     (([String: Any]) -> [String: Any])?
+    var onAgentKey:      (([String: Any]) -> [String: Any])?
+    var onAgentCapture:  (([String: Any]) async -> [String: Any])?
+    var onAgentQueryDOM: (([String: Any]) async -> [String: Any])?
+    var onAgentEval:     (([String: Any]) async -> [String: Any])?
+    var onAgentNavigate: (([String: Any]) async -> [String: Any])?
+    var onAgentTabs:     (([String: Any]) async -> [String: Any])?
+    var onAgentFocus:    (([String: Any]) async -> [String: Any])?
+    var onAgentListWindows: (([String: Any]) -> [String: Any])?
+    var onAgentMark:     (([String: Any]) -> [String: Any])?
+    var onAgentClickInFrame: (([String: Any]) -> [String: Any])?
+    var onAgentMoveInFrame:  (([String: Any]) -> [String: Any])?
+
     private var listener: NWListener?
     private let queue = DispatchQueue(label: "floatyterm.devtools-relay")
     private let aggQueue = DispatchQueue(label: "floatyterm.aggregator")
@@ -102,6 +124,22 @@ final class DevtoolsRelay {
             return response(200, "text/plain", "ok")
         case ("POST", "/diff"):
             return handleDiff(Data(body.prefix(contentLength)))
+        case ("POST", "/agent/click"):     return agentSync(onAgentClick,    Data(body.prefix(contentLength)))
+        case ("POST", "/agent/move"):      return agentSync(onAgentMove,     Data(body.prefix(contentLength)))
+        case ("POST", "/agent/drag"):      return agentSync(onAgentDrag,     Data(body.prefix(contentLength)))
+        case ("POST", "/agent/scroll"):    return agentSync(onAgentScroll,   Data(body.prefix(contentLength)))
+        case ("POST", "/agent/type"):      return agentSync(onAgentType,     Data(body.prefix(contentLength)))
+        case ("POST", "/agent/key"):       return agentSync(onAgentKey,      Data(body.prefix(contentLength)))
+        case ("POST", "/agent/capture"):   return agentAsync(onAgentCapture, Data(body.prefix(contentLength)))
+        case ("POST", "/agent/query-dom"): return agentAsync(onAgentQueryDOM, Data(body.prefix(contentLength)))
+        case ("POST", "/agent/eval"):      return agentAsync(onAgentEval,     Data(body.prefix(contentLength)))
+        case ("POST", "/agent/navigate"):  return agentAsync(onAgentNavigate, Data(body.prefix(contentLength)))
+        case ("POST", "/agent/tabs"):      return agentAsync(onAgentTabs,     Data(body.prefix(contentLength)))
+        case ("POST", "/agent/focus"):     return agentAsync(onAgentFocus,    Data(body.prefix(contentLength)))
+        case ("POST", "/agent/list-windows"): return agentSync(onAgentListWindows, Data(body.prefix(contentLength)))
+        case ("POST", "/agent/mark"):      return agentSync(onAgentMark,     Data(body.prefix(contentLength)))
+        case ("POST", "/agent/click-in-frame"): return agentSync(onAgentClickInFrame, Data(body.prefix(contentLength)))
+        case ("POST", "/agent/move-in-frame"):  return agentSync(onAgentMoveInFrame,  Data(body.prefix(contentLength)))
         default:
             return response(404, "text/plain", "not found")
         }
@@ -123,6 +161,42 @@ final class DevtoolsRelay {
         let data = Data(body.utf8)
         head += "Content-Length: \(data.count)\r\nConnection: close\r\n\r\n"
         return Data(head.utf8) + data
+    }
+
+    // MARK: - Agent route bridges (/agent/*)
+    //
+    // Two generic bridges — sync for input commands, async for capture/query-dom
+    // (which await SCK / CDP). Both parse the JSON body, hop to the main actor,
+    // run the closure, and serialize the result, so each route above is one line.
+    // The DispatchSemaphore holds the relay's connection thread until the
+    // main-actor work finishes; that's intended (agent commands are serial) and
+    // can't deadlock, since the main thread never waits on the relay queue.
+
+    private func jsonResponse(_ obj: [String: Any], status: Int = 200) -> Data {
+        let data = (try? JSONSerialization.data(withJSONObject: obj)) ?? Data("{}".utf8)
+        return response(status, "application/json", String(decoding: data, as: UTF8.self))
+    }
+
+    private func parseBody(_ body: Data) -> [String: Any]? {
+        try? JSONSerialization.jsonObject(with: body) as? [String: Any]
+    }
+
+    private func agentSync(_ handler: (([String: Any]) -> [String: Any])?, _ body: Data) -> Data {
+        guard let obj = parseBody(body) else { return jsonResponse(["error": "invalid JSON body"], status: 400) }
+        var result: [String: Any] = ["error": "no handler"]
+        let sem = DispatchSemaphore(value: 0)
+        DispatchQueue.main.async { result = handler?(obj) ?? ["error": "no handler"]; sem.signal() }
+        sem.wait()
+        return jsonResponse(result, status: result["error"] == nil ? 200 : 400)
+    }
+
+    private func agentAsync(_ handler: (([String: Any]) async -> [String: Any])?, _ body: Data) -> Data {
+        guard let obj = parseBody(body) else { return jsonResponse(["error": "invalid JSON body"], status: 400) }
+        var result: [String: Any] = ["error": "no handler"]
+        let sem = DispatchSemaphore(value: 0)
+        Task { @MainActor in result = await handler?(obj) ?? ["error": "no handler"]; sem.signal() }
+        sem.wait()
+        return jsonResponse(result, status: result["error"] == nil ? 200 : 400)
     }
 
     // MARK: - Diff trigger (shell shim → diff tab)
