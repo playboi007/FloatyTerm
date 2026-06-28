@@ -26,8 +26,12 @@
 #   floaty scroll --dx 0 --dy 400 [--x 700 --y 400] [--human|--duration N] [--target App]
 #                 (pass --x/--y to put the cursor over the area to scroll — wheel
 #                  events go to whatever is UNDER the cursor, not the focused view)
-#   floaty type   --text "hello" [--human|--duration N] [--target Notes]
-#   floaty key    --key return [--modifiers cmd,shift] [--target Cursor]
+#   floaty type   --text "hello" [--human|--duration N] [--target Notes | --pid 8123]
+#   floaty key    --key return [--modifiers cmd,shift] [--target Cursor | --pid 8123]
+#                 (--pid pins input to ONE exact process — disambiguates two same-named
+#                  apps, e.g. two Chromes, where --target "Google Chrome" is a coin flip)
+#   floaty focused --app "Notes" | --pid 8123           # the focused element (role/value/editable):
+#                                                        # confirm a text cursor exists BEFORE typing
 #   floaty capture --window "Flutter" [--ocr]           # returns a capture FRAME (frame_id +
 #                                                        # origin/size/scale/image dims) + PNG
 #   floaty capture --window-id 12345 [--ocr]            # exact window from list-windows
@@ -35,14 +39,23 @@
 #                 (x/y are PIXELS in the captured PNG, as your vision model reads them;
 #                  FloatyTerm inverts to a screen point and clicks — no scale math, no re-capture)
 #   floaty move-in-frame  --frame cap_… --x <imgpx> --y <imgpx>   # same transform, hover only
-#   floaty list-windows [--filter Chrome]               # ids+titles+bounds you can target
+#   floaty list-windows [--filter Chrome]               # ids+PIDS+titles+bounds you can target
+#   floaty query-ax --app "Notes" [--role button] [--title Save] [--max 100] [--press]
+#   floaty query-ax --pid 8123 --title "Sign in" --press # AX tree by PID (disambiguates two Chromes,
+#                 # drives live default-profile Chrome with no debug port). --press = AXPress 1st match.
 #   floaty query-dom --selector "h3 a" [--port 9222] [--match youtube.com]  # ALL matches
 #   floaty eval     --expression "document.title" [--port 9222] [--match docs]  # run JS, get JSON
 #   floaty navigate --url "https://example.com" [--port 9222] [--match console.cloud]  # drive a tab
 #   floaty tabs     [--port 9222]                       # list open tabs (id/title/url) to pick --match
 #   floaty focus    --match youtube.com [--port 9222]   # raise that tab's window (then key/type land there)
+#   floaty som      [--port 9222] [--match …] [--max 100]   # Set-of-Mark (DOM): numbered boxes on a
+#                                                            # screenshot → PNG + frame_id + marks[]
+#   floaty som      --app "Notes"  [--max 100]              # Set-of-Mark (AX): same, for native apps
+#   floaty som      --pid 8123     [--max 100]              # & live Chrome (by PID, no debug port)
+#   floaty click-mark --frame som_… --id 5 [--clicks 2] [--human]  # click the element labeled 5
+#                                                            # (model picks a NUMBER, not a pixel)
 #
-# --match <substring> selects WHICH tab (url or title contains it) for eval/query-dom/navigate/focus;
+# --match <substring> selects WHICH tab (url or title contains it) for eval/query-dom/navigate/focus/som;
 # without it they use the first real page. Use `floaty tabs` to see what's open.
 #   floaty mark     --x 840 --y 412 [--duration 1.2] [--label "submit"]  # flash a crosshair to
 #                                                                        # verify a click target
@@ -55,7 +68,7 @@ set -euo pipefail
 HOST="127.0.0.1:7777"
 
 cmd="${1:-}"; shift || true
-[ -n "$cmd" ] || { echo "usage: floaty <click|move|drag|scroll|type|key|capture|query-dom|eval|navigate|tabs|focus|list-windows|mark|click-in-frame|move-in-frame> [--flag value ...]" >&2; exit 2; }
+[ -n "$cmd" ] || { echo "usage: floaty <click|move|drag|scroll|type|key|capture|query-dom|query-ax|focused|eval|navigate|tabs|focus|list-windows|mark|click-in-frame|move-in-frame|som|click-mark> [--flag value ...]" >&2; exit 2; }
 
 args=("$@")
 # Expand the array in a way that's safe when it's EMPTY under `set -u` on the
@@ -66,7 +79,7 @@ import sys, json
 cmd = sys.argv[1]; toks = sys.argv[2:]
 obj = {}; i = 0
 # numeric flags → numbers; --modifiers → array; bare flags (--human/--ocr) → true.
-NUM = {"x","y","port","clicks","dx","dy","duration","from_x","from_y","to_x","to_y","window_id"}
+NUM = {"x","y","port","clicks","dx","dy","duration","from_x","from_y","to_x","to_y","window_id","id","max","pid"}
 while i < len(toks):
     if not toks[i].startswith("--"): i += 1; continue
     key = toks[i][2:].replace("-", "_")
@@ -86,7 +99,9 @@ paths = {"click":"/agent/click","move":"/agent/move","drag":"/agent/drag",
          "eval":"/agent/eval","navigate":"/agent/navigate",
          "tabs":"/agent/tabs","focus":"/agent/focus",
          "list-windows":"/agent/list-windows","mark":"/agent/mark",
-         "click-in-frame":"/agent/click-in-frame","move-in-frame":"/agent/move-in-frame"}
+         "click-in-frame":"/agent/click-in-frame","move-in-frame":"/agent/move-in-frame",
+         "som":"/agent/som","click-mark":"/agent/click-mark",
+         "query-ax":"/agent/query-ax","focused":"/agent/focused"}
 print(json.dumps({"path": paths.get(cmd, "/agent/"+cmd), "body": obj}))
 PY
 )

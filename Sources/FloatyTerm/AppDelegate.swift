@@ -34,12 +34,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             guard let self, let p = self.point(b) else { return ["error": "expected {x,y}"] }
             let clicks = (b["clicks"] as? NSNumber)?.intValue ?? 1
             let ok = AgentInput.click(at: p, button: self.button(b), modifiers: self.mods(b),
-                                      clicks: clicks, pacing: self.pacing(b), target: self.target(b))
+                                      clicks: clicks, pacing: self.pacing(b),
+                                      target: self.target(b), targetPID: self.targetPID(b))
             return ok ? ["ok": true] : self.inputFailure("click", b)
         }
         DevtoolsRelay.shared.onAgentMove = { [weak self] b in
             guard let self, let p = self.point(b) else { return ["error": "expected {x,y}"] }
-            let ok = AgentInput.move(to: p, pacing: self.pacing(b), target: self.target(b))
+            let ok = AgentInput.move(to: p, pacing: self.pacing(b),
+                                     target: self.target(b), targetPID: self.targetPID(b))
             return ok ? ["ok": true] : self.inputFailure("move", b)
         }
         DevtoolsRelay.shared.onAgentDrag = { [weak self] b in
@@ -51,7 +53,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             else { return ["error": "expected {from_x,from_y,to_x,to_y}"] }
             let ok = AgentInput.drag(from: CGPoint(x: fx, y: fy), to: CGPoint(x: tx, y: ty),
                                      button: self.button(b), modifiers: self.mods(b),
-                                     pacing: self.pacing(b), target: self.target(b))
+                                     pacing: self.pacing(b), target: self.target(b),
+                                     targetPID: self.targetPID(b))
             return ok ? ["ok": true] : self.inputFailure("drag", b)
         }
         DevtoolsRelay.shared.onAgentScroll = { [weak self] b in
@@ -59,12 +62,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             let dx = (b["dx"] as? NSNumber)?.intValue ?? 0
             let dy = (b["dy"] as? NSNumber)?.intValue ?? 0
             let ok = AgentInput.scroll(dx: dx, dy: dy, at: self.point(b),
-                                       pacing: self.pacing(b), target: self.target(b))
+                                       pacing: self.pacing(b), target: self.target(b),
+                                       targetPID: self.targetPID(b))
             return ok ? ["ok": true] : self.inputFailure("scroll", b)
         }
         DevtoolsRelay.shared.onAgentType = { [weak self] b in
             guard let self, let text = b["text"] as? String else { return ["error": "expected {text}"] }
-            let ok = AgentInput.type(text, pacing: self.pacing(b), target: self.target(b))
+            let ok = AgentInput.type(text, pacing: self.pacing(b),
+                                     target: self.target(b), targetPID: self.targetPID(b))
             return ok ? ["ok": true, "typed": text.count] : self.inputFailure("type", b)
         }
         DevtoolsRelay.shared.onAgentKey = { [weak self] b in
@@ -77,7 +82,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     + "named key (return, tab, space, delete, escape, left/right/up/down, home, end, "
                     + "pgup, pgdown). For arbitrary text use `type`, not `key`."]
             }
-            let ok = AgentInput.pressKey(key, modifiers: self.mods(b), target: self.target(b))
+            let ok = AgentInput.pressKey(key, modifiers: self.mods(b),
+                                         target: self.target(b), targetPID: self.targetPID(b))
             return ok ? ["ok": true, "key": key] : self.inputFailure("key", b)
         }
         DevtoolsRelay.shared.onAgentCapture = { b in
@@ -143,7 +149,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     || $0.title.lowercased().contains(filter!) }
                 .sorted { $0.bounds.width * $0.bounds.height > $1.bounds.width * $1.bounds.height }
                 .map { w -> [String: Any] in
-                    ["id": Int(w.id), "owner": w.owner, "title": w.title,
+                    ["id": Int(w.id), "pid": Int(w.pid), "owner": w.owner, "title": w.title,
                      "x": w.bounds.origin.x, "y": w.bounds.origin.y,
                      "width": w.bounds.width, "height": w.bounds.height]
                 }
@@ -205,6 +211,238 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 try await AgentDOM.bringToFront(port: port, match: match)
                 return ["ok": true]
             } catch { return ["error": error.localizedDescription] }
+        }
+        // Set-of-Mark: annotate the page's interactable elements with numbered
+        // boxes (drawn in-page, screenshotted, then stripped) and return the PNG
+        // + a mark table in SCREEN coords. The model reads a NUMBER off the image
+        // instead of regressing a pixel; `click-mark --id N` resolves N → a click.
+        DevtoolsRelay.shared.onAgentSom = { b in
+            let maxMarks = (b["max"] as? NSNumber)?.intValue ?? 100
+            let app = b["app"] as? String
+            let axPID = (b["pid"] as? NSNumber).map { pid_t($0.intValue) }
+
+            // AX-backed Set-of-Mark: read the target app's tree (by PID — works on
+            // native apps AND the live default-profile Chrome), screenshot its
+            // window, and draw the numbered boxes ourselves (native elements can't
+            // inject their own overlay like the DOM path does).
+            if app != nil || axPID != nil {
+                do {
+                    let pid = try AgentAX.resolvePID(app: app, pid: axPID)
+                    guard let win = AgentCapture.listWindows()
+                            .filter({ $0.pid == pid })
+                            .max(by: { $0.area < $1.area }) else {
+                        return ["error": "no on-screen window for that app/pid (is it visible, not minimized?)"]
+                    }
+                    let shot = try await AgentCapture.rawCapture(windowID: win.id, fallbackName: app)
+                    // Query generously, then keep only this window's elements.
+                    let (matches, _) = try await AgentAX.query(app: nil, pid: pid, role: nil,
+                                                               title: nil, max: 500, press: false)
+                    let winRect = CGRect(origin: shot.origin, size: shot.size)
+                    let pppX = Double(shot.image.width) / Double(max(shot.size.width, 1))
+                    let pppY = Double(shot.image.height) / Double(max(shot.size.height, 1))
+                    var stored: [AgentCapture.Mark] = []
+                    var boxes: [(label: Int, rect: CGRect)] = []
+                    var marksOut: [[String: Any]] = []
+                    for m in matches {
+                        guard winRect.contains(m.center) else { continue }   // this window's elements only
+                        let id = stored.count + 1
+                        let ir = CGRect(x: (m.rect.origin.x - shot.origin.x) * pppX,
+                                        y: (m.rect.origin.y - shot.origin.y) * pppY,
+                                        width: m.rect.size.width * pppX, height: m.rect.size.height * pppY)
+                        boxes.append((label: id, rect: ir))
+                        stored.append(AgentCapture.Mark(id: id, role: m.role, name: m.name,
+                                                        rect: m.rect, center: m.center))
+                        marksOut.append(["id": id, "role": m.role, "name": m.name,
+                                         "x": m.rect.origin.x, "y": m.rect.origin.y,
+                                         "width": m.rect.size.width, "height": m.rect.size.height,
+                                         "center_x": m.center.x, "center_y": m.center.y])
+                        if stored.count >= maxMarks { break }
+                    }
+                    let annotated = AgentCapture.annotate(image: shot.image, boxes: boxes) ?? shot.image
+                    guard let url = ContextSnap.saveImage(annotated) else {
+                        return ["error": "som: could not save the annotated screenshot"]
+                    }
+                    let fid = AgentCapture.nextMarkFrameID()
+                    AgentCapture.rememberMarks(AgentCapture.MarkFrame(
+                        id: fid, source: "ax", marks: stored, capturedAt: Date(),
+                        pid: pid, owner: shot.owner, windowID: win.id, windowBounds: winRect))
+                    var out: [String: Any] = [
+                        "ok": true, "source": "ax", "path": url.path, "frame_id": fid,
+                        "count": marksOut.count, "image_width": annotated.width,
+                        "image_height": annotated.height, "marks": marksOut,
+                    ]
+                    if marksOut.count >= maxMarks {
+                        out["truncated"] = true
+                        out["note"] = "capped at \(maxMarks) marks; pass --max to raise"
+                    }
+                    return out
+                } catch { return ["error": error.localizedDescription] }
+            }
+
+            // CDP-backed Set-of-Mark (DOM apps): the page draws its own overlay.
+            let port = UInt16((b["port"] as? NSNumber)?.intValue ?? 9222)
+            let match = b["match"] as? String
+            do {
+                let r = try await AgentDOM.setOfMarks(port: port, match: match, max: maxMarks)
+                // Decode + save the annotated PNG through ContextSnap so it joins
+                // snap history and pruning, like a normal capture.
+                guard let data = Data(base64Encoded: r.pngBase64),
+                      let rep = NSBitmapImageRep(data: data),
+                      let img = rep.cgImage,
+                      let url = ContextSnap.saveImage(img)
+                else { return ["error": "som: could not save the annotated screenshot"] }
+
+                // Assign 1-based ids (matching the drawn labels), store the frame,
+                // and emit the table the model reads beside the image.
+                var stored: [AgentCapture.Mark] = []
+                var marksOut: [[String: Any]] = []
+                for (i, m) in r.marks.enumerated() {
+                    let id = i + 1
+                    stored.append(AgentCapture.Mark(id: id, role: m.role, name: m.name,
+                                                    rect: m.rect, center: m.center))
+                    marksOut.append(["id": id, "role": m.role, "name": m.name,
+                                     "x": m.rect.origin.x, "y": m.rect.origin.y,
+                                     "width": m.rect.size.width, "height": m.rect.size.height,
+                                     "center_x": m.center.x, "center_y": m.center.y])
+                }
+                let fid = AgentCapture.nextMarkFrameID()
+                AgentCapture.rememberMarks(AgentCapture.MarkFrame(
+                    id: fid, source: "cdp", marks: stored, capturedAt: Date(),
+                    port: port, match: match, url: r.url,
+                    screenX: r.screenX, screenY: r.screenY,
+                    scrollX: r.scrollX, scrollY: r.scrollY))
+
+                var out: [String: Any] = [
+                    "ok": true, "source": "cdp", "path": url.path, "frame_id": fid, "count": marksOut.count,
+                    "image_width": img.width, "image_height": img.height, "marks": marksOut,
+                ]
+                if marksOut.count >= maxMarks {
+                    out["truncated"] = true
+                    out["note"] = "capped at \(maxMarks) marks; pass --max to raise"
+                }
+                return out
+            } catch { return ["error": error.localizedDescription] }
+        }
+        // query-ax: read a target app's Accessibility tree (the native analog of
+        // query-dom) by PID — so it disambiguates two same-named Chromes and
+        // drives the live default-profile Chrome that Chrome 136+ won't expose
+        // over CDP. AXPosition/AXSize are already global screen points. With
+        // --press it AXPress-es the first match: a targeted activation that
+        // ignores which window is frontmost.
+        DevtoolsRelay.shared.onAgentQueryAX = { b in
+            let app = b["app"] as? String
+            let pid = (b["pid"] as? NSNumber).map { pid_t($0.intValue) }
+            guard app != nil || pid != nil else {
+                return ["error": "expected {app} or {pid} (see `floaty list-windows` for pids)"]
+            }
+            let role = b["role"] as? String
+            let title = (b["title"] as? String) ?? (b["name"] as? String)
+            let maxN = (b["max"] as? NSNumber)?.intValue ?? 100
+            let press = (b["press"] as? NSNumber)?.boolValue ?? false
+            do {
+                let (matches, pressed) = try await AgentAX.query(
+                    app: app, pid: pid, role: role, title: title, max: maxN, press: press)
+                let arr: [[String: Any]] = matches.map { m in
+                    ["role": m.role, "name": m.name,
+                     "x": m.rect.origin.x, "y": m.rect.origin.y,
+                     "width": m.rect.size.width, "height": m.rect.size.height,
+                     "center_x": m.center.x, "center_y": m.center.y]
+                }
+                var out: [String: Any] = ["ok": true, "count": arr.count, "matches": arr]
+                if let f = matches.first {   // mirror first match (parity with query-dom)
+                    out["x"] = f.rect.origin.x; out["y"] = f.rect.origin.y
+                    out["width"] = f.rect.size.width; out["height"] = f.rect.size.height
+                    out["center_x"] = f.center.x; out["center_y"] = f.center.y
+                }
+                if let pressed {
+                    out["pressed"] = ["role": pressed.role, "name": pressed.name,
+                                      "center_x": pressed.center.x, "center_y": pressed.center.y]
+                }
+                return out
+            } catch { return ["error": error.localizedDescription] }
+        }
+        // focused: report the target app's focused element (AXFocusedUIElement)
+        // so the agent can confirm a text cursor exists before typing — the
+        // click → focused check → type pattern, instead of click-and-pray.
+        DevtoolsRelay.shared.onAgentFocused = { b in
+            let app = b["app"] as? String
+            let pid = (b["pid"] as? NSNumber).map { pid_t($0.intValue) }
+            guard app != nil || pid != nil else {
+                return ["error": "expected {app} or {pid} (see `floaty list-windows` for pids)"]
+            }
+            do {
+                let f = try AgentAX.focused(app: app, pid: pid)
+                return ["ok": true, "has_focus": f.hasFocus, "role": f.role,
+                        "name": f.name, "value": f.value, "editable": f.editable]
+            } catch { return ["error": error.localizedDescription] }
+        }
+        // click-mark: the model picked a NUMBER off the som screenshot; resolve it
+        // to the stored screen center and click. Refuses (no silent misclick) if
+        // the page navigated/scrolled/moved since the marks were captured.
+        DevtoolsRelay.shared.onAgentClickMark = { [weak self] b in
+            guard let self else { return ["error": "no self"] }
+            guard let fid = (b["frame_id"] as? String) ?? (b["frame"] as? String),
+                  let id = (b["id"] as? NSNumber)?.intValue
+            else { return ["error": "expected {frame_id, id} (id is a mark number from `floaty som`)"] }
+            guard let frame = AgentCapture.markFrame(id: fid) else {
+                return ["error": "unknown or expired frame_id; re-run `floaty som`"]
+            }
+            guard let mark = frame.marks.first(where: { $0.id == id }) else {
+                return ["error": "no mark #\(id) in this frame (it has \(frame.marks.count); ids 1–\(frame.marks.count))"]
+            }
+
+            // AX-backed frame: validate the window hasn't moved/resized/closed
+            // (the native analog of the capture-frame guard), raise that exact
+            // PROCESS (pid-precise → no two-Chrome ambiguity), then click.
+            if frame.source == "ax" {
+                guard let cur = AgentCapture.listWindows().first(where: { $0.id == frame.windowID }) else {
+                    return ["error": "the window closed since `floaty som`; re-run `floaty som`"]
+                }
+                let tol: CGFloat = 4
+                if abs(cur.bounds.origin.x - frame.windowBounds.origin.x) > tol
+                    || abs(cur.bounds.origin.y - frame.windowBounds.origin.y) > tol
+                    || abs(cur.bounds.size.width - frame.windowBounds.size.width) > tol
+                    || abs(cur.bounds.size.height - frame.windowBounds.size.height) > tol {
+                    return ["error": "the window moved or resized since `floaty som`; re-run `floaty som`"]
+                }
+                // Raise that EXACT process (pid-precise → no two-Chrome ambiguity)
+                // via the full cooperative-activation path, then click its center.
+                let clicks = (b["clicks"] as? NSNumber)?.intValue ?? 1
+                let ok = AgentInput.click(at: mark.center, button: self.button(b), modifiers: self.mods(b),
+                                          clicks: clicks, pacing: self.pacing(b),
+                                          target: nil, targetPID: frame.pid != 0 ? frame.pid : nil)
+                return ok ? ["ok": true, "id": id, "screen_x": mark.center.x, "screen_y": mark.center.y,
+                             "role": mark.role, "name": mark.name]
+                          : self.inputFailure("click-mark", b)
+            }
+
+            // CDP-backed frame.
+            // Staleness guard: one eval re-reading the page's window origin, scroll,
+            // and url — any drift means the stored screen coords are wrong now.
+            do {
+                // Return a plain object — runJavaScript re-serializes the value,
+                // so JSON.stringify here would double-encode to a String and the
+                // [String:Any] cast below would silently fail (skipping the guard).
+                let probe = "({sx:window.screenX,sy:window.screenY,scx:window.scrollX,scy:window.scrollY,url:location.href})"
+                if let json = try await AgentDOM.runJavaScript(expression: probe, port: frame.port, match: frame.match),
+                   let st = try? JSONSerialization.jsonObject(with: Data(json.utf8)) as? [String: Any] {
+                    func d(_ k: String) -> Double { (st[k] as? NSNumber)?.doubleValue ?? .nan }
+                    let tol = 2.0
+                    if (st["url"] as? String) != frame.url
+                        || abs(d("sx") - frame.screenX) > tol || abs(d("sy") - frame.screenY) > tol
+                        || abs(d("scx") - frame.scrollX) > tol || abs(d("scy") - frame.scrollY) > tol {
+                        return ["error": "page changed since `floaty som` (navigated, scrolled, or window moved); re-run `floaty som`"]
+                    }
+                }
+            } catch { return ["error": "click-mark: \(error.localizedDescription)"] }
+            // Raise the tab's window so the screen-point click lands on it.
+            try? await AgentDOM.bringToFront(port: frame.port, match: frame.match)
+            let clicks = (b["clicks"] as? NSNumber)?.intValue ?? 1
+            let ok = AgentInput.click(at: mark.center, button: self.button(b), modifiers: self.mods(b),
+                                      clicks: clicks, pacing: self.pacing(b), target: self.target(b))
+            return ok ? ["ok": true, "id": id, "screen_x": mark.center.x, "screen_y": mark.center.y,
+                         "role": mark.role, "name": mark.name]
+                      : self.inputFailure("click-mark", b)
         }
 
         // Keep per-feature data (Devtools logs, Browser Context captures,
@@ -801,6 +1039,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         (b["modifiers"] as? [Any])?.compactMap { $0 as? String } ?? []
     }
     private func target(_ b: [String: Any]) -> String? { b["target"] as? String }
+    /// PID target (wins over `--target` name): pins input to one exact process,
+    /// so keystrokes can't land in the wrong same-named app (two Chromes).
+    private func targetPID(_ b: [String: Any]) -> pid_t? {
+        (b["pid"] as? NSNumber).map { pid_t($0.intValue) }
+    }
 
     /// Parse a frame body ({frame_id|frame, x, y} in image pixels) and resolve
     /// it to a global screen point + the owning app (to raise before acting).
@@ -832,6 +1075,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if !AXIsProcessTrusted() {
             return ["error": "\(verb) failed: FloatyTerm needs Accessibility access — grant it under "
                 + "System Settings → Privacy & Security → Accessibility, then relaunch.\(tail)"]
+        }
+        if let pid = targetPID(b) {
+            let running = NSRunningApplication(processIdentifier: pid) != nil
+            return ["error": running
+                ? "\(verb) failed: couldn't bring pid \(pid) to the front\(tail)."
+                : "\(verb) failed: no running process with pid \(pid)\(tail)."]
         }
         if let t = target(b) {
             let running = NSWorkspace.shared.runningApplications.contains {

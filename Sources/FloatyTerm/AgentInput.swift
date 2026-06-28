@@ -102,15 +102,30 @@ enum AgentInput {
     // MARK: - Target activation
 
     @discardableResult
-    static func activate(_ identifier: String?) -> Bool {
-        guard let identifier else { return true }
-        let match = NSWorkspace.shared.runningApplications.first {
-            $0.localizedName == identifier || $0.bundleIdentifier == identifier
+    static func activate(_ identifier: String?, pid: pid_t? = nil) -> Bool {
+        // Resolve the target process. A PID wins: it disambiguates two apps that
+        // share a name (the two-Chrome problem) and pins keystrokes to that exact
+        // instance — the fix for "type went to the wrong Chrome." Otherwise match
+        // a running app by localized name / bundle id.
+        let app: NSRunningApplication
+        if let pid {
+            guard let a = NSRunningApplication(processIdentifier: pid) else {
+                NSLog("FloatyTerm: agent target pid \(pid) not running")
+                return false
+            }
+            app = a
+        } else if let identifier {
+            guard let a = (NSWorkspace.shared.runningApplications.first {
+                $0.localizedName == identifier || $0.bundleIdentifier == identifier
+            }) else {
+                NSLog("FloatyTerm: agent target not running: \(identifier)")
+                return false
+            }
+            app = a
+        } else {
+            return true   // no target → inject into whatever is frontmost
         }
-        guard let app = match else {
-            NSLog("FloatyTerm: agent target not running: \(identifier)")
-            return false
-        }
+        let label = identifier ?? "pid \(app.processIdentifier)"
 
         // macOS 14 made activation COOPERATIVE: .activateIgnoringOtherApps is a
         // no-op, so a background/accessory app (which FloatyTerm is) can no
@@ -140,7 +155,7 @@ enum AgentInput {
         let deadline = Date().addingTimeInterval(2.0)
         while NSWorkspace.shared.frontmostApplication?.processIdentifier != app.processIdentifier {
             if Date() >= deadline {
-                NSLog("FloatyTerm: target \(identifier) did not come to front")
+                NSLog("FloatyTerm: target \(label) did not come to front")
                 return false
             }
             RunLoop.current.run(mode: .default, before: Date().addingTimeInterval(0.02))
@@ -188,8 +203,8 @@ enum AgentInput {
 
     // MARK: - Mouse: move
 
-    static func move(to point: CGPoint, pacing: Pacing = .instant, target: String? = nil) -> Bool {
-        guard ensureAccessibility(), activate(target) else { return false }
+    static func move(to point: CGPoint, pacing: Pacing = .instant, target: String? = nil, targetPID: pid_t? = nil) -> Bool {
+        guard ensureAccessibility(), activate(target, pid: targetPID) else { return false }
         interpolatedMove(from: currentMouse(), to: point, pacing: pacing, dragging: nil, modifiers: [])
         return true
     }
@@ -230,8 +245,8 @@ enum AgentInput {
 
     static func click(at point: CGPoint, button: MouseButton = .left,
                       modifiers: [String] = [], clicks: Int = 1,
-                      pacing: Pacing = .instant, target: String? = nil) -> Bool {
-        guard ensureAccessibility(), activate(target) else { return false }
+                      pacing: Pacing = .instant, target: String? = nil, targetPID: pid_t? = nil) -> Bool {
+        guard ensureAccessibility(), activate(target, pid: targetPID) else { return false }
         if pacing.isHuman {
             interpolatedMove(from: currentMouse(), to: point, pacing: pacing, dragging: nil, modifiers: [])
         }
@@ -258,8 +273,8 @@ enum AgentInput {
     // MARK: - Mouse: down / up (compose custom gestures)
 
     static func mouseDown(at point: CGPoint, button: MouseButton = .left,
-                          modifiers: [String] = [], target: String? = nil) -> Bool {
-        guard ensureAccessibility(), activate(target) else { return false }
+                          modifiers: [String] = [], target: String? = nil, targetPID: pid_t? = nil) -> Bool {
+        guard ensureAccessibility(), activate(target, pid: targetPID) else { return false }
         let e = CGEvent(mouseEventSource: CGEventSource(stateID: .hidSystemState),
                         mouseType: button.downType, mouseCursorPosition: point, mouseButton: button.cg)
         e?.flags = flags(from: modifiers)
@@ -268,8 +283,8 @@ enum AgentInput {
     }
 
     static func mouseUp(at point: CGPoint, button: MouseButton = .left,
-                        modifiers: [String] = [], target: String? = nil) -> Bool {
-        guard ensureAccessibility(), activate(target) else { return false }
+                        modifiers: [String] = [], target: String? = nil, targetPID: pid_t? = nil) -> Bool {
+        guard ensureAccessibility(), activate(target, pid: targetPID) else { return false }
         let e = CGEvent(mouseEventSource: CGEventSource(stateID: .hidSystemState),
                         mouseType: button.upType, mouseCursorPosition: point, mouseButton: button.cg)
         e?.flags = flags(from: modifiers)
@@ -280,8 +295,8 @@ enum AgentInput {
     // MARK: - Mouse: drag
 
     static func drag(from: CGPoint, to: CGPoint, button: MouseButton = .left,
-                     modifiers: [String] = [], pacing: Pacing = .instant, target: String? = nil) -> Bool {
-        guard ensureAccessibility(), activate(target) else { return false }
+                     modifiers: [String] = [], pacing: Pacing = .instant, target: String? = nil, targetPID: pid_t? = nil) -> Bool {
+        guard ensureAccessibility(), activate(target, pid: targetPID) else { return false }
         let src = CGEventSource(stateID: .hidSystemState)
         let f = flags(from: modifiers)
         let down = CGEvent(mouseEventSource: src, mouseType: button.downType,
@@ -312,8 +327,8 @@ enum AgentInput {
     /// over the area you want to scroll first; it makes scrolling reliable
     /// without needing a focusing click.
     static func scroll(dx: Int, dy: Int, at point: CGPoint? = nil,
-                       pacing: Pacing = .instant, target: String? = nil) -> Bool {
-        guard ensureAccessibility(), activate(target) else { return false }
+                       pacing: Pacing = .instant, target: String? = nil, targetPID: pid_t? = nil) -> Bool {
+        guard ensureAccessibility(), activate(target, pid: targetPID) else { return false }
         let src = CGEventSource(stateID: .hidSystemState)
         if let point {
             CGEvent(mouseEventSource: src, mouseType: .mouseMoved,
@@ -341,8 +356,8 @@ enum AgentInput {
 
     // MARK: - Text (layout-independent, optionally human-paced)
 
-    static func type(_ text: String, pacing: Pacing = .instant, target: String? = nil) -> Bool {
-        guard ensureAccessibility(), activate(target) else { return false }
+    static func type(_ text: String, pacing: Pacing = .instant, target: String? = nil, targetPID: pid_t? = nil) -> Bool {
+        guard ensureAccessibility(), activate(target, pid: targetPID) else { return false }
         let src = CGEventSource(stateID: .hidSystemState)
         for scalar in text.unicodeScalars {
             postUnicode(String(scalar), source: src)
@@ -366,8 +381,8 @@ enum AgentInput {
 
     // MARK: - Named keys & chords (keycode-based)
 
-    static func pressKey(_ name: String, modifiers: [String] = [], target: String? = nil) -> Bool {
-        guard ensureAccessibility(), activate(target) else { return false }
+    static func pressKey(_ name: String, modifiers: [String] = [], target: String? = nil, targetPID: pid_t? = nil) -> Bool {
+        guard ensureAccessibility(), activate(target, pid: targetPID) else { return false }
         guard let code = keycode(for: name) else {
             NSLog("FloatyTerm: unknown key \(name)")
             return false

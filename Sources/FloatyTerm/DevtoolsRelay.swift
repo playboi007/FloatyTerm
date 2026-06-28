@@ -49,6 +49,10 @@ final class DevtoolsRelay {
     var onAgentMark:     (([String: Any]) -> [String: Any])?
     var onAgentClickInFrame: (([String: Any]) -> [String: Any])?
     var onAgentMoveInFrame:  (([String: Any]) -> [String: Any])?
+    var onAgentSom:       (([String: Any]) async -> [String: Any])?
+    var onAgentClickMark: (([String: Any]) async -> [String: Any])?
+    var onAgentQueryAX:   (([String: Any]) async -> [String: Any])?
+    var onAgentFocused:   (([String: Any]) async -> [String: Any])?
 
     private var listener: NWListener?
     private let queue = DispatchQueue(label: "floatyterm.devtools-relay")
@@ -140,6 +144,10 @@ final class DevtoolsRelay {
         case ("POST", "/agent/mark"):      return agentSync(onAgentMark,     Data(body.prefix(contentLength)))
         case ("POST", "/agent/click-in-frame"): return agentSync(onAgentClickInFrame, Data(body.prefix(contentLength)))
         case ("POST", "/agent/move-in-frame"):  return agentSync(onAgentMoveInFrame,  Data(body.prefix(contentLength)))
+        case ("POST", "/agent/som"):        return agentAsync(onAgentSom,       Data(body.prefix(contentLength)))
+        case ("POST", "/agent/click-mark"): return agentAsync(onAgentClickMark, Data(body.prefix(contentLength)))
+        case ("POST", "/agent/query-ax"):   return agentAsync(onAgentQueryAX,   Data(body.prefix(contentLength)))
+        case ("POST", "/agent/focused"):    return agentAsync(onAgentFocused,   Data(body.prefix(contentLength)))
         default:
             return response(404, "text/plain", "not found")
         }

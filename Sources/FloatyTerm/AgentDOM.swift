@@ -175,6 +175,134 @@ enum AgentDOM {
         }
     }
 
+    // MARK: - Set-of-Mark (annotate interactable elements with numbered boxes)
+
+    /// One annotated element: its screen rect/center (so a later `click-mark`
+    /// can act without the model emitting a coordinate) plus role + name so the
+    /// agent can read the table alongside the image. Sendable to cross the
+    /// timeout task-group boundary, like `Match`.
+    struct SoMMark: Sendable {
+        let role: String
+        let name: String
+        let rect: CGRect
+        let center: CGPoint
+    }
+
+    /// The raw result of one set-of-mark pass: the annotated PNG (base64, decoded
+    /// + saved by the caller on the main actor), the mark table in SCREEN space,
+    /// and the page state used to invalidate the marks if the page later moves /
+    /// scrolls / navigates (`click-mark`'s staleness guard).
+    struct SoMResult: Sendable {
+        let pngBase64: String
+        let marks: [SoMMark]
+        let url: String
+        let screenX: Double
+        let screenY: Double
+        let scrollX: Double
+        let scrollY: Double
+    }
+
+    /// Set-of-Mark prompting, DOM-backed. Draws a numbered box over each visible
+    /// interactable element, screenshots the page WITH the overlay, then strips
+    /// the overlay — so the model picks a NUMBER off the image instead of
+    /// regressing a pixel. Element rects come from the same approach-5b CSS→screen
+    /// transform `screenRects` uses, so a mark's stored center is click-accurate.
+    /// (The native analog is the AX tree; this is the Chrome/Electron path.)
+    static func setOfMarks(port: UInt16, match: String? = nil, max: Int = 100) async throws -> SoMResult {
+        try await withTimeout(20) {
+            try await withSession(port: port, match: match) { ws -> SoMResult in
+                // 1. Inject the overlay + collect element geometry. awaitPromise:
+                //    the script resolves after a double rAF, so the boxes are
+                //    actually painted before we screenshot.
+                guard let json = try await rawEval(ws, expression: somInjectJS(max: max),
+                                                   awaitPromise: true) as? String,
+                      let m = try? JSONSerialization.jsonObject(with: Data(json.utf8)) as? [String: Any]
+                else { throw DOMError.cdpError("set-of-mark: could not collect elements") }
+
+                // 2. Screenshot the page with the marks visible.
+                let shot = try await call(ws, method: "Page.captureScreenshot",
+                                          params: ["format": "png", "captureBeyondViewport": false])
+                let b64 = (shot["data"] as? String) ?? ""
+
+                // 3. Remove the overlay — best effort, never fail over cleanup.
+                _ = try? await rawEval(ws, expression:
+                    "(function(){var e=document.getElementById('__floaty_som__');if(e)e.remove();return 1;})()")
+
+                guard !b64.isEmpty else { throw DOMError.cdpError("set-of-mark: no screenshot data") }
+
+                func d(_ dict: [String: Any], _ k: String) -> Double { (dict[k] as? NSNumber)?.doubleValue ?? 0 }
+                // Compose screen coords exactly like screenRects (CSS px == screen px).
+                let chrome = d(m, "outerHeight") - d(m, "innerHeight")
+                let sx = d(m, "screenX"), sy = d(m, "screenY")
+                let marks: [SoMMark] = ((m["marks"] as? [[String: Any]]) ?? []).map { e in
+                    let rw = d(e, "w"), rh = d(e, "h")
+                    let ox = sx + d(e, "x"), oy = sy + chrome + d(e, "y")
+                    return SoMMark(role: (e["role"] as? String) ?? "",
+                                   name: (e["name"] as? String) ?? "",
+                                   rect: CGRect(x: ox, y: oy, width: rw, height: rh),
+                                   center: CGPoint(x: ox + rw / 2, y: oy + rh / 2))
+                }
+                return SoMResult(pngBase64: b64, marks: marks,
+                                 url: (m["url"] as? String) ?? "",
+                                 screenX: sx, screenY: sy,
+                                 scrollX: d(m, "scrollX"), scrollY: d(m, "scrollY"))
+            }
+        }
+    }
+
+    /// JS run in the page: find visible interactable elements, draw a numbered
+    /// box over each (a single removable overlay container), and return the mark
+    /// table + window/scroll state. Resolves after a double rAF so the screenshot
+    /// catches the painted boxes. `\\s` is a JS regex escape, not Swift.
+    private static func somInjectJS(max: Int) -> String {
+        """
+        (function(){
+          var MAX=\(max);
+          var old=document.getElementById('__floaty_som__'); if(old) old.remove();
+          var sel='a[href],button,input:not([type=hidden]):not([disabled]),select,textarea,'+
+            '[role=button],[role=link],[role=textbox],[role=checkbox],[role=radio],[role=tab],'+
+            '[role=menuitem],[role=switch],[contenteditable=""],[contenteditable=true],[onclick],'+
+            'summary,[tabindex]:not([tabindex="-1"])';
+          var nodes=Array.prototype.slice.call(document.querySelectorAll(sel));
+          var vw=window.innerWidth, vh=window.innerHeight;
+          function vis(el){
+            var r=el.getBoundingClientRect();
+            if(r.width<5||r.height<5) return null;
+            if(r.bottom<=0||r.right<=0||r.top>=vh||r.left>=vw) return null;
+            var s=getComputedStyle(el);
+            if(s.visibility==='hidden'||s.display==='none'||parseFloat(s.opacity||'1')===0) return null;
+            return r;
+          }
+          var marks=[], seen=[];
+          for(var i=0;i<nodes.length;i++){
+            var el=nodes[i], r=vis(el); if(!r) continue;
+            var dup=false;
+            for(var j=0;j<seen.length;j++){var q=seen[j];
+              if(Math.abs(q.left-r.left)<2&&Math.abs(q.top-r.top)<2&&Math.abs(q.width-r.width)<2&&Math.abs(q.height-r.height)<2){dup=true;break;}}
+            if(dup) continue; seen.push(r);
+            var role=el.getAttribute('role')||el.tagName.toLowerCase();
+            var name=(el.getAttribute('aria-label')||el.innerText||el.value||el.placeholder||el.getAttribute('title')||el.getAttribute('name')||'').replace(/\\s+/g,' ').trim().slice(0,80);
+            marks.push({x:r.left,y:r.top,w:r.width,h:r.height,role:role,name:name});
+            if(marks.length>=MAX) break;
+          }
+          var box=document.createElement('div'); box.id='__floaty_som__';
+          box.style.cssText='position:fixed;left:0;top:0;z-index:2147483647;pointer-events:none;';
+          var pal=['#e6194B','#3cb44b','#4363d8','#f58231','#911eb4','#42d4f4','#f032e6','#469990','#9A6324','#800000'];
+          for(var k=0;k<marks.length;k++){
+            var mm=marks[k], c=pal[k%pal.length];
+            var b=document.createElement('div');
+            b.style.cssText='position:fixed;left:'+mm.x+'px;top:'+mm.y+'px;width:'+mm.w+'px;height:'+mm.h+'px;border:2px solid '+c+';box-sizing:border-box;pointer-events:none;';
+            var lab=document.createElement('div'); lab.textContent=String(k+1);
+            lab.style.cssText='position:fixed;left:'+mm.x+'px;top:'+Math.max(0,mm.y-14)+'px;background:'+c+';color:#fff;font:bold 11px/14px monospace;padding:0 3px;pointer-events:none;white-space:nowrap;';
+            box.appendChild(b); box.appendChild(lab);
+          }
+          document.documentElement.appendChild(box);
+          var payload=JSON.stringify({marks:marks,screenX:window.screenX,screenY:window.screenY,outerHeight:window.outerHeight,innerHeight:window.innerHeight,scrollX:window.scrollX,scrollY:window.scrollY,url:location.href});
+          return new Promise(function(res){requestAnimationFrame(function(){requestAnimationFrame(function(){res(payload);});});});
+        })()
+        """
+    }
+
     // MARK: - CDP plumbing (shared by all operations)
 
     /// Discover → connect → run `body` with a live CDP socket → always close.
@@ -185,6 +313,11 @@ enum AgentDOM {
         let wsURL = try await discoverPageWebSocket(port: port, match: match)
         let session = URLSession(configuration: .ephemeral)
         let ws = session.webSocketTask(with: wsURL)
+        // Page.captureScreenshot (set-of-mark) returns a base64 PNG that easily
+        // exceeds URLSessionWebSocketTask's 1 MiB default message cap — a
+        // full-page Retina shot is several MB. Without this the receive throws
+        // and `som` silently fails on any non-trivial page.
+        ws.maximumMessageSize = 16 * 1024 * 1024
         ws.resume()
         defer {
             ws.cancel(with: .goingAway, reason: nil)
