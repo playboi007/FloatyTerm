@@ -32,6 +32,12 @@
 #                  apps, e.g. two Chromes, where --target "Google Chrome" is a coin flip)
 #   floaty focused --app "Notes" | --pid 8123           # the focused element (role/value/editable):
 #                                                        # confirm a text cursor exists BEFORE typing
+#   floaty raise   --app "Google Chrome" | --pid 8123   # surface an off-stage / other-Space / inactive-
+#                 # fullscreen window onto the ACTIVE Space (like a notification) so capture/som/click work
+#   floaty host    --ghost on | --ghost off             # Agent Ghost: make FloatyTerm's front window
+#                 # click-through + unable to steal focus (but still visible) so synthetic clicks/keys
+#                 # reach the app you're driving. Click the on-screen badge — or it auto-surfaces when
+#                 # your session needs input — to release. Run `--ghost on` BEFORE a click/type sequence.
 #   floaty capture --window "Flutter" [--ocr]           # returns a capture FRAME (frame_id +
 #                                                        # origin/size/scale/image dims) + PNG
 #   floaty capture --window-id 12345 [--ocr]            # exact window from list-windows
@@ -43,6 +49,8 @@
 #   floaty query-ax --app "Notes" [--role button] [--title Save] [--max 100] [--press]
 #   floaty query-ax --pid 8123 --title "Sign in" --press # AX tree by PID (disambiguates two Chromes,
 #                 # drives live default-profile Chrome with no debug port). --press = AXPress 1st match.
+#   floaty read-text --app "Google Chrome" | --pid 8123  # read a window's text via AX tree (lossless;
+#                 # the "read this page" path for live Chrome w/o CDP), auto-falls back to OCR if AX is empty
 #   floaty query-dom --selector "h3 a" [--port 9222] [--match youtube.com]  # ALL matches
 #   floaty eval     --expression "document.title" [--port 9222] [--match docs]  # run JS, get JSON
 #   floaty navigate --url "https://example.com" [--port 9222] [--match console.cloud]  # drive a tab
@@ -68,7 +76,7 @@ set -euo pipefail
 HOST="127.0.0.1:7777"
 
 cmd="${1:-}"; shift || true
-[ -n "$cmd" ] || { echo "usage: floaty <click|move|drag|scroll|type|key|capture|query-dom|query-ax|focused|eval|navigate|tabs|focus|list-windows|mark|click-in-frame|move-in-frame|som|click-mark> [--flag value ...]" >&2; exit 2; }
+[ -n "$cmd" ] || { echo "usage: floaty <click|move|drag|scroll|type|key|capture|query-dom|query-ax|focused|read-text|eval|navigate|tabs|focus|list-windows|mark|click-in-frame|move-in-frame|som|click-mark|host|raise> [--flag value ...]" >&2; exit 2; }
 
 args=("$@")
 # Expand the array in a way that's safe when it's EMPTY under `set -u` on the
@@ -101,7 +109,9 @@ paths = {"click":"/agent/click","move":"/agent/move","drag":"/agent/drag",
          "list-windows":"/agent/list-windows","mark":"/agent/mark",
          "click-in-frame":"/agent/click-in-frame","move-in-frame":"/agent/move-in-frame",
          "som":"/agent/som","click-mark":"/agent/click-mark",
-         "query-ax":"/agent/query-ax","focused":"/agent/focused"}
+         "query-ax":"/agent/query-ax","focused":"/agent/focused",
+         "host":"/agent/host","raise":"/agent/raise",
+         "read-text":"/agent/read-text"}
 print(json.dumps({"path": paths.get(cmd, "/agent/"+cmd), "body": obj}))
 PY
 )

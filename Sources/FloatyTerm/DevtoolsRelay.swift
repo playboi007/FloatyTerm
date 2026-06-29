@@ -52,7 +52,10 @@ final class DevtoolsRelay {
     var onAgentSom:       (([String: Any]) async -> [String: Any])?
     var onAgentClickMark: (([String: Any]) async -> [String: Any])?
     var onAgentQueryAX:   (([String: Any]) async -> [String: Any])?
+    var onAgentRaise:     (([String: Any]) async -> [String: Any])?
+    var onAgentReadText:  (([String: Any]) async -> [String: Any])?
     var onAgentFocused:   (([String: Any]) async -> [String: Any])?
+    var onAgentHost:      (([String: Any]) -> [String: Any])?
 
     private var listener: NWListener?
     private let queue = DispatchQueue(label: "floatyterm.devtools-relay")
@@ -128,26 +131,29 @@ final class DevtoolsRelay {
             return response(200, "text/plain", "ok")
         case ("POST", "/diff"):
             return handleDiff(Data(body.prefix(contentLength)))
-        case ("POST", "/agent/click"):     return agentSync(onAgentClick,    Data(body.prefix(contentLength)))
-        case ("POST", "/agent/move"):      return agentSync(onAgentMove,     Data(body.prefix(contentLength)))
-        case ("POST", "/agent/drag"):      return agentSync(onAgentDrag,     Data(body.prefix(contentLength)))
-        case ("POST", "/agent/scroll"):    return agentSync(onAgentScroll,   Data(body.prefix(contentLength)))
-        case ("POST", "/agent/type"):      return agentSync(onAgentType,     Data(body.prefix(contentLength)))
-        case ("POST", "/agent/key"):       return agentSync(onAgentKey,      Data(body.prefix(contentLength)))
-        case ("POST", "/agent/capture"):   return agentAsync(onAgentCapture, Data(body.prefix(contentLength)))
-        case ("POST", "/agent/query-dom"): return agentAsync(onAgentQueryDOM, Data(body.prefix(contentLength)))
-        case ("POST", "/agent/eval"):      return agentAsync(onAgentEval,     Data(body.prefix(contentLength)))
-        case ("POST", "/agent/navigate"):  return agentAsync(onAgentNavigate, Data(body.prefix(contentLength)))
-        case ("POST", "/agent/tabs"):      return agentAsync(onAgentTabs,     Data(body.prefix(contentLength)))
-        case ("POST", "/agent/focus"):     return agentAsync(onAgentFocus,    Data(body.prefix(contentLength)))
-        case ("POST", "/agent/list-windows"): return agentSync(onAgentListWindows, Data(body.prefix(contentLength)))
-        case ("POST", "/agent/mark"):      return agentSync(onAgentMark,     Data(body.prefix(contentLength)))
-        case ("POST", "/agent/click-in-frame"): return agentSync(onAgentClickInFrame, Data(body.prefix(contentLength)))
-        case ("POST", "/agent/move-in-frame"):  return agentSync(onAgentMoveInFrame,  Data(body.prefix(contentLength)))
-        case ("POST", "/agent/som"):        return agentAsync(onAgentSom,       Data(body.prefix(contentLength)))
-        case ("POST", "/agent/click-mark"): return agentAsync(onAgentClickMark, Data(body.prefix(contentLength)))
-        case ("POST", "/agent/query-ax"):   return agentAsync(onAgentQueryAX,   Data(body.prefix(contentLength)))
-        case ("POST", "/agent/focused"):    return agentAsync(onAgentFocused,   Data(body.prefix(contentLength)))
+        case ("POST", "/agent/click"):     return agentSync("click", onAgentClick,    Data(body.prefix(contentLength)))
+        case ("POST", "/agent/move"):      return agentSync("move", onAgentMove,     Data(body.prefix(contentLength)))
+        case ("POST", "/agent/drag"):      return agentSync("drag", onAgentDrag,     Data(body.prefix(contentLength)))
+        case ("POST", "/agent/scroll"):    return agentSync("scroll", onAgentScroll,   Data(body.prefix(contentLength)))
+        case ("POST", "/agent/type"):      return agentSync("type", onAgentType,     Data(body.prefix(contentLength)))
+        case ("POST", "/agent/key"):       return agentSync("key", onAgentKey,      Data(body.prefix(contentLength)))
+        case ("POST", "/agent/capture"):   return agentAsync("capture", onAgentCapture, Data(body.prefix(contentLength)))
+        case ("POST", "/agent/query-dom"): return agentAsync("query-dom", onAgentQueryDOM, Data(body.prefix(contentLength)))
+        case ("POST", "/agent/eval"):      return agentAsync("eval", onAgentEval,     Data(body.prefix(contentLength)))
+        case ("POST", "/agent/navigate"):  return agentAsync("navigate", onAgentNavigate, Data(body.prefix(contentLength)))
+        case ("POST", "/agent/tabs"):      return agentAsync("tabs", onAgentTabs,     Data(body.prefix(contentLength)))
+        case ("POST", "/agent/focus"):     return agentAsync("focus", onAgentFocus,    Data(body.prefix(contentLength)))
+        case ("POST", "/agent/list-windows"): return agentSync("list-windows", onAgentListWindows, Data(body.prefix(contentLength)))
+        case ("POST", "/agent/mark"):      return agentSync("mark", onAgentMark,     Data(body.prefix(contentLength)))
+        case ("POST", "/agent/click-in-frame"): return agentSync("click-in-frame", onAgentClickInFrame, Data(body.prefix(contentLength)))
+        case ("POST", "/agent/move-in-frame"):  return agentSync("move-in-frame", onAgentMoveInFrame,  Data(body.prefix(contentLength)))
+        case ("POST", "/agent/som"):        return agentAsync("som", onAgentSom,       Data(body.prefix(contentLength)))
+        case ("POST", "/agent/click-mark"): return agentAsync("click-mark", onAgentClickMark, Data(body.prefix(contentLength)))
+        case ("POST", "/agent/query-ax"):   return agentAsync("query-ax", onAgentQueryAX,   Data(body.prefix(contentLength)))
+        case ("POST", "/agent/raise"):      return agentAsync("raise", onAgentRaise,      Data(body.prefix(contentLength)))
+        case ("POST", "/agent/read-text"):  return agentAsync("read-text", onAgentReadText, Data(body.prefix(contentLength)))
+        case ("POST", "/agent/focused"):    return agentAsync("focused", onAgentFocused,   Data(body.prefix(contentLength)))
+        case ("POST", "/agent/host"):       return agentSync("host", onAgentHost,       Data(body.prefix(contentLength)))
         default:
             return response(404, "text/plain", "not found")
         }
@@ -189,22 +195,76 @@ final class DevtoolsRelay {
         try? JSONSerialization.jsonObject(with: body) as? [String: Any]
     }
 
-    private func agentSync(_ handler: (([String: Any]) -> [String: Any])?, _ body: Data) -> Data {
+    private func agentSync(_ route: String, _ handler: (([String: Any]) -> [String: Any])?, _ body: Data) -> Data {
         guard let obj = parseBody(body) else { return jsonResponse(["error": "invalid JSON body"], status: 400) }
         var result: [String: Any] = ["error": "no handler"]
+        let start = Date()
         let sem = DispatchSemaphore(value: 0)
         DispatchQueue.main.async { result = handler?(obj) ?? ["error": "no handler"]; sem.signal() }
         sem.wait()
+        logAgentCall(route: route, args: obj, ms: Int(Date().timeIntervalSince(start) * 1000), result: result)
         return jsonResponse(result, status: result["error"] == nil ? 200 : 400)
     }
 
-    private func agentAsync(_ handler: (([String: Any]) async -> [String: Any])?, _ body: Data) -> Data {
+    private func agentAsync(_ route: String, _ handler: (([String: Any]) async -> [String: Any])?, _ body: Data) -> Data {
         guard let obj = parseBody(body) else { return jsonResponse(["error": "invalid JSON body"], status: 400) }
         var result: [String: Any] = ["error": "no handler"]
+        let start = Date()
         let sem = DispatchSemaphore(value: 0)
         Task { @MainActor in result = await handler?(obj) ?? ["error": "no handler"]; sem.signal() }
         sem.wait()
+        logAgentCall(route: route, args: obj, ms: Int(Date().timeIntervalSince(start) * 1000), result: result)
         return jsonResponse(result, status: result["error"] == nil ? 200 : 400)
+    }
+
+    // MARK: - Agent call trace (debug instrumentation)
+    //
+    // Every /agent/* call appends one NDJSON line to
+    //   …/Application Support/FloatyTerm/Devtools/agent/calls.ndjson
+    // so a run's ACTUAL tool-trace is tailable and diffable against the "golden"
+    // trace in docs/floaty-test-cases.md. The whole point is loop attribution:
+    // find the first divergence, then the result on that line says whether the
+    // tool misled the agent (framework) or the agent ignored a good signal (skill).
+
+    private func logAgentCall(route: String, args: [String: Any], ms: Int, result: [String: Any]) {
+        var line: [String: Any] = [
+            "ts": Self.isoFormatter.string(from: Date()),
+            "route": route, "ms": ms,
+            "ok": result["error"] == nil,
+            "args": Self.summarizeAgentArgs(args),
+        ]
+        if let err = result["error"] as? String { line["error"] = String(err.prefix(300)) }
+        // Echo the few result fields that drive the agent's NEXT decision, so the
+        // trace shows what signal it actually had at each branch point.
+        var outcome: [String: Any] = [:]
+        for k in ["count", "frame_id", "source", "pressed", "truncated", "url",
+                  "screen_x", "screen_y", "on_screen", "ghost", "released"] {
+            if let v = result[k] { outcome[k] = (v as? String).map { String($0.prefix(120)) } ?? v }
+        }
+        if !outcome.isEmpty { line["result"] = outcome }
+        guard let data = try? JSONSerialization.data(withJSONObject: line),
+              let s = String(data: data, encoding: .utf8) else { return }
+        let url = Self.logDirectory(category: "agent").appendingPathComponent("calls.ndjson")
+        DevtoolsLog.shared.append(s + "\n", to: url)
+    }
+
+    /// Compact, privacy-aware arg summary: small scalars verbatim, long text
+    /// fields as length + a short head (so a 4 KB paste or eval isn't logged raw).
+    static func summarizeAgentArgs(_ b: [String: Any]) -> [String: Any] {
+        var o: [String: Any] = [:]
+        let scalars = ["x", "y", "id", "pid", "port", "app", "target", "role", "title",
+                       "match", "url", "key", "button", "clicks", "max", "frame", "frame_id",
+                       "window", "window_id", "dx", "dy", "duration", "human", "ocr", "press",
+                       "filter", "from_x", "from_y", "to_x", "to_y", "label", "ghost"]
+        for k in scalars where b[k] != nil {
+            if let s = b[k] as? String { o[k] = String(s.prefix(120)) } else { o[k] = b[k] }
+        }
+        if let mods = b["modifiers"] as? [Any] { o["modifiers"] = mods.compactMap { $0 as? String } }
+        if let sel = b["selector"] as? String { o["selector"] = String(sel.prefix(120)) }
+        for k in ["text", "expression", "js"] {
+            if let s = b[k] as? String { o["\(k)_len"] = s.count; o["\(k)_head"] = String(s.prefix(48)) }
+        }
+        return o
     }
 
     // MARK: - Diff trigger (shell shim → diff tab)

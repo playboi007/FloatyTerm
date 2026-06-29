@@ -22,11 +22,17 @@ enum AgentCapture {
     enum CaptureError: LocalizedError {
         case permissionDenied
         case windowNotFound(String)
+        case windowOffScreen(String, Int)
         case captureFailed
         var errorDescription: String? {
             switch self {
             case .permissionDenied: return "Screen Recording permission not granted."
             case .windowNotFound(let n): return "No on-screen window matches: \(n)"
+            case .windowOffScreen(let n, let c):
+                return "\"\(n)\" has \(c) window\(c == 1 ? "" : "s") open but off the current "
+                    + "Space/Stage (another desktop, minimized, or Stage Manager). Run "
+                    + "`floaty raise --app \"\(n)\"` to surface it (or bring it forward manually), then retry "
+                    + "— off-screen windows can't be captured. Don't just re-run this command."
             case .captureFailed: return "ScreenCaptureKit capture failed."
             }
         }
@@ -183,6 +189,7 @@ enum AgentCapture {
         let owner: String
         let title: String
         let bounds: CGRect
+        let onScreen: Bool        // false = open but on another Space / minimized / off-stage (Stage Manager)
         var area: CGFloat { bounds.width * bounds.height }
     }
 
@@ -191,10 +198,22 @@ enum AgentCapture {
     /// (id + owner + title + bounds) instead of guessing by name and hoping the
     /// right window matched.
     @MainActor
-    static func listWindows() -> [WindowInfo] {
+    static func listWindows(includingOffScreen: Bool = false) -> [WindowInfo] {
         let myPID = ProcessInfo.processInfo.processIdentifier
-        guard let infoList = CGWindowListCopyWindowInfo(
-            [.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID) as? [[String: Any]]
+        // `.optionOnScreenOnly` only sees the ACTIVE Space/stage — so a window
+        // that's open but on another Space, minimized, or off-stage under Stage
+        // Manager is invisible to it (an agent then wrongly concludes "no
+        // window"). When asked, widen to `.optionAll` and flag each window's
+        // on-screen membership so the agent can see it exists and raise it.
+        let onScreenIDs: Set<CGWindowID> = includingOffScreen
+            ? Set((CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID)
+                as? [[String: Any]] ?? [])
+                .compactMap { ($0[kCGWindowNumber as String] as? NSNumber)?.uint32Value })
+            : []
+        let option: CGWindowListOption = includingOffScreen
+            ? [.optionAll, .excludeDesktopElements]
+            : [.optionOnScreenOnly, .excludeDesktopElements]
+        guard let infoList = CGWindowListCopyWindowInfo(option, kCGNullWindowID) as? [[String: Any]]
         else { return [] }
         return infoList.compactMap { info -> WindowInfo? in
             let ownerPID = (info[kCGWindowOwnerPID as String] as? Int32) ?? 0
@@ -206,12 +225,19 @@ enum AgentCapture {
             else { return nil }
             let b = info[kCGWindowBounds as String] as? [String: Any] ?? [:]
             func n(_ k: String) -> CGFloat { CGFloat((b[k] as? NSNumber)?.doubleValue ?? 0) }
+            let bounds = CGRect(x: n("X"), y: n("Y"), width: n("Width"), height: n("Height"))
+            let onScreen = includingOffScreen ? onScreenIDs.contains(id) : true
+            // Off-screen additions are noisy: a single Chrome window backs a dozen
+            // tab-strip/shadow sliver windows. Keep only real content windows (the
+            // ≥200² floor bestMatch uses); on-screen results are left untouched.
+            if !onScreen && (bounds.width < 200 || bounds.height < 200) { return nil }
             return WindowInfo(
                 id: id,
                 pid: ownerPID,
                 owner: info[kCGWindowOwnerName as String] as? String ?? "",
                 title: info[kCGWindowName as String] as? String ?? "",
-                bounds: CGRect(x: n("X"), y: n("Y"), width: n("Width"), height: n("Height")))
+                bounds: bounds,
+                onScreen: onScreen)
         }
     }
 
@@ -257,8 +283,17 @@ enum AgentCapture {
             targetID = windowID
         } else if let name, let win = bestMatch(named: name) {
             targetID = win.id
+        } else if let name {
+            // Distinguish "open but off-stage" from "genuinely no window" so the
+            // agent can raise it instead of declaring the window closed.
+            let off = listWindows(includingOffScreen: true).filter {
+                !$0.onScreen && ($0.owner.localizedCaseInsensitiveContains(name)
+                                 || $0.title.localizedCaseInsensitiveContains(name))
+            }
+            throw off.isEmpty ? CaptureError.windowNotFound(name)
+                              : CaptureError.windowOffScreen(name, off.count)
         } else {
-            throw CaptureError.windowNotFound(name ?? "(neither window nor window-id given)")
+            throw CaptureError.windowNotFound("(neither window nor window-id given)")
         }
 
         let shot = try await rawCapture(windowID: targetID, fallbackName: name)
@@ -576,7 +611,97 @@ enum AgentAX {
         return FocusedInfo(hasFocus: true, role: role, name: name, value: value, editable: editable)
     }
 
+    /// Bring a target app + window to the ACTIVE Space — the sanctioned twin of
+    /// clicking a notification (public activation, no private SkyLight). Activates
+    /// the process, AX-raises its main window, and marks it frontmost, so a window
+    /// parked off-stage / on another Space / inactive-full-screen surfaces and
+    /// becomes capture/click/type-able (Chrome also populates its a11y tree once
+    /// foreground). Returns whether a window is on the active Space afterward.
+    static func raise(app: String?, pid: pid_t?) async throws -> (pid: pid_t, onScreen: Bool, title: String) {
+        guard AXIsProcessTrusted() else { throw AXError.notTrusted }
+        let appPID = try resolvePID(app: app, pid: pid)
+
+        let appEl = AXUIElementCreateApplication(appPID)
+        AXUIElementSetMessagingTimeout(appEl, 2.0)
+        var title = ""
+        if let win = mainWindow(of: appEl) {
+            AXUIElementPerformAction(win, kAXRaiseAction as CFString)
+            AXUIElementSetAttributeValue(win, kAXMainAttribute as CFString, kCFBooleanTrue)
+            title = copyString(win, kAXTitleAttribute as CFString) ?? ""
+        }
+        AXUIElementSetAttributeValue(appEl, kAXFrontmostAttribute as CFString, kCFBooleanTrue)
+        NSRunningApplication(processIdentifier: appPID)?.activate()
+
+        // Let the Space switch / stage swap settle, then confirm a window is now
+        // on the active Space (capturable).
+        try await Task.sleep(nanoseconds: 450_000_000)
+        let onScreen = AgentCapture.listWindows().contains { $0.pid == appPID }
+        return (appPID, onScreen, title)
+    }
+
+    /// Extract readable text from a target via the AX tree — the structural,
+    /// lossless analog of OCR, and the right way to "read this page" on live
+    /// Chrome that Chrome 136+ won't expose over CDP. Walks the focused window
+    /// collecting static-text / heading / field values. Returns "" when the tree
+    /// carries no text, so the caller can fall back to OCR.
+    static func extractText(app: String?, pid: pid_t?, maxChars: Int = 40000) async throws -> String {
+        guard AXIsProcessTrusted() else { throw AXError.notTrusted }
+        let appPID = try resolvePID(app: app, pid: pid)
+        let appEl = AXUIElementCreateApplication(appPID)
+        AXUIElementSetMessagingTimeout(appEl, 2.0)
+        AXUIElementSetAttributeValue(appEl, "AXManualAccessibility" as CFString, kCFBooleanTrue)
+        AXUIElementSetAttributeValue(appEl, "AXEnhancedUserInterface" as CFString, kCFBooleanTrue)
+        let root = mainWindow(of: appEl) ?? appEl
+        let textRoles: Set<String> = ["AXStaticText", "AXTextArea", "AXTextField", "AXHeading"]
+
+        func sweep() -> [String] {
+            var out: [String] = []
+            var visited = 0
+            let nodeCap = 8000
+            func walk(_ el: AXUIElement) {
+                if visited >= nodeCap { return }
+                visited += 1
+                if textRoles.contains(copyString(el, kAXRoleAttribute as CFString) ?? "") {
+                    let s = copyString(el, kAXValueAttribute as CFString)
+                        ?? copyString(el, kAXTitleAttribute as CFString) ?? ""
+                    let t = s.trimmingCharacters(in: .whitespacesAndNewlines)
+                    if !t.isEmpty { out.append(t) }
+                }
+                if let kids = copyChildren(el) { for k in kids { if visited >= nodeCap { break }; walk(k) } }
+            }
+            walk(root)
+            return out
+        }
+        // Chrome enables its a11y tree lazily — retry if the first sweep is empty.
+        var parts = sweep()
+        var attempt = 0
+        while parts.joined(separator: "\n").count < 20 && attempt < 2 {
+            try await Task.sleep(nanoseconds: 250_000_000)
+            parts = sweep()
+            attempt += 1
+        }
+        var lines: [String] = []
+        for p in parts where lines.last != p { lines.append(p) }   // drop consecutive dupes
+        let text = lines.joined(separator: "\n")
+        return text.count > maxChars ? String(text.prefix(maxChars)) : text
+    }
+
+    private static func mainWindow(of appEl: AXUIElement) -> AXUIElement? {
+        var v: CFTypeRef?
+        if AXUIElementCopyAttributeValue(appEl, kAXMainWindowAttribute as CFString, &v) == .success,
+           let v, CFGetTypeID(v) == AXUIElementGetTypeID() {
+            return (v as! AXUIElement)
+        }
+        return copyAXArray(appEl, kAXWindowsAttribute as CFString)?.first
+    }
+
     // MARK: - AX attribute readers
+
+    private static func copyAXArray(_ el: AXUIElement, _ attr: CFString) -> [AXUIElement]? {
+        var v: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(el, attr, &v) == .success else { return nil }
+        return v as? [AXUIElement]
+    }
 
     private static func rectOf(_ el: AXUIElement) -> CGRect? {
         guard let p = copyPoint(el, kAXPositionAttribute as CFString),

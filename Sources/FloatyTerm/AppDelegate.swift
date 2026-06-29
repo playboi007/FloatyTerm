@@ -143,13 +143,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         DevtoolsRelay.shared.onAgentListWindows = { b in
             // Optional `filter` narrows to windows whose owner/title contains it.
             let filter = (b["filter"] as? String)?.lowercased()
-            let windows = AgentCapture.listWindows()
+            // Include off-screen windows (other Spaces / minimized / off-stage)
+            // so the agent sees a window exists even under Stage Manager — each
+            // carries `on_screen`; only on_screen windows can be captured/clicked.
+            let windows = AgentCapture.listWindows(includingOffScreen: true)
                 .filter { filter == nil
                     || $0.owner.lowercased().contains(filter!)
                     || $0.title.lowercased().contains(filter!) }
-                .sorted { $0.bounds.width * $0.bounds.height > $1.bounds.width * $1.bounds.height }
+                .sorted {                                   // on-screen first, then largest
+                    $0.onScreen != $1.onScreen ? $0.onScreen : $0.area > $1.area
+                }
                 .map { w -> [String: Any] in
                     ["id": Int(w.id), "pid": Int(w.pid), "owner": w.owner, "title": w.title,
+                     "on_screen": w.onScreen,
                      "x": w.bounds.origin.x, "y": w.bounds.origin.y,
                      "width": w.bounds.width, "height": w.bounds.height]
                 }
@@ -231,7 +237,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     guard let win = AgentCapture.listWindows()
                             .filter({ $0.pid == pid })
                             .max(by: { $0.area < $1.area }) else {
-                        return ["error": "no on-screen window for that app/pid (is it visible, not minimized?)"]
+                        // Open but off-stage? Say so (don't claim "no window").
+                        let off = AgentCapture.listWindows(includingOffScreen: true)
+                            .filter { $0.pid == pid && !$0.onScreen }
+                        if !off.isEmpty {
+                            return ["error": "\(app ?? "pid \(pid)") has \(off.count) window(s) open but off the "
+                                + "current Space/Stage (Stage Manager or another desktop). Run "
+                                + "`floaty raise --pid \(pid)` to surface it (or bring it forward manually), then "
+                                + "retry — off-screen windows can't be screenshotted. Don't just re-run this command."]
+                        }
+                        return ["error": "no window for that app/pid (it may have no open windows — ⌘N in the app)"]
                     }
                     let shot = try await AgentCapture.rawCapture(windowID: win.id, fallbackName: app)
                     // Query generously, then keep only this window's elements.
@@ -361,6 +376,28 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 return out
             } catch { return ["error": error.localizedDescription] }
         }
+        // host: Agent Ghost mode. `floaty host --ghost on` makes the front window
+        // click-through + non-key (so synthetic input passes to the app being
+        // driven and can't be stolen back) while staying visible; a floating
+        // unlock badge signals it and releases on click. `--ghost off` releases
+        // every agent-ghosted window. The standard pre-typing step for an agent
+        // driving the GUI from a terminal inside FloatyTerm.
+        DevtoolsRelay.shared.onAgentHost = { [weak self] b in
+            guard let self else { return ["error": "no self"] }
+            let on: Bool
+            if let s = b["ghost"] as? String { on = ["on", "true", "1", "yes"].contains(s.lowercased()) }
+            else if let n = b["ghost"] as? NSNumber { on = n.boolValue }
+            else { return ["error": "expected {ghost: on|off}"] }
+            if on {
+                guard let wc = self.currentWindow() else { return ["error": "no FloatyTerm window to ghost"] }
+                wc.setAgentGhost(true)
+                return ["ok": true, "ghost": true, "window": wc.displayTitle]
+            } else {
+                let released = self.windows.filter { $0.isAgentGhosted }
+                released.forEach { $0.setAgentGhost(false) }
+                return ["ok": true, "ghost": false, "released": released.count]
+            }
+        }
         // focused: report the target app's focused element (AXFocusedUIElement)
         // so the agent can confirm a text cursor exists before typing — the
         // click → focused check → type pattern, instead of click-and-pray.
@@ -374,6 +411,65 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 let f = try AgentAX.focused(app: app, pid: pid)
                 return ["ok": true, "has_focus": f.hasFocus, "role": f.role,
                         "name": f.name, "value": f.value, "editable": f.editable]
+            } catch { return ["error": error.localizedDescription] }
+        }
+        // raise: surface a target app/window onto the ACTIVE Space — the public
+        // equivalent of clicking a notification. The agent's self-recovery for an
+        // off-stage / other-Space / inactive-full-screen window: list-windows sees
+        // on_screen:false → raise → capture/som/click now work (no manual step).
+        DevtoolsRelay.shared.onAgentRaise = { b in
+            let app = b["app"] as? String
+            let pid = (b["pid"] as? NSNumber).map { pid_t($0.intValue) }
+            guard app != nil || pid != nil else {
+                return ["error": "expected {app} or {pid} (see `floaty list-windows` for pids)"]
+            }
+            do {
+                let r = try await AgentAX.raise(app: app, pid: pid)
+                return ["ok": true, "pid": Int(r.pid), "on_screen": r.onScreen, "title": r.title,
+                        "note": r.onScreen
+                            ? "window is on the active Space now — capture/som/click will work"
+                            : "activated, but no window on the active Space yet (it may have no open window — ⌘N — or be mid-switch); re-check `floaty list-windows`"]
+            } catch { return ["error": error.localizedDescription] }
+        }
+        // read-text: pull readable text from a target. AX-tree extraction first
+        // (lossless, fast — the right "read this page" path for live Chrome that
+        // Chrome 136+ won't expose over CDP); if the tree carries ~no text, fall
+        // back to OCR of the on-screen window.
+        DevtoolsRelay.shared.onAgentReadText = { b in
+            let app = b["app"] as? String
+            let pid = (b["pid"] as? NSNumber).map { pid_t($0.intValue) }
+            guard app != nil || pid != nil else {
+                return ["error": "expected {app} or {pid} (see `floaty list-windows` for pids)"]
+            }
+            do {
+                let axText = try await AgentAX.extractText(app: app, pid: pid)
+                if axText.count >= 40 {   // real content from the tree
+                    return ["ok": true, "source": "ax", "chars": axText.count, "text": axText]
+                }
+                // AX sparse → OCR the on-screen window as fallback.
+                let resolvedPID = try AgentAX.resolvePID(app: app, pid: pid)
+                guard let win = AgentCapture.listWindows()
+                        .filter({ $0.pid == resolvedPID }).max(by: { $0.area < $1.area }) else {
+                    let off = AgentCapture.listWindows(includingOffScreen: true)
+                        .filter { $0.pid == resolvedPID && !$0.onScreen }
+                    if !off.isEmpty {
+                        return ["error": "\(app ?? "pid \(resolvedPID)") is off the current Space/Stage; run "
+                            + "`floaty raise --pid \(resolvedPID)` to surface it, then retry (need it visible to OCR)."]
+                    }
+                    return ["ok": true, "source": "ax", "chars": axText.count, "text": axText,
+                            "note": "little AX text and no on-screen window to OCR"]
+                }
+                let shot = try await AgentCapture.rawCapture(windowID: win.id, fallbackName: app)
+                let ocr: String? = await withCheckedContinuation { cont in
+                    ContextSnap.recognizeText(in: shot.image) { cont.resume(returning: $0) }
+                }
+                if let ocr, !ocr.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                    let capped = String(ocr.prefix(40000))
+                    return ["ok": true, "source": "ocr", "chars": capped.count, "text": capped,
+                            "note": "AX text was sparse; fell back to OCR"]
+                }
+                return ["ok": true, "source": "ax", "chars": axText.count, "text": axText,
+                        "note": "AX sparse and OCR found no text"]
             } catch { return ["error": error.localizedDescription] }
         }
         // click-mark: the model picked a NUMBER off the som screenshot; resolve it
@@ -529,6 +625,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             let waiting = terminals.filter(\.awaitingInput).count
             let working = terminals.filter { $0.hasRunningForegroundJob && !$0.awaitingInput }.count
             self.statusItem.updateSummary(working: working, waiting: waiting)
+
+            // Auto-surface: when an agent-ghosted window's session stops for user
+            // input, release Agent Ghost and pulse it so the user sees the prompt
+            // and can respond — the window can't be interacted with while ghosted.
+            for wc in self.windows where wc.isAgentGhosted {
+                let waitingHere = wc.tabs
+                    .compactMap { $0 as? TerminalController }
+                    .contains { $0.awaitingInput }
+                if waitingHere {
+                    wc.setAgentGhost(false)
+                    wc.pulseAttention()
+                }
+            }
         }
         timer.tolerance = 1
         fleetSummaryTimer = timer
