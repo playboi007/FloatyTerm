@@ -36,6 +36,10 @@
 #                 # (not keystrokes) — the reliable entry path for Electron/Chromium, where `type` fires
 #                 # events that miss the field yet report success. Re-reads → landed:true/false; landed/
 #                 # settable:false → fall back to paste (pbcopy + ⌘V). Focus the field first.
+#   floaty enable-cdp --app "Slack" [--port 9225]       # relaunch an ELECTRON app (Slack/VS Code/Cursor/
+#                 # Discord) with a debug port so it speaks CDP — then drive it with query-dom/eval/navigate
+#                 # --port N (reliable, no keystroke guessing). Quits + reopens the app. Browsers are REFUSED
+#                 # (personal profile); drive Chrome with osascript + read-text/query-ax instead.
 #   floaty raise   --app "Google Chrome" | --pid 8123   # surface an off-stage / other-Space / inactive-
 #                 # fullscreen window onto the ACTIVE Space (like a notification) so capture/som/click work
 #   floaty host    --ghost on | --ghost off             # Agent Ghost: make FloatyTerm's front window
@@ -81,7 +85,7 @@ set -euo pipefail
 HOST="127.0.0.1:7777"
 
 cmd="${1:-}"; shift || true
-[ -n "$cmd" ] || { echo "usage: floaty <click|move|drag|scroll|type|key|set-text|capture|query-dom|query-ax|focused|read-text|eval|navigate|tabs|focus|list-windows|mark|click-in-frame|move-in-frame|som|click-mark|host|raise> [--flag value ...]" >&2; exit 2; }
+[ -n "$cmd" ] || { echo "usage: floaty <click|move|drag|scroll|type|key|set-text|enable-cdp|capture|query-dom|query-ax|focused|read-text|eval|navigate|tabs|focus|list-windows|mark|click-in-frame|move-in-frame|som|click-mark|host|raise> [--flag value ...]" >&2; exit 2; }
 
 args=("$@")
 # Expand the array in a way that's safe when it's EMPTY under `set -u` on the
@@ -115,7 +119,7 @@ paths = {"click":"/agent/click","move":"/agent/move","drag":"/agent/drag",
          "click-in-frame":"/agent/click-in-frame","move-in-frame":"/agent/move-in-frame",
          "som":"/agent/som","click-mark":"/agent/click-mark",
          "query-ax":"/agent/query-ax","focused":"/agent/focused",
-         "set-text":"/agent/set-text",
+         "set-text":"/agent/set-text","enable-cdp":"/agent/enable-cdp",
          "host":"/agent/host","raise":"/agent/raise",
          "read-text":"/agent/read-text"}
 print(json.dumps({"path": paths.get(cmd, "/agent/"+cmd), "body": obj}))

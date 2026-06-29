@@ -840,3 +840,100 @@ enum AgentAX {
         return parts.isEmpty ? "the interactable filter" : parts.joined(separator: " ")
     }
 }
+
+/// Put an Electron app onto the reliable CDP path by relaunching it with a remote
+/// debugging port. Slack/VS Code/Cursor/Discord all speak CDP but only expose it
+/// when launched with `--remote-debugging-port=N`; once they do, `query-dom`/`eval`/
+/// `navigate` drive them exactly like a web page — sidestepping the fragile
+/// synthetic-keystroke path entirely. Browsers are explicitly refused: a personal
+/// Chrome/Edge/Safari can't be relaunched non-destructively (singleton profile lock),
+/// so those stay on the osascript/AX path.
+enum AgentElectron {
+    struct Result: Sendable {
+        let app: String
+        let pid: pid_t
+        let port: UInt16
+        let cdpUp: Bool         // a CDP endpoint answered on the port afterward
+        let relaunched: Bool    // false = it was already up on this port (idempotent)
+    }
+
+    enum ElectronError: LocalizedError {
+        case notRunning(String)
+        case isBrowser(String)
+        case launchFailed(String)
+        var errorDescription: String? {
+            switch self {
+            case .notRunning(let s):
+                return "No running app matches \"\(s)\". Open it first (so I can relaunch the same "
+                    + "bundle with a debug port), or pass its exact name. See `floaty list-windows`."
+            case .isBrowser(let s):
+                return "\"\(s)\" is a web browser — don't relaunch it for a debug port (personal profile / "
+                    + "singleton lock makes it destructive). Drive it with osascript + `read-text`/`query-ax` "
+                    + "instead (see ref/cdp.md). enable-cdp is for Electron apps like Slack/VS Code/Discord."
+            case .launchFailed(let s):
+                return "Couldn't relaunch \"\(s)\" with a debug port."
+            }
+        }
+    }
+
+    /// Browsers we must never relaunch (bundle ids).
+    private static let browserBundleIDs: Set<String> = [
+        "com.google.Chrome", "com.google.Chrome.canary", "com.google.Chrome.beta",
+        "com.microsoft.edgemac", "com.brave.Browser", "com.vivaldi.Vivaldi",
+        "company.thebrowser.Browser", "org.mozilla.firefox", "com.apple.Safari",
+    ]
+
+    static func enableCDP(appName: String, port: UInt16) async throws -> Result {
+        // Already up on this port? Idempotent: don't disturb the app.
+        if (try? await AgentDOM.tabs(port: port)) != nil {
+            let pid = NSWorkspace.shared.runningApplications.first {
+                $0.localizedName?.localizedCaseInsensitiveContains(appName) ?? false
+            }?.processIdentifier ?? -1
+            return Result(app: appName, pid: pid, port: port, cdpUp: true, relaunched: false)
+        }
+
+        let ws = NSWorkspace.shared
+        guard let running = ws.runningApplications.first(where: {
+            $0.activationPolicy == .regular &&
+            (($0.localizedName?.localizedCaseInsensitiveContains(appName) ?? false) ||
+             ($0.bundleURL?.deletingPathExtension().lastPathComponent
+                 .localizedCaseInsensitiveContains(appName) ?? false))
+        }), let bundleURL = running.bundleURL else {
+            throw ElectronError.notRunning(appName)
+        }
+
+        let bundleID = Bundle(url: bundleURL)?.bundleIdentifier ?? running.bundleIdentifier ?? ""
+        if browserBundleIDs.contains(bundleID) { throw ElectronError.isBrowser(running.localizedName ?? appName) }
+
+        let name = running.localizedName ?? appName
+
+        // Quit gracefully (lets it persist drafts/state), wait for the process to exit.
+        running.terminate()
+        var waited = 0
+        while !running.isTerminated && waited < 4000 {
+            try? await Task.sleep(nanoseconds: 100_000_000); waited += 100
+        }
+        if !running.isTerminated {
+            running.forceTerminate()
+            try? await Task.sleep(nanoseconds: 400_000_000)
+        }
+
+        // Relaunch a fresh instance carrying the debug-port flag, without stealing focus.
+        let cfg = NSWorkspace.OpenConfiguration()
+        cfg.arguments = ["--remote-debugging-port=\(port)"]
+        cfg.createsNewApplicationInstance = true
+        cfg.activates = false
+        let app: NSRunningApplication
+        do { app = try await ws.openApplication(at: bundleURL, configuration: cfg) }
+        catch { throw ElectronError.launchFailed(name) }
+
+        // Poll for the CDP endpoint to come up (launch + port bind take a moment).
+        var cdpUp = false
+        waited = 0
+        while waited < 9000 {
+            try? await Task.sleep(nanoseconds: 500_000_000); waited += 500
+            if (try? await AgentDOM.tabs(port: port)) != nil { cdpUp = true; break }
+        }
+        return Result(app: name, pid: app.processIdentifier, port: port, cdpUp: cdpUp, relaunched: true)
+    }
+}

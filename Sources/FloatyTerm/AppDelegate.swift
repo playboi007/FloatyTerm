@@ -466,6 +466,37 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                                 + "(pbcopy + ⌘V) — and confirm the field was focused first (`floaty focused`)."]
             } catch { return ["error": error.localizedDescription] }
         }
+        // enable-cdp: relaunch an Electron app (Slack, VS Code, Cursor, Discord…)
+        // with a remote debugging port so it can be driven over CDP — the reliable
+        // path that moots synthetic-keystroke flakiness. Browsers are refused (the
+        // personal-profile / singleton-lock problem); they stay on osascript/AX.
+        DevtoolsRelay.shared.onAgentEnableCDP = { b in
+            guard let app = b["app"] as? String else {
+                return ["error": "expected {app} (the Electron app to relaunch with a debug port, e.g. Slack)"]
+            }
+            // Port: honor an explicit --port, else the conventional one per app
+            // (matches the ports table in the skill), else 9229.
+            let conventional: [String: UInt16] = [
+                "slack": 9225, "code": 9223, "visual studio code": 9223,
+                "cursor": 9224, "discord": 9226,
+            ]
+            let port: UInt16 = (b["port"] as? NSNumber).map { UInt16(truncating: $0) }
+                ?? conventional[app.lowercased()] ?? 9229
+            do {
+                let r = try await AgentElectron.enableCDP(appName: app, port: Int(port) > 0 ? port : 9229)
+                if r.cdpUp {
+                    return ["ok": true, "app": r.app, "pid": Int(r.pid), "port": Int(r.port),
+                            "cdp": true, "relaunched": r.relaunched,
+                            "note": "CDP is live on \(r.port) — drive it with `floaty tabs --port \(r.port)`, "
+                                + "`query-dom --port \(r.port)`, `eval --port \(r.port)`, `navigate --port \(r.port)`."]
+                }
+                return ["ok": false, "app": r.app, "pid": Int(r.pid), "port": Int(r.port),
+                        "cdp": false, "relaunched": r.relaunched,
+                        "error": "relaunched \(r.app) but no CDP endpoint answered on \(r.port) within ~9s. "
+                            + "It may not accept the flag, or needs longer — retry `floaty tabs --port \(r.port)`. "
+                            + "If it stays dead, fall back to set-text/paste."]
+            } catch { return ["error": error.localizedDescription] }
+        }
         // raise: surface a target app/window onto the ACTIVE Space — the public
         // equivalent of clicking a notification. The agent's self-recovery for an
         // off-stage / other-Space / inactive-full-screen window: list-windows sees
