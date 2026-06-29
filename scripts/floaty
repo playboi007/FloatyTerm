@@ -60,6 +60,9 @@
 #                 # drives live default-profile Chrome with no debug port). --press = AXPress 1st match.
 #   floaty read-text --app "Google Chrome" | --pid 8123  # read a window's text via AX tree (lossless;
 #                 # the "read this page" path for live Chrome w/o CDP), auto-falls back to OCR if AX is empty
+#   floaty read-text --pid 8123 --sections               # same, but split into LABELED regions (by ARIA
+#                 # landmark: main/navigation/complementary…) so you can grab the thread/detail pane without
+#                 # awk-ing the flat dump — returns sections[]{label,chars,text} in document order
 #   floaty query-dom --selector "h3 a" [--port 9222] [--match youtube.com]  # ALL matches
 #   floaty eval     --expression "document.title" [--port 9222] [--match docs]  # run JS, get JSON
 #   floaty navigate --url "https://example.com" [--port 9222] [--match console.cloud]  # drive a tab

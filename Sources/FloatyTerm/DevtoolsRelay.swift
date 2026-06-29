@@ -55,7 +55,7 @@ final class DevtoolsRelay {
     var onAgentRaise:     (([String: Any]) async -> [String: Any])?
     var onAgentReadText:  (([String: Any]) async -> [String: Any])?
     var onAgentFocused:   (([String: Any]) async -> [String: Any])?
-    var onAgentSetText:   (([String: Any]) -> [String: Any])?
+    var onAgentSetText:   (([String: Any]) async -> [String: Any])?
     var onAgentEnableCDP: (([String: Any]) async -> [String: Any])?
     var onAgentHost:      (([String: Any]) -> [String: Any])?
 
@@ -155,7 +155,7 @@ final class DevtoolsRelay {
         case ("POST", "/agent/raise"):      return agentAsync("raise", onAgentRaise,      Data(body.prefix(contentLength)))
         case ("POST", "/agent/read-text"):  return agentAsync("read-text", onAgentReadText, Data(body.prefix(contentLength)))
         case ("POST", "/agent/focused"):    return agentAsync("focused", onAgentFocused,   Data(body.prefix(contentLength)))
-        case ("POST", "/agent/set-text"):   return agentSync("set-text", onAgentSetText,   Data(body.prefix(contentLength)))
+        case ("POST", "/agent/set-text"):   return agentAsync("set-text", onAgentSetText,   Data(body.prefix(contentLength)))
         case ("POST", "/agent/enable-cdp"): return agentAsync("enable-cdp", onAgentEnableCDP, Data(body.prefix(contentLength)))
         case ("POST", "/agent/host"):       return agentSync("host", onAgentHost,       Data(body.prefix(contentLength)))
         default:

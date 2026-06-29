@@ -450,7 +450,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     + "Focus the field first (click → `floaty focused`), then set-text writes into it."]
             }
             do {
-                let r = try AgentAX.setText(app: app, pid: pid, text: text)
+                let r = try await AgentAX.setText(app: app, pid: pid, text: text)
                 if r.landed {
                     return ["ok": true, "landed": true, "settable": r.settable,
                             "role": r.role, "value": r.value]
@@ -525,7 +525,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             guard app != nil || pid != nil else {
                 return ["error": "expected {app} or {pid} (see `floaty list-windows` for pids)"]
             }
+            let wantSections = (b["sections"] as? Bool) ?? false
             do {
+                // --sections: labeled regions (by ARIA landmark) so the caller can
+                // pick "the thread/detail pane" without awk-ing the flat dump.
+                if wantSections {
+                    let secs = try await AgentAX.extractSections(app: app, pid: pid)
+                    let total = secs.reduce(0) { $0 + $1.chars }
+                    if total >= 40 {
+                        return ["ok": true, "source": "ax", "chars": total,
+                                "sections": secs.map { ["label": $0.label, "chars": $0.chars, "text": $0.text] }]
+                    }
+                    // fall through to OCR if the tree was empty
+                }
                 let axText = try await AgentAX.extractText(app: app, pid: pid)
                 if axText.count >= 40 {   // real content from the tree
                     return ["ok": true, "source": "ax", "chars": axText.count, "text": axText]

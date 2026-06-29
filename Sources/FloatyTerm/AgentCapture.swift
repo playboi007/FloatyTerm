@@ -658,7 +658,7 @@ enum AgentAX {
     /// Caller is responsible for focusing the field first (click / `focused`). If the
     /// element doesn't expose a settable AXValue (some custom web inputs don't),
     /// `landed:false, settable:false` comes back — the signal to fall back to paste.
-    static func setText(app: String?, pid: pid_t?, text: String) throws -> SetTextResult {
+    static func setText(app: String?, pid: pid_t?, text: String) async throws -> SetTextResult {
         guard AXIsProcessTrusted() else { throw AXError.notTrusted }
         let appPID = try resolvePID(app: app, pid: pid)
         let appEl = AXUIElementCreateApplication(appPID)
@@ -678,13 +678,39 @@ enum AgentAX {
         let settable = settableRef.boolValue
 
         AXUIElementSetAttributeValue(el, kAXValueAttribute as CFString, text as CFString)
-        // Re-read to verify: some Electron fields report settable but ignore the
-        // write, or normalize/trim it. Accept exact match, containment, or a healthy
-        // prefix (rich editors can append a trailing node).
-        let after = String((copyString(el, kAXValueAttribute as CFString) ?? "").prefix(500))
-        let head = String(text.prefix(min(40, text.count)))
-        let landed = !text.isEmpty && (after == text || after.contains(text) || after.contains(head))
-        return SetTextResult(landed: landed, settable: settable, role: role, value: after)
+
+        // Verify HONESTLY. The set is processed asynchronously: an immediate re-read
+        // returns the field's PRE-write value (a false negative — landed:false even
+        // though the text is in the field a moment later). And a React/Electron field
+        // may swap its AX node on the value change, so the original `el` handle can go
+        // stale — re-fetch the focused element each time and read ITS value. Poll until
+        // the value reflects the text, or give up (~1s) and report the real readback.
+        let want = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        let head = String(want.prefix(min(40, want.count)))
+        func currentValue() -> String {
+            var ff: CFTypeRef?
+            if AXUIElementCopyAttributeValue(appEl, kAXFocusedUIElementAttribute as CFString, &ff) == .success,
+               let ff, CFGetTypeID(ff) == AXUIElementGetTypeID(),
+               let s = copyString(ff as! AXUIElement, kAXValueAttribute as CFString), !s.isEmpty {
+                return s
+            }
+            return copyString(el, kAXValueAttribute as CFString) ?? ""
+        }
+        func reflects(_ v: String) -> Bool {
+            guard !want.isEmpty else { return false }
+            let a = v.trimmingCharacters(in: .whitespacesAndNewlines)
+            return a == want || a.contains(want) || (!head.isEmpty && a.contains(head))
+        }
+        var after = currentValue()
+        var landed = reflects(after)
+        var tries = 0
+        while !landed && tries < 8 {            // ~8 × 120ms ≈ 1s before conceding
+            try? await Task.sleep(nanoseconds: 120_000_000)
+            after = currentValue()
+            landed = reflects(after)
+            tries += 1
+        }
+        return SetTextResult(landed: landed, settable: settable, role: role, value: String(after.prefix(500)))
     }
 
     /// Bring a target app + window to the ACTIVE Space — the sanctioned twin of
@@ -763,6 +789,90 @@ enum AgentAX {
         for p in parts where lines.last != p { lines.append(p) }   // drop consecutive dupes
         let text = lines.joined(separator: "\n")
         return text.count > maxChars ? String(text.prefix(maxChars)) : text
+    }
+
+    struct TextSection: Sendable { let label: String; let chars: Int; let text: String }
+
+    /// `read-text`, but split into labeled regions instead of one flat blob — so a
+    /// caller can grab "the thread pane" without awk-ing a marker out of the dump.
+    /// Segmentation is by **ARIA landmark** (Chromium maps `role="main"` →
+    /// AXSubrole `AXLandmarkMain`, `complementary`/aside → `AXLandmarkComplementary`,
+    /// `navigation` → `AXLandmarkNavigation`, etc.) — a general, app-agnostic
+    /// boundary present in any landmarked web/Electron UI. Text under each landmark
+    /// is bucketed to it; anything outside one lands in "(main)". Sections come back
+    /// in document order, so a right-hand thread/detail pane (complementary) sorts
+    /// after the main list. If the app exposes no landmarks you get a single section
+    /// (no worse than the flat read).
+    static func extractSections(app: String?, pid: pid_t?, maxChars: Int = 40000) async throws -> [TextSection] {
+        guard AXIsProcessTrusted() else { throw AXError.notTrusted }
+        let appPID = try resolvePID(app: app, pid: pid)
+        let appEl = AXUIElementCreateApplication(appPID)
+        AXUIElementSetMessagingTimeout(appEl, 2.0)
+        AXUIElementSetAttributeValue(appEl, "AXManualAccessibility" as CFString, kCFBooleanTrue)
+        AXUIElementSetAttributeValue(appEl, "AXEnhancedUserInterface" as CFString, kCFBooleanTrue)
+        let root = mainWindow(of: appEl) ?? appEl
+        let textRoles: Set<String> = ["AXStaticText", "AXTextArea", "AXTextField", "AXHeading"]
+
+        func landmarkLabel(_ el: AXUIElement) -> String? {
+            let sub = copyString(el, kAXSubroleAttribute as CFString) ?? ""
+            guard sub.hasPrefix("AXLandmark") else { return nil }
+            let base: String
+            switch sub {
+            case "AXLandmarkMain":          base = "main"
+            case "AXLandmarkComplementary": base = "complementary"
+            case "AXLandmarkNavigation":    base = "navigation"
+            case "AXLandmarkBanner":        base = "banner"
+            case "AXLandmarkContentInfo":   base = "contentinfo"
+            case "AXLandmarkSearch":        base = "search"
+            case "AXLandmarkRegion":        base = "region"
+            default: base = sub.replacingOccurrences(of: "AXLandmark", with: "").lowercased()
+            }
+            // Append the landmark's accessible name when it has one (e.g. "Thread").
+            let name = (copyString(el, kAXTitleAttribute as CFString)
+                        ?? copyString(el, kAXDescriptionAttribute as CFString)
+                        ?? copyString(el, "AXRoleDescription" as CFString) ?? "")
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            return name.isEmpty || name.lowercased() == base ? base : "\(base): \(String(name.prefix(60)))"
+        }
+
+        func sweep() -> [(label: String, lines: [String])] {
+            var order: [String] = []
+            var buckets: [String: [String]] = [:]
+            var visited = 0
+            let nodeCap = 8000
+            func add(_ label: String, _ t: String) {
+                if buckets[label] == nil { buckets[label] = []; order.append(label) }
+                if buckets[label]?.last != t { buckets[label]?.append(t) }
+            }
+            func walk(_ el: AXUIElement, _ section: String) {
+                if visited >= nodeCap { return }
+                visited += 1
+                let here = landmarkLabel(el) ?? section
+                if textRoles.contains(copyString(el, kAXRoleAttribute as CFString) ?? "") {
+                    let s = (copyString(el, kAXValueAttribute as CFString)
+                             ?? copyString(el, kAXTitleAttribute as CFString) ?? "")
+                        .trimmingCharacters(in: .whitespacesAndNewlines)
+                    if !s.isEmpty { add(here, s) }
+                }
+                if let kids = copyChildren(el) { for k in kids { if visited >= nodeCap { break }; walk(k, here) } }
+            }
+            walk(root, "main")
+            return order.map { ($0, buckets[$0] ?? []) }
+        }
+
+        var secs = sweep()
+        var attempt = 0
+        while secs.reduce(0, { $0 + $1.lines.joined().count }) < 40 && attempt < 5 {
+            try await Task.sleep(nanoseconds: 300_000_000)
+            secs = sweep()
+            attempt += 1
+        }
+        return secs.compactMap { sec in
+            let joined = sec.lines.joined(separator: "\n")
+            guard !joined.isEmpty else { return nil }
+            let clipped = joined.count > maxChars ? String(joined.prefix(maxChars)) : joined
+            return TextSection(label: sec.label, chars: clipped.count, text: clipped)
+        }
     }
 
     private static func mainWindow(of appEl: AXUIElement) -> AXUIElement? {
