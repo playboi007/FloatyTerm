@@ -404,9 +404,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             else if let n = b["ghost"] as? NSNumber { on = n.boolValue }
             else { return ["error": "expected {ghost: on|off}"] }
             if on {
-                guard let wc = self.currentWindow() else { return ["error": "no FloatyTerm window to ghost"] }
-                wc.setAgentGhost(true)
-                return ["ok": true, "ghost": true, "window": wc.displayTitle]
+                // Ghost EVERY window, not just currentWindow(): when the agent is
+                // driving another app, no FloatyTerm window is key, so the old
+                // `first(isKey) ?? last` heuristic could ghost a window the user
+                // isn't even looking at (or none usefully) — which is why ghost
+                // looked like it "didn't engage". Ghosting all guarantees the
+                // agent's window is covered, and they all share the banner.
+                let targets = self.windows.filter { $0.isVisible }   // on-screen only — no stray banner on a hidden one
+                guard !targets.isEmpty else { return ["error": "no visible FloatyTerm window to ghost"] }
+                targets.forEach { $0.setAgentGhost(true) }
+                let ghosted = self.windows.filter { $0.isAgentGhosted }.count
+                return ["ok": true, "ghost": true, "ghosted": ghosted, "windows": self.windows.count]
             } else {
                 let released = self.windows.filter { $0.isAgentGhosted }
                 released.forEach { $0.setAgentGhost(false) }
@@ -648,13 +656,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             // Auto-surface: when an agent-ghosted window's session stops for user
             // input, release Agent Ghost and pulse it so the user sees the prompt
             // and can respond — the window can't be interacted with while ghosted.
-            for wc in self.windows where wc.isAgentGhosted {
-                let waitingHere = wc.tabs
-                    .compactMap { $0 as? TerminalController }
-                    .contains { $0.awaitingInput }
-                if waitingHere {
-                    wc.setAgentGhost(false)
-                    wc.pulseAttention()
+            //
+            // BUT skip this while the agent is actively driving: a driving session
+            // reads as `awaitingInput` in the gaps between `floaty` calls, so an
+            // unconditional release here tore the ghost down within one timer tick
+            // (banner never stayed up, synthetic keystrokes scattered). Only surface
+            // once the agent has gone quiet — then awaitingInput means the user.
+            if !DevtoolsRelay.shared.agentIsDriving() {
+                for wc in self.windows where wc.isAgentGhosted {
+                    let waitingHere = wc.tabs
+                        .compactMap { $0 as? TerminalController }
+                        .contains { $0.awaitingInput }
+                    if waitingHere {
+                        wc.setAgentGhost(false)
+                        wc.pulseAttention()
+                    }
                 }
             }
         }

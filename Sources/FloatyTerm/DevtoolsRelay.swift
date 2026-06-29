@@ -199,6 +199,7 @@ final class DevtoolsRelay {
         guard let obj = parseBody(body) else { return jsonResponse(["error": "invalid JSON body"], status: 400) }
         var result: [String: Any] = ["error": "no handler"]
         let start = Date()
+        markAgentCallStart(); defer { markAgentCallEnd() }
         let sem = DispatchSemaphore(value: 0)
         DispatchQueue.main.async { result = handler?(obj) ?? ["error": "no handler"]; sem.signal() }
         sem.wait()
@@ -210,11 +211,43 @@ final class DevtoolsRelay {
         guard let obj = parseBody(body) else { return jsonResponse(["error": "invalid JSON body"], status: 400) }
         var result: [String: Any] = ["error": "no handler"]
         let start = Date()
+        markAgentCallStart(); defer { markAgentCallEnd() }
         let sem = DispatchSemaphore(value: 0)
         Task { @MainActor in result = await handler?(obj) ?? ["error": "no handler"]; sem.signal() }
         sem.wait()
         logAgentCall(route: route, args: obj, ms: Int(Date().timeIntervalSince(start) * 1000), result: result)
         return jsonResponse(result, status: result["error"] == nil ? 200 : 400)
+    }
+
+    // MARK: - Agent activity (so auto-surface doesn't fight an active drive)
+    //
+    // When an agent drives the GUI from a terminal *inside* FloatyTerm, that
+    // session reads as `awaitingInput` between `floaty` calls — which tripped the
+    // 3s auto-surface timer into releasing Agent Ghost out from under the agent
+    // (ghost-on engaged, then auto-released within ~3s → banner gone, keystrokes
+    // scatter). We track in-flight calls and a recency timestamp so the timer can
+    // tell "agent is mid-sequence" (keep ghosted) from "agent stopped, control is
+    // back with the user" (surface so they can respond).
+    private let agentActivityLock = NSLock()
+    private var agentInFlight = 0
+    private var lastAgentCallAt = Date.distantPast
+
+    private func markAgentCallStart() {
+        agentActivityLock.lock(); agentInFlight += 1; lastAgentCallAt = Date(); agentActivityLock.unlock()
+    }
+    private func markAgentCallEnd() {
+        agentActivityLock.lock(); agentInFlight = max(0, agentInFlight - 1); lastAgentCallAt = Date(); agentActivityLock.unlock()
+    }
+
+    /// True while a `/agent/*` call is executing, or within `grace` seconds of the
+    /// last one finishing — i.e. the agent is actively driving. The auto-surface
+    /// timer checks this before releasing Agent Ghost, so a held ghost survives the
+    /// gaps between calls (and long single calls like a human-paced `type`) and is
+    /// only auto-released once the agent has truly gone quiet.
+    func agentIsDriving(grace: TimeInterval = 12) -> Bool {
+        agentActivityLock.lock(); defer { agentActivityLock.unlock() }
+        if agentInFlight > 0 { return true }
+        return Date().timeIntervalSince(lastAgentCallAt) < grace
     }
 
     // MARK: - Agent call trace (debug instrumentation)
