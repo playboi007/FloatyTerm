@@ -18,9 +18,15 @@ final class FloatingPanel: NSPanel {
         )
     }
 
+    /// While true (Agent Ghost mode), the panel refuses key status — so a
+    /// synthetic click that lands on it can't steal the text cursor from the app
+    /// the agent is driving. Paired with `ignoresMouseEvents` (clicks pass
+    /// through) in `TerminalWindowController.setAgentGhost`.
+    var blocksKey = false
+
     // Allow the panel to receive keyboard focus when the user clicks into it,
-    // so they can actually type in the terminal.
-    override var canBecomeKey: Bool { true }
+    // so they can actually type in the terminal — unless agent-ghosted.
+    override var canBecomeKey: Bool { !blocksKey }
     override var canBecomeMain: Bool { false }
 
     /// When true, this window is "linked"/pinned to a single Space: it drops

@@ -35,6 +35,15 @@ final class TerminalWindowController: NSObject, NSWindowDelegate {
     /// summoning the session (the window itself can't be clicked).
     private(set) var isGhosted = false
 
+    /// True while this window is in AGENT GHOST mode: click-through AND non-key
+    /// (so synthetic input passes to the app being driven and the floating panel
+    /// can't steal the text cursor back), but STILL fully visible — unlike
+    /// `isGhosted`, it stays readable so the user watches the agent work. Exited
+    /// via the floating unlock badge, the `floaty host` route, or auto-surfaced
+    /// when the agent stops for user input.
+    private(set) var isAgentGhosted = false
+    private var unlockBadge: AgentGhostBadge?
+
     /// Per-window opacity override (0.1–1.0) set from the double-click header
     /// overlay. When non-nil it wins over the global focused/unfocused-dim
     /// settings for this window. Session-scoped (not persisted).
@@ -542,6 +551,42 @@ final class TerminalWindowController: NSObject, NSWindowDelegate {
         if !on { panel.presentOverlay() }
     }
 
+    // MARK: - Agent Ghost mode (drive an app through the window)
+
+    /// Enter/leave AGENT GHOST: the panel becomes click-through (`ignoresMouseEvents`)
+    /// and refuses key status (`blocksKey`) so synthetic clicks/keystrokes pass to
+    /// the app the agent is driving and can't be stolen back by a stray hover —
+    /// the root-cause fix for "typing scattered / the field wouldn't focus". The
+    /// window stays fully visible; a floating unlock badge signals the state and
+    /// is the click-to-release escape hatch (the panel itself can't be clicked).
+    func setAgentGhost(_ on: Bool) {
+        guard on != isAgentGhosted else { return }
+        isAgentGhosted = on
+        panel.blocksKey = on
+        panel.ignoresMouseEvents = on
+        panel.alphaValue = 1.0                 // stay readable — the badge is the cue
+        if on {
+            // Relinquish key focus NOW. `blocksKey` only stops the panel becoming
+            // key in future; a panel that's ALREADY key keeps eating keystrokes
+            // (you could still type into the terminal). Ordering a key window out
+            // resigns it; re-show without makeKey — `blocksKey` stops it re-grabbing
+            // — so it's visible but inert. (In the agent flow the next
+            // `type --target/--pid` would re-activate the target anyway; this makes
+            // ghost-on feel right immediately and for manual use.)
+            if panel.isKeyWindow {
+                panel.orderOut(nil)
+                panel.reassertFloatingBehavior()
+                panel.orderFrontRegardless()
+            }
+            let badge = unlockBadge ?? AgentGhostBadge { [weak self] in self?.setAgentGhost(false) }
+            unlockBadge = badge
+            badge.show(over: panel.frame)
+        } else {
+            unlockBadge?.hide()
+            panel.presentOverlay()             // reclaim interactivity + key focus
+        }
+    }
+
     // MARK: - Ticker mode (one-line live strip)
 
     /// Collapses this window into a one-line floating strip showing the active
@@ -912,13 +957,16 @@ final class TerminalWindowController: NSObject, NSWindowDelegate {
 
     private func applyAppearance(focused: Bool) {
         contentBlur.isHidden = !Settings.shared.backgroundBlur
+        // Agent Ghost is intentionally non-key while the agent drives "through"
+        // it, but must stay fully readable — so treat it as focused for dimming.
+        let effectiveFocused = focused || isAgentGhosted
         // A per-window override (from the header double-click overlay) wins over
         // the global focused/unfocused-dim settings for this window.
         let alpha: Double
         if let override = opacityOverride {
             alpha = override
         } else {
-            alpha = (Settings.shared.dimWhenUnfocused && !focused)
+            alpha = (Settings.shared.dimWhenUnfocused && !effectiveFocused)
                 ? Settings.shared.unfocusedOpacity
                 : Settings.shared.focusedOpacity
         }
@@ -951,6 +999,7 @@ final class TerminalWindowController: NSObject, NSWindowDelegate {
             self.applyAppearance(focused: self.panel.isKeyWindow)
         }
         vc.onGhost = { [weak self] in self?.setGhosted(true) }
+        vc.onAgentGhost = { [weak self] in self?.setAgentGhost(true) }
 
         let popover = NSPopover()
         popover.contentViewController = vc
@@ -2216,8 +2265,13 @@ final class TerminalWindowController: NSObject, NSWindowDelegate {
         dismissWindowOptions()   // don't leave the overlay floating over an inactive window
         applyAppearance(focused: false)
     }
-    func windowDidMove(_ notification: Notification)      { scheduleFrameSave() }
-    func windowDidResize(_ notification: Notification)    { scheduleFrameSave() }
+    func windowDidMove(_ notification: Notification)      { scheduleFrameSave(); repositionAgentBadge() }
+    func windowDidResize(_ notification: Notification)    { scheduleFrameSave(); repositionAgentBadge() }
+
+    /// Keep the Agent Ghost unlock badge pinned to the window's corner as it moves.
+    private func repositionAgentBadge() {
+        if isAgentGhosted { unlockBadge?.reposition(over: panel.frame) }
+    }
 
     /// Move/resize fire continuously during a drag; coalesce into one
     /// state-record write shortly after the gesture settles. Per-window records
