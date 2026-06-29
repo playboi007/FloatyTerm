@@ -111,8 +111,10 @@ final class FloatingPanel: NSPanel {
         // Only grab key focus if we actually landed on the active Space. A
         // pinned window being revealed onto a DIFFERENT Space must not makeKey,
         // or it would yank the user across Spaces. Roaming windows join all
-        // Spaces, so isOnActiveSpace is true for them.
-        if isOnActiveSpace { makeKey() }
+        // Spaces, so isOnActiveSpace is true for them. And never grab key while
+        // agent-ghosted (`blocksKey`) — a stray show path must not steal focus
+        // back from the app the agent is driving.
+        if isOnActiveSpace && !blocksKey { makeKey() }
     }
 
     // MARK: - Legacy frame restore (migration fallback)

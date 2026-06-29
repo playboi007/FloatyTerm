@@ -43,6 +43,7 @@ final class TerminalWindowController: NSObject, NSWindowDelegate {
     /// when the agent stops for user input.
     private(set) var isAgentGhosted = false
     private var unlockBadge: AgentGhostBadge?
+    private var wasPinnedBeforeGhost = false
 
     /// Per-window opacity override (0.1–1.0) set from the double-click header
     /// overlay. When non-nil it wins over the global focused/unfocused-dim
@@ -566,6 +567,14 @@ final class TerminalWindowController: NSObject, NSWindowDelegate {
         panel.ignoresMouseEvents = on
         panel.alphaValue = 1.0                 // stay readable — the badge is the cue
         if on {
+            // Unpin while ghosting: a Space-pinned (managed) window is bound to one
+            // Space and fights the agent's Space switches (raise / notification-style
+            // surfacing). Drop the pin for the duration; restore it on release.
+            wasPinnedBeforeGhost = panel.isPinned
+            if panel.isPinned {
+                panel.setPinned(false)
+                header.setPinned(false)
+            }
             // Relinquish key focus NOW. `blocksKey` only stops the panel becoming
             // key in future; a panel that's ALREADY key keeps eating keystrokes
             // (you could still type into the terminal). Ordering a key window out
@@ -578,11 +587,16 @@ final class TerminalWindowController: NSObject, NSWindowDelegate {
                 panel.reassertFloatingBehavior()
                 panel.orderFrontRegardless()
             }
-            let badge = unlockBadge ?? AgentGhostBadge { [weak self] in self?.setAgentGhost(false) }
+            let badge = unlockBadge ?? AgentGhostBadge()
             unlockBadge = badge
             badge.show(over: panel.frame)
         } else {
             unlockBadge?.hide()
+            if wasPinnedBeforeGhost {           // restore the pre-ghost Space pin
+                panel.setPinned(true)
+                header.setPinned(true)
+            }
+            wasPinnedBeforeGhost = false
             panel.presentOverlay()             // reclaim interactivity + key focus
         }
     }
