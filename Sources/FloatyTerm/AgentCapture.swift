@@ -672,11 +672,14 @@ enum AgentAX {
             walk(root)
             return out
         }
-        // Chrome enables its a11y tree lazily — retry if the first sweep is empty.
+        // Chrome enables its a11y tree lazily AND a freshly-navigated page needs a
+        // beat to populate it — so retry (to the caller's ~40-char "real content"
+        // bar, not a token 20) before giving up. ~1.5s budget catches a settling
+        // page so read-text returns lossless AX text instead of falling to OCR.
         var parts = sweep()
         var attempt = 0
-        while parts.joined(separator: "\n").count < 20 && attempt < 2 {
-            try await Task.sleep(nanoseconds: 250_000_000)
+        while parts.joined(separator: "\n").count < 40 && attempt < 5 {
+            try await Task.sleep(nanoseconds: 300_000_000)
             parts = sweep()
             attempt += 1
         }

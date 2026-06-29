@@ -41,6 +41,7 @@
 #   floaty capture --window "Flutter" [--ocr]           # returns a capture FRAME (frame_id +
 #                                                        # origin/size/scale/image dims) + PNG
 #   floaty capture --window-id 12345 [--ocr]            # exact window from list-windows
+#   floaty capture --pid 8123 [--ocr]                   # that process's largest on-screen window
 #   floaty click-in-frame --frame cap_… --x <imgpx> --y <imgpx> [--button right] [--clicks 2] [--human]
 #                 (x/y are PIXELS in the captured PNG, as your vision model reads them;
 #                  FloatyTerm inverts to a screen point and clicks — no scale math, no re-capture)

@@ -88,9 +88,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         DevtoolsRelay.shared.onAgentCapture = { b in
             let window = b["window"] as? String
-            let windowID = (b["window_id"] as? NSNumber)?.uint32Value
+            var windowID = (b["window_id"] as? NSNumber)?.uint32Value
+            // Accept --pid like the other targeting verbs (som/query-ax/read-text/
+            // raise/focused all take it) — resolve to that process's largest
+            // on-screen window. Removes a needless "capture rejects --pid" stumble.
+            if windowID == nil, let pid = (b["pid"] as? NSNumber).map({ pid_t($0.intValue) }) {
+                if let win = AgentCapture.listWindows().filter({ $0.pid == pid }).max(by: { $0.area < $1.area }) {
+                    windowID = win.id
+                } else {
+                    let off = AgentCapture.listWindows(includingOffScreen: true).filter { $0.pid == pid && !$0.onScreen }
+                    if !off.isEmpty {
+                        return ["error": "pid \(pid) has \(off.count) window(s) off the current Space/Stage; run "
+                            + "`floaty raise --pid \(pid)` to surface it, then retry."]
+                    }
+                    return ["error": "no on-screen window for pid \(pid)"]
+                }
+            }
             guard window != nil || windowID != nil else {
-                return ["error": "expected {window} or {window_id} (see `floaty list-windows`)"]
+                return ["error": "expected {window}, {window_id}, or {pid} (see `floaty list-windows`)"]
             }
             let ocr = (b["ocr"] as? NSNumber)?.boolValue ?? false
             do {
@@ -604,15 +619,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             self?.windows.first { $0.id == id }?.show()
         }
 
-        // Ghosted (click-through) windows can't be clicked; this menu section
-        // is how they come back.
+        // Ghosted windows can't be clicked (manual ghost = click-through; Agent
+        // Ghost = non-activating + a pass-through banner). Either way this menu
+        // section is how they come back — important for Agent Ghost now that the
+        // banner is non-interactive (it can't release itself by design).
         statusItem.ghostedWindowsProvider = { [weak self] in
             (self?.windows ?? [])
-                .filter { $0.isGhosted }
+                .filter { $0.isGhosted || $0.isAgentGhosted }
                 .map { (id: $0.id, title: $0.displayTitle) }
         }
         statusItem.onUnghostWindow = { [weak self] id in
-            self?.windows.first { $0.id == id }?.setGhosted(false)
+            guard let wc = self?.windows.first(where: { $0.id == id }) else { return }
+            if wc.isGhosted { wc.setGhosted(false) }
+            if wc.isAgentGhosted { wc.setAgentGhost(false) }
         }
 
         // Fleet summary: periodically count terminal sessions that are
