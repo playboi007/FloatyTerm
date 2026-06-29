@@ -227,15 +227,21 @@ enum AgentCapture {
             func n(_ k: String) -> CGFloat { CGFloat((b[k] as? NSNumber)?.doubleValue ?? 0) }
             let bounds = CGRect(x: n("X"), y: n("Y"), width: n("Width"), height: n("Height"))
             let onScreen = includingOffScreen ? onScreenIDs.contains(id) : true
+            let title = info[kCGWindowName as String] as? String ?? ""
             // Off-screen additions are noisy: a single Chrome window backs a dozen
             // tab-strip/shadow sliver windows. Keep only real content windows (the
             // ≥200² floor bestMatch uses); on-screen results are left untouched.
             if !onScreen && (bounds.width < 200 || bounds.height < 200) { return nil }
+            // Phantom helper windows: several apps (Slack, Notes…) park a junk,
+            // TITLELESS ~500×500 window at (0,400) that's never real content and
+            // just adds noise to window selection. A real off-stage content window
+            // carries a title; drop the titleless mid-size off-screen ones.
+            if !onScreen && title.isEmpty && bounds.width <= 520 && bounds.height <= 520 { return nil }
             return WindowInfo(
                 id: id,
                 pid: ownerPID,
                 owner: info[kCGWindowOwnerName as String] as? String ?? "",
-                title: info[kCGWindowName as String] as? String ?? "",
+                title: title,
                 bounds: bounds,
                 onScreen: onScreen)
         }
@@ -437,6 +443,8 @@ enum AgentAX {
         case appNotFound(String)
         case ambiguousApp(String, [pid_t])
         case noMatch(String)
+        case noFocusedElement
+        case stalePress(was: String, now: String)
         var errorDescription: String? {
             switch self {
             case .notTrusted:
@@ -450,6 +458,13 @@ enum AgentAX {
                     + "(see `floaty list-windows`)."
             case .noMatch(let s):
                 return "No accessibility element matches \(s)."
+            case .noFocusedElement:
+                return "No focused element in the target — click the field first (then `floaty focused` "
+                    + "to confirm), so there's a cursor to write into."
+            case .stalePress(let was, let now):
+                return "element changed since the query: matched \"\(was)\" but the handle now points at "
+                    + "\"\(now)\" — re-query and press again. (Dynamic lists/menus recycle AX nodes; "
+                    + "this guard refused to press the wrong row.)"
             }
         }
     }
@@ -570,6 +585,18 @@ enum AgentAX {
             guard let t = result.pressTarget, let m = result.pressMatch else {
                 throw AXError.noMatch(describe(role: role, title: title))
             }
+            // Atomic-press guard. We act on the AXUIElement handle captured during
+            // the walk — but in a DYNAMIC list (quick-switcher, autocomplete/menu
+            // dropdown) the tree mutates between the walk and the press: nodes get
+            // recycled and reordered, so the handle can now point at a DIFFERENT
+            // row (this is how "press admin-flutter" opened a stranger's DM). Re-read
+            // the handle's live name and bail if it no longer matches what we matched
+            // — same contract as click-in-frame's "window moved … re-capture". Static
+            // toolbar buttons are stable, so this never trips on the common case.
+            let liveName = name(of: t)
+            if !m.name.isEmpty && liveName != m.name {
+                throw AXError.stalePress(was: m.name, now: liveName)
+            }
             AXUIElementPerformAction(t, kAXPressAction as CFString)
             return (result.matches, m)
         }
@@ -609,6 +636,55 @@ enum AgentAX {
         let value = String((copyString(el, kAXValueAttribute as CFString) ?? "").prefix(300))
         let editable = ["AXTextField", "AXTextArea", "AXComboBox", "AXSearchField"].contains(role)
         return FocusedInfo(hasFocus: true, role: role, name: name, value: value, editable: editable)
+    }
+
+    struct SetTextResult: Sendable {
+        let landed: Bool        // re-read confirms the value is actually in the field
+        let settable: Bool      // the element advertised AXValue as writable
+        let role: String
+        let value: String       // the field's value AFTER the write (re-read)
+    }
+
+    /// Write text into the focused field by SETTING its AXValue directly, instead
+    /// of dispatching synthetic keystrokes. This is the reliable text-entry path for
+    /// Chromium/Electron (Slack, VS Code, Discord…): synthetic CGEvents route to
+    /// whatever the window server holds as first responder, which in those apps can
+    /// differ from what AX reports as focused — so `type` fires events that land in
+    /// the composer or nowhere while reporting success (it counts events sent, not
+    /// characters landed). Setting AXValue addresses the focused element itself, so
+    /// there's no routing to get wrong; we then RE-READ the value and report whether
+    /// it truly landed, rather than claiming success blindly.
+    ///
+    /// Caller is responsible for focusing the field first (click / `focused`). If the
+    /// element doesn't expose a settable AXValue (some custom web inputs don't),
+    /// `landed:false, settable:false` comes back — the signal to fall back to paste.
+    static func setText(app: String?, pid: pid_t?, text: String) throws -> SetTextResult {
+        guard AXIsProcessTrusted() else { throw AXError.notTrusted }
+        let appPID = try resolvePID(app: app, pid: pid)
+        let appEl = AXUIElementCreateApplication(appPID)
+        AXUIElementSetMessagingTimeout(appEl, 2.0)
+        AXUIElementSetAttributeValue(appEl, "AXManualAccessibility" as CFString, kCFBooleanTrue)
+        AXUIElementSetAttributeValue(appEl, "AXEnhancedUserInterface" as CFString, kCFBooleanTrue)
+
+        var f: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(appEl, kAXFocusedUIElementAttribute as CFString, &f) == .success,
+              let f, CFGetTypeID(f) == AXUIElementGetTypeID()
+        else { throw AXError.noFocusedElement }
+        let el = f as! AXUIElement
+        let role = copyString(el, kAXRoleAttribute as CFString) ?? ""
+
+        var settableRef: DarwinBoolean = false
+        AXUIElementIsAttributeSettable(el, kAXValueAttribute as CFString, &settableRef)
+        let settable = settableRef.boolValue
+
+        AXUIElementSetAttributeValue(el, kAXValueAttribute as CFString, text as CFString)
+        // Re-read to verify: some Electron fields report settable but ignore the
+        // write, or normalize/trim it. Accept exact match, containment, or a healthy
+        // prefix (rich editors can append a trailing node).
+        let after = String((copyString(el, kAXValueAttribute as CFString) ?? "").prefix(500))
+        let head = String(text.prefix(min(40, text.count)))
+        let landed = !text.isEmpty && (after == text || after.contains(text) || after.contains(head))
+        return SetTextResult(landed: landed, settable: settable, role: role, value: after)
     }
 
     /// Bring a target app + window to the ACTIVE Space — the sanctioned twin of

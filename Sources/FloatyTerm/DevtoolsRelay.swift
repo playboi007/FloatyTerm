@@ -55,6 +55,7 @@ final class DevtoolsRelay {
     var onAgentRaise:     (([String: Any]) async -> [String: Any])?
     var onAgentReadText:  (([String: Any]) async -> [String: Any])?
     var onAgentFocused:   (([String: Any]) async -> [String: Any])?
+    var onAgentSetText:   (([String: Any]) -> [String: Any])?
     var onAgentHost:      (([String: Any]) -> [String: Any])?
 
     private var listener: NWListener?
@@ -153,6 +154,7 @@ final class DevtoolsRelay {
         case ("POST", "/agent/raise"):      return agentAsync("raise", onAgentRaise,      Data(body.prefix(contentLength)))
         case ("POST", "/agent/read-text"):  return agentAsync("read-text", onAgentReadText, Data(body.prefix(contentLength)))
         case ("POST", "/agent/focused"):    return agentAsync("focused", onAgentFocused,   Data(body.prefix(contentLength)))
+        case ("POST", "/agent/set-text"):   return agentSync("set-text", onAgentSetText,   Data(body.prefix(contentLength)))
         case ("POST", "/agent/host"):       return agentSync("host", onAgentHost,       Data(body.prefix(contentLength)))
         default:
             return response(404, "text/plain", "not found")
@@ -271,7 +273,8 @@ final class DevtoolsRelay {
         // trace shows what signal it actually had at each branch point.
         var outcome: [String: Any] = [:]
         for k in ["count", "frame_id", "source", "pressed", "truncated", "url",
-                  "screen_x", "screen_y", "on_screen", "ghost", "released"] {
+                  "screen_x", "screen_y", "on_screen", "ghost", "released",
+                  "landed", "settable", "editable", "has_focus", "role"] {
             if let v = result[k] { outcome[k] = (v as? String).map { String($0.prefix(120)) } ?? v }
         }
         if !outcome.isEmpty { line["result"] = outcome }

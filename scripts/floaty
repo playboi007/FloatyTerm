@@ -32,6 +32,10 @@
 #                  apps, e.g. two Chromes, where --target "Google Chrome" is a coin flip)
 #   floaty focused --app "Notes" | --pid 8123           # the focused element (role/value/editable):
 #                                                        # confirm a text cursor exists BEFORE typing
+#   floaty set-text --pid 8123 --text "hello"           # write text into the FOCUSED field via the AX API
+#                 # (not keystrokes) — the reliable entry path for Electron/Chromium, where `type` fires
+#                 # events that miss the field yet report success. Re-reads → landed:true/false; landed/
+#                 # settable:false → fall back to paste (pbcopy + ⌘V). Focus the field first.
 #   floaty raise   --app "Google Chrome" | --pid 8123   # surface an off-stage / other-Space / inactive-
 #                 # fullscreen window onto the ACTIVE Space (like a notification) so capture/som/click work
 #   floaty host    --ghost on | --ghost off             # Agent Ghost: make FloatyTerm's front window
@@ -77,7 +81,7 @@ set -euo pipefail
 HOST="127.0.0.1:7777"
 
 cmd="${1:-}"; shift || true
-[ -n "$cmd" ] || { echo "usage: floaty <click|move|drag|scroll|type|key|capture|query-dom|query-ax|focused|read-text|eval|navigate|tabs|focus|list-windows|mark|click-in-frame|move-in-frame|som|click-mark|host|raise> [--flag value ...]" >&2; exit 2; }
+[ -n "$cmd" ] || { echo "usage: floaty <click|move|drag|scroll|type|key|set-text|capture|query-dom|query-ax|focused|read-text|eval|navigate|tabs|focus|list-windows|mark|click-in-frame|move-in-frame|som|click-mark|host|raise> [--flag value ...]" >&2; exit 2; }
 
 args=("$@")
 # Expand the array in a way that's safe when it's EMPTY under `set -u` on the
@@ -111,6 +115,7 @@ paths = {"click":"/agent/click","move":"/agent/move","drag":"/agent/drag",
          "click-in-frame":"/agent/click-in-frame","move-in-frame":"/agent/move-in-frame",
          "som":"/agent/som","click-mark":"/agent/click-mark",
          "query-ax":"/agent/query-ax","focused":"/agent/focused",
+         "set-text":"/agent/set-text",
          "host":"/agent/host","raise":"/agent/raise",
          "read-text":"/agent/read-text"}
 print(json.dumps({"path": paths.get(cmd, "/agent/"+cmd), "body": obj}))

@@ -436,6 +436,36 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                         "name": f.name, "value": f.value, "editable": f.editable]
             } catch { return ["error": error.localizedDescription] }
         }
+        // set-text: write into the focused field by SETTING its AXValue directly,
+        // bypassing synthetic keystrokes. The reliable text-entry path for
+        // Chromium/Electron, where `type`'s CGEvents route to the wrong responder
+        // and it reports success without anything landing. Re-reads to report
+        // `landed` honestly; `settable:false` means fall back to paste.
+        DevtoolsRelay.shared.onAgentSetText = { b in
+            let app = b["app"] as? String
+            let pid = (b["pid"] as? NSNumber).map { pid_t($0.intValue) }
+            guard let text = b["text"] as? String else { return ["error": "expected {text}"] }
+            guard app != nil || pid != nil else {
+                return ["error": "expected {app} or {pid} (see `floaty list-windows` for pids). "
+                    + "Focus the field first (click → `floaty focused`), then set-text writes into it."]
+            }
+            do {
+                let r = try AgentAX.setText(app: app, pid: pid, text: text)
+                if r.landed {
+                    return ["ok": true, "landed": true, "settable": r.settable,
+                            "role": r.role, "value": r.value]
+                }
+                // Wrote but the field didn't take it — tell the agent to paste, don't
+                // let it think text entry succeeded.
+                return ["ok": false, "landed": false, "settable": r.settable, "role": r.role,
+                        "value": r.value,
+                        "error": r.settable
+                            ? "AXValue write didn't stick on a \(r.role) (custom web input ignores it). "
+                                + "Fall back to paste: `printf %s \"$TEXT\" | pbcopy; floaty key --key v --modifiers cmd --pid <N>`."
+                            : "focused \(r.role) doesn't expose a settable value. Fall back to paste "
+                                + "(pbcopy + ⌘V) — and confirm the field was focused first (`floaty focused`)."]
+            } catch { return ["error": error.localizedDescription] }
+        }
         // raise: surface a target app/window onto the ACTIVE Space — the public
         // equivalent of clicking a notification. The agent's self-recovery for an
         // off-stage / other-Space / inactive-full-screen window: list-windows sees
