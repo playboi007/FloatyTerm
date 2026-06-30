@@ -552,10 +552,22 @@ enum AgentAX {
                     let m = AXMatch(role: r, name: name(of: el), rect: rect,
                                     center: CGPoint(x: rect.midX, y: rect.midY))
                     if out.count < max { out.append(m) }
-                    // Press the first ACTIONABLE match — a title filter can also
-                    // hit the element's static-text twin; don't press dead text.
-                    if press && pressMatch == nil, wantRole != nil || interactable.contains(r) {
-                        pressTarget = el; pressMatch = m
+                    // Resolve the press target for the FIRST match. A `--title` filter
+                    // usually lands on the visible LABEL (an AXStaticText), whose
+                    // clickable thing is its container (the row / option / button). So:
+                    // press this element if it's actionable itself, else the nearest
+                    // ancestor that actually supports AXPress. (Previously a label-only
+                    // match set no target → "press-fail" even though a click here works.)
+                    if press && pressMatch == nil {
+                        if wantRole != nil || interactable.contains(r) {
+                            pressTarget = el; pressMatch = m
+                        } else if let p = nearestPressable(el) {
+                            let prect = rectOf(p) ?? rect
+                            pressTarget = p
+                            pressMatch = AXMatch(role: copyString(p, kAXRoleAttribute as CFString) ?? r,
+                                                 name: name(of: p), rect: prect,
+                                                 center: CGPoint(x: prect.midX, y: prect.midY))
+                        }
                     }
                 }
                 if let kids = copyChildren(el) {
@@ -570,13 +582,16 @@ enum AgentAX {
             return (out, pressTarget, pressMatch)
         }
 
-        // Chromium enables its a11y tree IN RESPONSE to the nudge above, so the
-        // very first sweep often comes back near-empty. Retry a couple of times
-        // (non-blocking) until the tree populates; native apps satisfy attempt 1.
+        // Chromium enables its a11y tree IN RESPONSE to the nudge above, and it
+        // takes ~1s to populate — longer than this used to wait (2×250ms), which is
+        // why a fresh Chrome/Electron query came back count:0 while `read-text`
+        // (which retries ~1.5s) saw the same tree fine. Match that patience: retry
+        // until the tree fills, ~1.6s budget. Native apps satisfy attempt 1, so they
+        // pay nothing; only a genuinely sparse/lazy tree spends the extra time.
         var result = sweep()
         var attempt = 0
-        while result.matches.count < 2 && attempt < 2 {
-            try await Task.sleep(nanoseconds: 250_000_000)
+        while result.matches.count < 2 && attempt < 5 {
+            try await Task.sleep(nanoseconds: 320_000_000)
             result = sweep()
             attempt += 1
         }
@@ -873,6 +888,32 @@ enum AgentAX {
             let clipped = joined.count > maxChars ? String(joined.prefix(maxChars)) : joined
             return TextSection(label: sec.label, chars: clipped.count, text: clipped)
         }
+    }
+
+    /// Actions an element advertises (e.g. AXPress, AXShowMenu).
+    private static func actionNames(_ el: AXUIElement) -> [String] {
+        var names: CFArray?
+        guard AXUIElementCopyActionNames(el, &names) == .success, let arr = names as? [String] else { return [] }
+        return arr
+    }
+
+    /// The nearest element — `el` itself or an ancestor within `maxHops` — that
+    /// actually supports the AXPress action. Lets `--press` activate the clickable
+    /// container (row / option / button) when a `--title` filter matched only the
+    /// static-text label inside it. Role-agnostic: it asks the element what it can
+    /// do rather than guessing from its role, so custom/Electron widgets work too.
+    private static func nearestPressable(_ el: AXUIElement, maxHops: Int = 6) -> AXUIElement? {
+        var cur: AXUIElement? = el
+        var hops = 0
+        while let c = cur, hops <= maxHops {
+            if actionNames(c).contains(kAXPressAction as String) { return c }
+            var p: CFTypeRef?
+            guard AXUIElementCopyAttributeValue(c, kAXParentAttribute as CFString, &p) == .success,
+                  let p, CFGetTypeID(p) == AXUIElementGetTypeID() else { return nil }
+            cur = (p as! AXUIElement)
+            hops += 1
+        }
+        return nil
     }
 
     private static func mainWindow(of appEl: AXUIElement) -> AXUIElement? {
