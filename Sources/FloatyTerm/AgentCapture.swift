@@ -528,11 +528,13 @@ enum AgentAX {
             return ""
         }
 
-        // One full tree walk. Returns the matches plus the first press target.
-        func sweep() -> (matches: [AXMatch], pressTarget: AXUIElement?, pressMatch: AXMatch?) {
+        // One full tree walk. Returns the matches, the first press target, and a
+        // Flutter "Enable accessibility" toggle if one is present (semantics off).
+        func sweep() -> (matches: [AXMatch], pressTarget: AXUIElement?, pressMatch: AXMatch?, toggle: AXUIElement?) {
             var out: [AXMatch] = []
             var pressTarget: AXUIElement?
             var pressMatch: AXMatch?
+            var toggle: AXUIElement?
             var visited = 0
             let nodeCap = 6000
 
@@ -541,6 +543,15 @@ enum AgentAX {
                 if out.count >= max && (!press || pressMatch != nil) { return }
                 visited += 1
                 let r = copyString(el, kAXRoleAttribute as CFString) ?? ""
+
+                // Flutter/engine canvas: a button literally named "Enable
+                // accessibility" means the semantics tree is OFF. Flag it (independent
+                // of the user's filter and of match count — browser chrome would
+                // otherwise mask an app whose own content semantics are absent).
+                if toggle == nil, r == "AXButton",
+                   name(of: el).range(of: "enable accessibility", options: .caseInsensitive) != nil {
+                    toggle = el
+                }
 
                 var isHit: Bool
                 if let wantRole { isHit = (r == wantRole) }
@@ -579,8 +590,10 @@ enum AgentAX {
                 }
             }
             walk(appEl)
-            return (out, pressTarget, pressMatch)
+            return (out, pressTarget, pressMatch, toggle)
         }
+
+        var result = sweep()
 
         // Chromium enables its a11y tree IN RESPONSE to the nudge above, and it
         // takes ~1s to populate — longer than this used to wait (2×250ms), which is
@@ -588,12 +601,29 @@ enum AgentAX {
         // (which retries ~1.5s) saw the same tree fine. Match that patience: retry
         // until the tree fills, ~1.6s budget. Native apps satisfy attempt 1, so they
         // pay nothing; only a genuinely sparse/lazy tree spends the extra time.
-        var result = sweep()
         var attempt = 0
         while result.matches.count < 2 && attempt < 5 {
+            if let toggle = result.toggle {     // Flutter toggle showed up first → press it
+                AXUIElementPerformAction(toggle, kAXPressAction as CFString)
+            }
             try await Task.sleep(nanoseconds: 320_000_000)
             result = sweep()
             attempt += 1
+        }
+
+        // Flutter/engine canvas: the loop above can exit "satisfied" while the app's
+        // OWN semantics are still off — browser chrome (Back/Forward/address bar)
+        // inflates the count past 2, masking empty app content. The honest signal is
+        // the "Enable accessibility" toggle itself. While it's present, press it and
+        // POLL until it's gone — Flutter builds the semantics sidecar over ~1–3s,
+        // longer than a single re-sweep waits. (It also resets to this toggle on
+        // every route change, so re-pressing each pass handles re-collapse.)
+        var flutterTries = 0
+        while result.toggle != nil && flutterTries < 6 {
+            AXUIElementPerformAction(result.toggle!, kAXPressAction as CFString)
+            try await Task.sleep(nanoseconds: 420_000_000)
+            result = sweep()
+            flutterTries += 1
         }
 
         if press {
@@ -793,9 +823,14 @@ enum AgentAX {
         // beat to populate it — so retry (to the caller's ~40-char "real content"
         // bar, not a token 20) before giving up. ~1.5s budget catches a settling
         // page so read-text returns lossless AX text instead of falling to OCR.
+        // Flutter/engine canvas: press the "Enable accessibility" toggle up front so
+        // the semantics sidecar builds before we read — browser chrome text can push
+        // us past the sparsity check below and mask empty app content otherwise.
+        if enableEngineSemanticsIfNeeded(appEl) { try await Task.sleep(nanoseconds: 500_000_000) }
         var parts = sweep()
         var attempt = 0
         while parts.joined(separator: "\n").count < 40 && attempt < 5 {
+            enableEngineSemanticsIfNeeded(appEl)   // re-collapsed on navigation → re-enable
             try await Task.sleep(nanoseconds: 300_000_000)
             parts = sweep()
             attempt += 1
@@ -875,9 +910,11 @@ enum AgentAX {
             return order.map { ($0, buckets[$0] ?? []) }
         }
 
+        if enableEngineSemanticsIfNeeded(appEl) { try await Task.sleep(nanoseconds: 500_000_000) }
         var secs = sweep()
         var attempt = 0
         while secs.reduce(0, { $0 + $1.lines.joined().count }) < 40 && attempt < 5 {
+            enableEngineSemanticsIfNeeded(appEl)   // re-collapsed on navigation → re-enable
             try await Task.sleep(nanoseconds: 300_000_000)
             secs = sweep()
             attempt += 1
@@ -914,6 +951,52 @@ enum AgentAX {
             hops += 1
         }
         return nil
+    }
+
+    /// Flutter (and some engine-rendered web UIs) paint to a canvas and expose NO
+    /// real AX tree until accessibility is switched on — they ship a hidden
+    /// "Enable accessibility" placeholder that, when pressed, makes the framework
+    /// build a parallel semantics tree (a sidecar DOM mirroring the widget tree)
+    /// that the browser then surfaces as AX. The tree also RESETS to that
+    /// placeholder on route changes. So: whenever a sweep comes back sparse, look
+    /// for that placeholder and press it — the canvas analog of the
+    /// AXManualAccessibility nudge we do for Chromium. Cheap because a collapsed
+    /// tree is tiny. Returns true if it pressed one (caller waits + re-sweeps).
+    @discardableResult
+    private static func enableEngineSemanticsIfNeeded(_ appEl: AXUIElement) -> Bool {
+        var visited = 0
+        let cap = 1500   // the placeholder is shallow; bound cost on already-rich trees
+        var hit: AXUIElement?
+        func walk(_ el: AXUIElement) {
+            if hit != nil || visited >= cap { return }
+            visited += 1
+            let label = (copyString(el, kAXTitleAttribute as CFString)
+                         ?? copyString(el, kAXDescriptionAttribute as CFString)
+                         ?? copyString(el, kAXValueAttribute as CFString) ?? "")
+            if label.range(of: "enable accessibility", options: .caseInsensitive) != nil {
+                hit = el; return
+            }
+            if let kids = copyChildren(el) { for k in kids { if hit != nil || visited >= cap { break }; walk(k) } }
+        }
+        walk(appEl)
+        if let hit { AXUIElementPerformAction(hit, kAXPressAction as CFString); return true }
+        return false
+    }
+
+    /// Auto-raise for `--pid` targets: if the process has no window on the active
+    /// Space but does have one off-stage (Stage Manager / another desktop — often
+    /// because a stray click shoved it there mid-task), surface it so the next
+    /// capture/som/read works without a manual `raise`. Also keeps the agent's
+    /// in-flight window in front, so the user is less likely to navigate the wrong
+    /// thing. No-op (true) when a window is already on-screen; false when the
+    /// process has no window at all (nothing to raise — don't loop).
+    @discardableResult
+    static func ensureOnScreen(pid: pid_t) async -> Bool {
+        if AgentCapture.listWindows().contains(where: { $0.pid == pid }) { return true }
+        let off = AgentCapture.listWindows(includingOffScreen: true).filter { $0.pid == pid && !$0.onScreen }
+        guard !off.isEmpty else { return false }
+        let r = try? await AgentAX.raise(app: nil, pid: pid)
+        return r?.onScreen ?? false
     }
 
     private static func mainWindow(of appEl: AXUIElement) -> AXUIElement? {

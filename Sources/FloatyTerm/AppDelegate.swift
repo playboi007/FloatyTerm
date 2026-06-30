@@ -93,16 +93,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             // raise/focused all take it) — resolve to that process's largest
             // on-screen window. Removes a needless "capture rejects --pid" stumble.
             if windowID == nil, let pid = (b["pid"] as? NSNumber).map({ pid_t($0.intValue) }) {
-                if let win = AgentCapture.listWindows().filter({ $0.pid == pid }).max(by: { $0.area < $1.area }) {
-                    windowID = win.id
-                } else {
-                    let off = AgentCapture.listWindows(includingOffScreen: true).filter { $0.pid == pid && !$0.onScreen }
-                    if !off.isEmpty {
-                        return ["error": "pid \(pid) has \(off.count) window(s) off the current Space/Stage; run "
-                            + "`floaty raise --pid \(pid)` to surface it, then retry."]
-                    }
-                    return ["error": "no on-screen window for pid \(pid)"]
+                var win = AgentCapture.listWindows().filter({ $0.pid == pid }).max(by: { $0.area < $1.area })
+                if win == nil {
+                    // Default for --pid: auto-raise an off-Space window (Stage Manager
+                    // / other desktop — usually a stray click shoved it there) instead
+                    // of erroring with "run raise". Surfaces it AND keeps the agent's
+                    // in-flight target in front. No-op if it's already on-screen.
+                    _ = await AgentAX.ensureOnScreen(pid: pid)
+                    win = AgentCapture.listWindows().filter({ $0.pid == pid }).max(by: { $0.area < $1.area })
                 }
+                if let win { windowID = win.id }
+                else { return ["error": "no window for pid \(pid) (it may have no open window — ⌘N in the app)"] }
             }
             guard window != nil || windowID != nil else {
                 return ["error": "expected {window}, {window_id}, or {pid} (see `floaty list-windows`)"]
@@ -249,18 +250,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             if app != nil || axPID != nil {
                 do {
                     let pid = try AgentAX.resolvePID(app: app, pid: axPID)
-                    guard let win = AgentCapture.listWindows()
-                            .filter({ $0.pid == pid })
-                            .max(by: { $0.area < $1.area }) else {
-                        // Open but off-stage? Say so (don't claim "no window").
-                        let off = AgentCapture.listWindows(includingOffScreen: true)
-                            .filter { $0.pid == pid && !$0.onScreen }
-                        if !off.isEmpty {
-                            return ["error": "\(app ?? "pid \(pid)") has \(off.count) window(s) open but off the "
-                                + "current Space/Stage (Stage Manager or another desktop). Run "
-                                + "`floaty raise --pid \(pid)` to surface it (or bring it forward manually), then "
-                                + "retry — off-screen windows can't be screenshotted. Don't just re-run this command."]
-                        }
+                    var win = AgentCapture.listWindows()
+                        .filter({ $0.pid == pid }).max(by: { $0.area < $1.area })
+                    if win == nil {
+                        // Default for --pid/--app: auto-raise an off-Space window (it
+                        // can't be screenshotted off-stage) instead of erroring.
+                        _ = await AgentAX.ensureOnScreen(pid: pid)
+                        win = AgentCapture.listWindows().filter({ $0.pid == pid }).max(by: { $0.area < $1.area })
+                    }
+                    guard let win else {
                         return ["error": "no window for that app/pid (it may have no open windows — ⌘N in the app)"]
                     }
                     let shot = try await AgentCapture.rawCapture(windowID: win.id, fallbackName: app)
@@ -370,6 +368,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             let maxN = (b["max"] as? NSNumber)?.intValue ?? 100
             let press = (b["press"] as? NSNumber)?.boolValue ?? false
             do {
+                // Auto-raise (default for --pid/--app): Chromium/Flutter expose their
+                // a11y tree only when foreground, so surface an off-Space window first.
+                if let rp = try? AgentAX.resolvePID(app: app, pid: pid) {
+                    _ = await AgentAX.ensureOnScreen(pid: rp)
+                }
                 let (matches, pressed) = try await AgentAX.query(
                     app: app, pid: pid, role: role, title: title, max: maxN, press: press)
                 let arr: [[String: Any]] = matches.map { m in
@@ -527,6 +530,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             }
             let wantSections = (b["sections"] as? Bool) ?? false
             do {
+                // Auto-raise (default for --pid/--app): surface an off-Space window
+                // first. For Chrome/Flutter the tree only populates when foreground,
+                // and the OCR fallback needs it on-screen — so this makes the read
+                // richer, not just the fallback work. No-op if already on-screen.
+                if let rp = try? AgentAX.resolvePID(app: app, pid: pid) {
+                    _ = await AgentAX.ensureOnScreen(pid: rp)
+                }
                 // --sections: labeled regions (by ARIA landmark) so the caller can
                 // pick "the thread/detail pane" without awk-ing the flat dump.
                 if wantSections {
