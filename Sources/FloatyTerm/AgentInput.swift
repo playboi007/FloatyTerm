@@ -359,6 +359,12 @@ enum AgentInput {
     static func type(_ text: String, pacing: Pacing = .instant, target: String? = nil, targetPID: pid_t? = nil) -> Bool {
         guard ensureAccessibility(), activate(target, pid: targetPID) else { return false }
         let src = CGEventSource(stateID: .hidSystemState)
+        // Human-paced AND a recorded profile exists → reproduce the user's real
+        // rhythm (dwell + flight + corrections). Otherwise fall back to flat jitter.
+        if pacing.isHuman, let prof = TypingProfile.current() {
+            typeProfiled(text, prof: prof, source: src)
+            return true
+        }
         for scalar in text.unicodeScalars {
             postUnicode(String(scalar), source: src)
             if pacing.isHuman { usleep(humanKeyDelay()) }
@@ -366,7 +372,64 @@ enum AgentInput {
         return true
     }
 
-    private static func postUnicode(_ s: String, source: CGEventSource?) {
+    /// Emit `text` using the recorded keystroke-dynamics profile: per-character
+    /// flight gaps and key-hold (dwell) sampled from the user's data, with
+    /// occasional backspace-and-retype corrections at the measured rate. The
+    /// corrections only ever delete and re-type the SAME characters, so the
+    /// final text is always exactly `text` — no wrong data is ever entered.
+    private static func typeProfiled(_ text: String, prof: TypingProfile, source: CGEventSource?) {
+        let deleteCode = keycode(for: "delete") ?? 51
+        let returnCode = keycode(for: "return") ?? 36
+        var prev: Character? = nil
+        var buffer: [Character] = []          // recently emitted printable chars
+        let bufferCap = 16
+
+        func sleepMs(_ ms: Double) {
+            guard ms > 0 else { return }
+            usleep(useconds_t(min(ms, 4000) * 1000))   // 4 s safety ceiling
+        }
+        func emit(_ c: Character) {
+            sleepMs(prof.flightMs(prev: prev, cur: c))
+            postUnicode(String(c), source: source, dwellUs: useconds_t(prof.dwellMs(for: c) * 1000))
+            prev = c
+        }
+
+        for c in text {
+            if c == "\n" || c == "\r" {
+                // Treat a line break as a real Return; corrections never span lines.
+                sleepMs(prof.flightMs(prev: prev, cur: " "))
+                postKeycode(returnCode, source: source, dwellUs: useconds_t(prof.dwellMs(for: " ") * 1000))
+                prev = nil
+                buffer.removeAll()
+                continue
+            }
+
+            // Buffer must mirror the emitted tail EXACTLY (spaces included), or a
+            // backspace-and-retype would delete real chars and restore different
+            // ones — corrupting the text. Trigger guard stays on non-whitespace.
+            emit(c)
+            buffer.append(c)
+            if buffer.count > bufferCap { buffer.removeFirst() }
+
+            // Backspace-and-retype correction (the "equivalent typo").
+            if !c.isWhitespace, !buffer.isEmpty, prof.shouldCorrect() {
+                let k = min(prof.sampleBurstLen(), buffer.count)
+                let lastK = Array(buffer.suffix(k))
+                sleepMs(prof.correctionEntryMs())
+                for i in 0..<k {
+                    if i > 0 { sleepMs(prof.bkspIntervalMs()) }
+                    postKeycode(deleteCode, source: source,
+                                dwellUs: useconds_t(prof.backspaceDwellMs() * 1000))
+                }
+                sleepMs(prof.resumeMs())
+                // Re-type the identical characters; buffer content is unchanged.
+                prev = buffer.count > k ? buffer[buffer.count - k - 1] : nil
+                for ch in lastK { emit(ch) }
+            }
+        }
+    }
+
+    private static func postUnicode(_ s: String, source: CGEventSource?, dwellUs: useconds_t = 0) {
         let utf16 = Array(s.utf16)
         guard let down = CGEvent(keyboardEventSource: source, virtualKey: 0, keyDown: true),
               let up = CGEvent(keyboardEventSource: source, virtualKey: 0, keyDown: false)
@@ -376,7 +439,17 @@ enum AgentInput {
             up.keyboardSetUnicodeString(stringLength: buf.count, unicodeString: buf.baseAddress)
         }
         down.post(tap: .cghidEventTap)
+        if dwellUs > 0 { usleep(dwellUs) }
         up.post(tap: .cghidEventTap)
+    }
+
+    /// Press a key by virtual keycode, optionally holding it `dwellUs` first.
+    private static func postKeycode(_ code: CGKeyCode, source: CGEventSource?, dwellUs: useconds_t = 0) {
+        let down = CGEvent(keyboardEventSource: source, virtualKey: code, keyDown: true)
+        let up = CGEvent(keyboardEventSource: source, virtualKey: code, keyDown: false)
+        down?.post(tap: .cghidEventTap)
+        if dwellUs > 0 { usleep(dwellUs) }
+        up?.post(tap: .cghidEventTap)
     }
 
     // MARK: - Named keys & chords (keycode-based)
