@@ -1,0 +1,16 @@
+{
+  "manifest_version": 3,
+  "name": "FloatyTerm CDP Bridge",
+  "version": "0.1.0",
+  "description": "Bridges the user's live Chrome tabs to FloatyTerm over the Chrome DevTools Protocol via chrome.debugger — no --remote-debugging-port, no relaunch, session intact.",
+  "permissions": ["debugger", "tabs", "alarms", "storage"],
+  "host_permissions": ["<all_urls>"],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "options_page": "options.html",
+  "action": {
+    "default_title": "FloatyTerm CDP Bridge (click for status)",
+    "default_popup": "options.html"
+  }
+}
