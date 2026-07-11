@@ -43,13 +43,6 @@ enum AgentInput {
     /// --animation-interval default). Lower = smoother + more events.
     private static let animationInterval: TimeInterval = 0.01
 
-    /// Per-keystroke delay when typing human-paced, mildly randomized so it
-    /// isn't a metronome (real typing is irregular). Base ~60ms.
-    private static func humanKeyDelay() -> useconds_t {
-        let base = 0.06, jitter = Double.random(in: -0.02...0.04)
-        return useconds_t(max(0.01, base + jitter) * 1_000_000)
-    }
-
     // MARK: - Permission gate (mirrors ContextSnap.ensurePermission)
 
     static func ensureAccessibility() -> Bool {
@@ -356,80 +349,41 @@ enum AgentInput {
 
     // MARK: - Text (layout-independent, optionally human-paced)
 
-    static func type(_ text: String, pacing: Pacing = .instant, target: String? = nil, targetPID: pid_t? = nil) -> Bool {
-        guard ensureAccessibility(), activate(target, pid: targetPID) else { return false }
+    struct TypeOutcome {
+        let ok: Bool
+        let typed: Int      // characters of `text` that actually landed
+        let stopped: Bool   // true when the user hit Stop on the replay HUD
+    }
+
+    /// Type `text`. Instant pacing posts events back-to-back and returns.
+    /// Human pacing runs as a pausable REPLAY SESSION on a background thread —
+    /// with a recorded profile it reproduces the user's real rhythm (dwell +
+    /// flight + backspace-and-retype corrections, which only ever delete and
+    /// re-type the SAME characters, so the final text is always exactly
+    /// `text`); without one it falls back to flat jitter. `showControls`
+    /// overlays play/pause/stop/speed transport on the terminal window for
+    /// the session's duration (see TypingReplay.swift).
+    static func type(_ text: String, pacing: Pacing = .instant, target: String? = nil,
+                     targetPID: pid_t? = nil, showControls: Bool = true) async -> TypeOutcome {
+        guard ensureAccessibility(), activate(target, pid: targetPID) else {
+            return TypeOutcome(ok: false, typed: 0, stopped: false)
+        }
         let src = CGEventSource(stateID: .hidSystemState)
-        // Human-paced AND a recorded profile exists → reproduce the user's real
-        // rhythm (dwell + flight + corrections). Otherwise fall back to flat jitter.
-        if pacing.isHuman, let prof = TypingProfile.current() {
-            typeProfiled(text, prof: prof, source: src)
-            return true
+        if pacing.isHuman {
+            let r = await TypingReplayController.shared.run(
+                text: text, profile: TypingProfile.current(), source: src,
+                showControls: showControls)
+            return TypeOutcome(ok: true, typed: r.typed, stopped: !r.completed)
         }
         for scalar in text.unicodeScalars {
             postUnicode(String(scalar), source: src)
-            if pacing.isHuman { usleep(humanKeyDelay()) }
         }
-        return true
+        return TypeOutcome(ok: true, typed: text.count, stopped: false)
     }
 
-    /// Emit `text` using the recorded keystroke-dynamics profile: per-character
-    /// flight gaps and key-hold (dwell) sampled from the user's data, with
-    /// occasional backspace-and-retype corrections at the measured rate. The
-    /// corrections only ever delete and re-type the SAME characters, so the
-    /// final text is always exactly `text` — no wrong data is ever entered.
-    private static func typeProfiled(_ text: String, prof: TypingProfile, source: CGEventSource?) {
-        let deleteCode = keycode(for: "delete") ?? 51
-        let returnCode = keycode(for: "return") ?? 36
-        var prev: Character? = nil
-        var buffer: [Character] = []          // recently emitted printable chars
-        let bufferCap = 16
-
-        func sleepMs(_ ms: Double) {
-            guard ms > 0 else { return }
-            usleep(useconds_t(min(ms, 4000) * 1000))   // 4 s safety ceiling
-        }
-        func emit(_ c: Character) {
-            sleepMs(prof.flightMs(prev: prev, cur: c))
-            postUnicode(String(c), source: source, dwellUs: useconds_t(prof.dwellMs(for: c) * 1000))
-            prev = c
-        }
-
-        for c in text {
-            if c == "\n" || c == "\r" {
-                // Treat a line break as a real Return; corrections never span lines.
-                sleepMs(prof.flightMs(prev: prev, cur: " "))
-                postKeycode(returnCode, source: source, dwellUs: useconds_t(prof.dwellMs(for: " ") * 1000))
-                prev = nil
-                buffer.removeAll()
-                continue
-            }
-
-            // Buffer must mirror the emitted tail EXACTLY (spaces included), or a
-            // backspace-and-retype would delete real chars and restore different
-            // ones — corrupting the text. Trigger guard stays on non-whitespace.
-            emit(c)
-            buffer.append(c)
-            if buffer.count > bufferCap { buffer.removeFirst() }
-
-            // Backspace-and-retype correction (the "equivalent typo").
-            if !c.isWhitespace, !buffer.isEmpty, prof.shouldCorrect() {
-                let k = min(prof.sampleBurstLen(), buffer.count)
-                let lastK = Array(buffer.suffix(k))
-                sleepMs(prof.correctionEntryMs())
-                for i in 0..<k {
-                    if i > 0 { sleepMs(prof.bkspIntervalMs()) }
-                    postKeycode(deleteCode, source: source,
-                                dwellUs: useconds_t(prof.backspaceDwellMs() * 1000))
-                }
-                sleepMs(prof.resumeMs())
-                // Re-type the identical characters; buffer content is unchanged.
-                prev = buffer.count > k ? buffer[buffer.count - k - 1] : nil
-                for ch in lastK { emit(ch) }
-            }
-        }
-    }
-
-    private static func postUnicode(_ s: String, source: CGEventSource?, dwellUs: useconds_t = 0) {
+    /// nonisolated: the replay session posts from its playback thread
+    /// (CGEvent.post is thread-safe).
+    nonisolated static func postUnicode(_ s: String, source: CGEventSource?, dwellUs: useconds_t = 0) {
         let utf16 = Array(s.utf16)
         guard let down = CGEvent(keyboardEventSource: source, virtualKey: 0, keyDown: true),
               let up = CGEvent(keyboardEventSource: source, virtualKey: 0, keyDown: false)
@@ -444,7 +398,8 @@ enum AgentInput {
     }
 
     /// Press a key by virtual keycode, optionally holding it `dwellUs` first.
-    private static func postKeycode(_ code: CGKeyCode, source: CGEventSource?, dwellUs: useconds_t = 0) {
+    /// nonisolated for the same reason as postUnicode.
+    nonisolated static func postKeycode(_ code: CGKeyCode, source: CGEventSource?, dwellUs: useconds_t = 0) {
         let down = CGEvent(keyboardEventSource: source, virtualKey: code, keyDown: true)
         let up = CGEvent(keyboardEventSource: source, virtualKey: code, keyDown: false)
         down?.post(tap: .cghidEventTap)
@@ -475,7 +430,7 @@ enum AgentInput {
     /// unknown key with a precise error before attempting (and failing) to press.
     static func isKnownKey(_ name: String) -> Bool { keycode(for: name) != nil }
 
-    private static func keycode(for name: String) -> CGKeyCode? {
+    static func keycode(for name: String) -> CGKeyCode? {
         keyCodes[name.lowercased()]
     }
 
