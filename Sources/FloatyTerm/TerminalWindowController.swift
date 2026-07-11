@@ -208,6 +208,12 @@ final class TerminalWindowController: NSObject, NSWindowDelegate {
         for v in [topBlur, contentBlur, contentArea, header, tabStrip] {
             v.translatesAutoresizingMaskIntoConstraints = false
         }
+        // Terminal views freeze their grid during a live window resize
+        // (FloatyTerminalView.setFrameSize), so mid-drag the terminal can be
+        // momentarily larger than the shrinking content area — clip it rather
+        // than let it paint over the header chrome.
+        contentArea.wantsLayer = true
+        contentArea.layer?.masksToBounds = true
         root.addSubview(contentBlur)
         root.addSubview(contentArea)
         root.addSubview(topBlur)
