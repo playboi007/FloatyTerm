@@ -74,11 +74,12 @@ enum AgentDOM {
     /// Resolve `selector` to the screen rects of ALL matching elements (document
     /// order, capped at 200), not just the first — so an agent can loop over or
     /// pick among results. Throws `.elementNotFound` when nothing matches.
-    static func screenRects(selector: String, port: UInt16, match: String? = nil) async throws -> [Match] {
+    static func screenRects(selector: String, port: UInt16, match: String? = nil,
+                            viaExtension: Bool = false) async throws -> [Match] {
         // A CDP endpoint that answers /json but never replies on the WS would
         // hang the relay (and the blocking CLI); cap the whole exchange.
         try await withTimeout(8) {
-            try await withSession(port: port, match: match) { ws in
+            try await withConn(port: port, match: match, viaExtension: viaExtension) { conn in
                 // One round-trip: every match's viewport-relative rect PLUS the
                 // window's screen origin and chrome inset (approach 5b).
                 let expression = """
@@ -89,7 +90,7 @@ enum AgentDOM {
                 return JSON.stringify({matches:out,screenX:window.screenX,screenY:window.screenY,\
                 outerHeight:window.outerHeight,innerHeight:window.innerHeight});})()
                 """
-                guard let json = try await rawEval(ws, expression: expression) as? String,
+                guard let json = try await rawEval(conn, expression: expression) as? String,
                       let m = try? JSONSerialization.jsonObject(with: Data(json.utf8)) as? [String: Any]
                 else { throw DOMError.cdpError("could not parse element measurements") }
 
@@ -117,10 +118,11 @@ enum AgentDOM {
     /// escape hatch agents were reaching for via raw Python websockets —
     /// querySelectorAll scraping, reading page text, clicking via the DOM.
     /// Promises are awaited.
-    static func runJavaScript(expression: String, port: UInt16, match: String? = nil) async throws -> String? {
+    static func runJavaScript(expression: String, port: UInt16, match: String? = nil,
+                              viaExtension: Bool = false) async throws -> String? {
         try await withTimeout(15) {
-            try await withSession(port: port, match: match) { ws -> String? in
-                let value = try await rawEval(ws, expression: expression, awaitPromise: true)
+            try await withConn(port: port, match: match, viaExtension: viaExtension) { conn -> String? in
+                let value = try await rawEval(conn, expression: expression, awaitPromise: true)
                 guard let value, !(value is NSNull) else { return nil }
                 let data = try JSONSerialization.data(withJSONObject: value, options: [.fragmentsAllowed])
                 return String(decoding: data, as: UTF8.self)
@@ -128,13 +130,12 @@ enum AgentDOM {
         }
     }
 
-    /// Navigate the debuggable page to `url` via CDP `Page.navigate` — works even
-    /// when the tab sits on a chrome:// page that blocks `query-dom`. Returns
-    /// once the navigation is accepted (not necessarily fully loaded).
-    static func navigate(url: String, port: UInt16, match: String? = nil) async throws {
+
+    static func navigate(url: String, port: UInt16, match: String? = nil,
+                         viaExtension: Bool = false) async throws {
         try await withTimeout(15) {
-            try await withSession(port: port, match: match) { ws in
-                let result = try await call(ws, method: "Page.navigate", params: ["url": url])
+            try await withConn(port: port, match: match, viaExtension: viaExtension) { conn in
+                let result = try await conn.call("Page.navigate", ["url": url])
                 if let err = result["errorText"] as? String, !err.isEmpty {
                     throw DOMError.cdpError("navigate failed: \(err)")
                 }
@@ -142,11 +143,15 @@ enum AgentDOM {
         }
     }
 
-    /// List the debuggable page targets (tabs) at this port: `id`, `title`,
-    /// `url`. Lets an agent see the open tabs and pick one to drive by
-    /// `--match` (a url/title substring) — the answer to "point at my YouTube
-    /// tab / GCP console tab". Just a GET /json; no WebSocket.
-    static func tabs(port: UInt16) async throws -> [[String: Any]] {
+    /// List the debuggable page targets (tabs) at this port: `id`, `title`
+    static func tabs(port: UInt16, viaExtension: Bool = false) async throws -> [[String: Any]] {
+        if viaExtension {
+            guard await CDPBridge.shared.isConnected else { throw CDPBridge.BridgeError.notConnected }
+            // The extension has no /json endpoint; it enumerates via chrome.tabs
+            // and answers a synthetic Floaty.listTabs command.
+            let r = try await CDPBridge.shared.call(method: "Floaty.listTabs", params: [:], match: nil).result
+            return (r["tabs"] as? [[String: Any]]) ?? []
+        }
         guard let url = URL(string: "http://127.0.0.1:\(port)/json") else {
             throw DOMError.portClosed(port)
         }
@@ -167,10 +172,11 @@ enum AgentDOM {
     /// This is how you aim KEYSTROKES at the debug Chrome when two Chromes share
     /// the app name: focus the right tab over CDP, then inject without --target
     /// (it's now frontmost). Selected by `match` like the other CDP verbs.
-    static func bringToFront(port: UInt16, match: String? = nil) async throws {
+    static func bringToFront(port: UInt16, match: String? = nil,
+                             viaExtension: Bool = false) async throws {
         try await withTimeout(8) {
-            try await withSession(port: port, match: match) { ws in
-                _ = try await call(ws, method: "Page.bringToFront")
+            try await withConn(port: port, match: match, viaExtension: viaExtension) { conn in
+                _ = try await conn.call("Page.bringToFront", [:])
             }
         }
     }
@@ -208,27 +214,37 @@ enum AgentDOM {
     /// regressing a pixel. Element rects come from the same approach-5b CSS→screen
     /// transform `screenRects` uses, so a mark's stored center is click-accurate.
     /// (The native analog is the AX tree; this is the Chrome/Electron path.)
-    static func setOfMarks(port: UInt16, match: String? = nil, max: Int = 100) async throws -> SoMResult {
+    ///
+    /// `includeImage: false` collects the mark table WITHOUT the overlay or the
+    /// screenshot (no rAF wait, no multi-MB PNG over the socket) — the cheap
+    /// first pass of table-first SoM: when marks are well-named the table alone
+    /// is what the model needs, and the pixels are skipped entirely.
+    static func setOfMarks(port: UInt16, match: String? = nil, max: Int = 100,
+                           includeImage: Bool = true, viaExtension: Bool = false) async throws -> SoMResult {
         try await withTimeout(20) {
-            try await withSession(port: port, match: match) { ws -> SoMResult in
-                // 1. Inject the overlay + collect element geometry. awaitPromise:
-                //    the script resolves after a double rAF, so the boxes are
-                //    actually painted before we screenshot.
-                guard let json = try await rawEval(ws, expression: somInjectJS(max: max),
+            try await withConn(port: port, match: match, viaExtension: viaExtension) { conn -> SoMResult in
+                // 1. Collect element geometry (and, when the image is wanted,
+                //    inject the overlay). awaitPromise: the drawing variant
+                //    resolves after a double rAF, so the boxes are actually
+                //    painted before we screenshot.
+                guard let json = try await rawEval(conn, expression: somInjectJS(max: max, draw: includeImage),
                                                    awaitPromise: true) as? String,
                       let m = try? JSONSerialization.jsonObject(with: Data(json.utf8)) as? [String: Any]
                 else { throw DOMError.cdpError("set-of-mark: could not collect elements") }
 
-                // 2. Screenshot the page with the marks visible.
-                let shot = try await call(ws, method: "Page.captureScreenshot",
-                                          params: ["format": "png", "captureBeyondViewport": false])
-                let b64 = (shot["data"] as? String) ?? ""
+                var b64 = ""
+                if includeImage {
+                    // 2. Screenshot the page with the marks visible.
+                    let shot = try await conn.call("Page.captureScreenshot",
+                                              ["format": "png", "captureBeyondViewport": false])
+                    b64 = (shot["data"] as? String) ?? ""
 
-                // 3. Remove the overlay — best effort, never fail over cleanup.
-                _ = try? await rawEval(ws, expression:
-                    "(function(){var e=document.getElementById('__floaty_som__');if(e)e.remove();return 1;})()")
+                    // 3. Remove the overlay — best effort, never fail over cleanup.
+                    _ = try? await rawEval(conn, expression:
+                        "(function(){var e=document.getElementById('__floaty_som__');if(e)e.remove();return 1;})()")
 
-                guard !b64.isEmpty else { throw DOMError.cdpError("set-of-mark: no screenshot data") }
+                    guard !b64.isEmpty else { throw DOMError.cdpError("set-of-mark: no screenshot data") }
+                }
 
                 func d(_ dict: [String: Any], _ k: String) -> Double { (dict[k] as? NSNumber)?.doubleValue ?? 0 }
                 // Compose screen coords exactly like screenRects (CSS px == screen px).
@@ -250,14 +266,16 @@ enum AgentDOM {
         }
     }
 
-    /// JS run in the page: find visible interactable elements, draw a numbered
-    /// box over each (a single removable overlay container), and return the mark
-    /// table + window/scroll state. Resolves after a double rAF so the screenshot
-    /// catches the painted boxes. `\\s` is a JS regex escape, not Swift.
-    private static func somInjectJS(max: Int) -> String {
+    /// JS run in the page: find visible interactable elements, optionally draw a
+    /// numbered box over each (a single removable overlay container), and return
+    /// the mark table + window/scroll state. With `draw`, resolves after a double
+    /// rAF so the screenshot catches the painted boxes; without, returns the
+    /// payload immediately (collect-only). `\\s` is a JS regex escape, not Swift.
+    private static func somInjectJS(max: Int, draw: Bool = true) -> String {
         """
         (function(){
           var MAX=\(max);
+          var DRAW=\(draw ? "true" : "false");
           var old=document.getElementById('__floaty_som__'); if(old) old.remove();
           var sel='a[href],button,input:not([type=hidden]):not([disabled]),select,textarea,'+
             '[role=button],[role=link],[role=textbox],[role=checkbox],[role=radio],[role=tab],'+
@@ -285,6 +303,8 @@ enum AgentDOM {
             marks.push({x:r.left,y:r.top,w:r.width,h:r.height,role:role,name:name});
             if(marks.length>=MAX) break;
           }
+          var payload=JSON.stringify({marks:marks,screenX:window.screenX,screenY:window.screenY,outerHeight:window.outerHeight,innerHeight:window.innerHeight,scrollX:window.scrollX,scrollY:window.scrollY,url:location.href});
+          if(!DRAW) return payload;
           var box=document.createElement('div'); box.id='__floaty_som__';
           box.style.cssText='position:fixed;left:0;top:0;z-index:2147483647;pointer-events:none;';
           var pal=['#e6194B','#3cb44b','#4363d8','#f58231','#911eb4','#42d4f4','#f032e6','#469990','#9A6324','#800000'];
@@ -297,7 +317,6 @@ enum AgentDOM {
             box.appendChild(b); box.appendChild(lab);
           }
           document.documentElement.appendChild(box);
-          var payload=JSON.stringify({marks:marks,screenX:window.screenX,screenY:window.screenY,outerHeight:window.outerHeight,innerHeight:window.innerHeight,scrollX:window.scrollX,scrollY:window.scrollY,url:location.href});
           return new Promise(function(res){requestAnimationFrame(function(){requestAnimationFrame(function(){res(payload);});});});
         })()
         """
@@ -305,11 +324,53 @@ enum AgentDOM {
 
     // MARK: - CDP plumbing (shared by all operations)
 
-    /// Discover → connect → run `body` with a live CDP socket → always close.
-    /// `match` selects which tab (url/title substring); nil = the first real page.
-    private static func withSession<T: Sendable>(
-        port: UInt16, match: String? = nil, _ body: (URLSessionWebSocketTask) async throws -> T
+    /// A CDP command channel. Two implementations — a direct debug-port WebSocket
+    /// and the extension bridge — so every operation below is transport-agnostic:
+    /// it issues `conn.call("Runtime.evaluate", …)` and doesn't care whether the
+    /// bytes go to `--remote-debugging-port` or through the user's live Chrome via
+    /// the FloatyTerm extension.
+    protocol CDPConn {
+        func call(_ method: String, _ params: [String: Any]) async throws -> [String: Any]
+    }
+
+    /// Direct debug-port transport: one JSON-RPC round-trip over the tab's
+    /// `webSocketDebuggerUrl`.
+    private struct DirectConn: CDPConn {
+        let ws: URLSessionWebSocketTask
+        func call(_ method: String, _ params: [String: Any]) async throws -> [String: Any] {
+            try await AgentDOM.call(ws, method: method, params: params)
+        }
+    }
+
+    /// Extension transport: forward the command to the extension service worker,
+    /// which resolves `match` → a tab and `chrome.debugger.sendCommand`s it.
+    /// The first reply's tabId pins every later call in the SAME session to that
+    /// exact tab — without it, a multi-call op like `som` (collect → screenshot)
+    /// would re-resolve per command and could straddle two tabs if the user
+    /// switched mid-flight. A class (not struct) so the pin survives across calls.
+    private final class BridgeConn: CDPConn {
+        let match: String?
+        private var tabId: Int?
+        init(match: String?) { self.match = match }
+        func call(_ method: String, _ params: [String: Any]) async throws -> [String: Any] {
+            let (result, tab) = try await CDPBridge.shared.call(
+                method: method, params: params, match: match, pinnedTab: tabId)
+            if let tab { tabId = tab }
+            return result
+        }
+    }
+
+    /// Connect → run `body` with a live CDP channel → always close. `viaExtension`
+    /// picks the extension bridge (the user's live tabs, no debug port); otherwise
+    /// discover a debuggable page at `port`. `match` selects which tab.
+    private static func withConn<T: Sendable>(
+        port: UInt16, match: String? = nil, viaExtension: Bool = false,
+        _ body: (any CDPConn) async throws -> T
     ) async throws -> T {
+        if viaExtension {
+            guard await CDPBridge.shared.isConnected else { throw CDPBridge.BridgeError.notConnected }
+            return try await body(BridgeConn(match: match))
+        }
         let wsURL = try await discoverPageWebSocket(port: port, match: match)
         let session = URLSession(configuration: .ephemeral)
         let ws = session.webSocketTask(with: wsURL)
@@ -323,7 +384,7 @@ enum AgentDOM {
             ws.cancel(with: .goingAway, reason: nil)
             session.invalidateAndCancel()
         }
-        return try await body(ws)
+        return try await body(DirectConn(ws: ws))
     }
 
     /// GET /json on the port → a debuggable page's WebSocket URL. When `match`
@@ -369,10 +430,10 @@ enum AgentDOM {
 
     /// Runtime.evaluate → the raw JS value (String / Number / Bool / Array /
     /// Dict by value), or nil for null/undefined. Throws on a page exception.
-    private static func rawEval(_ ws: URLSessionWebSocketTask, expression: String,
+    private static func rawEval(_ conn: any CDPConn, expression: String,
                                 awaitPromise: Bool = false) async throws -> Any? {
-        let result = try await call(ws, method: "Runtime.evaluate",
-            params: ["expression": expression, "returnByValue": true, "awaitPromise": awaitPromise])
+        let result = try await conn.call("Runtime.evaluate",
+            ["expression": expression, "returnByValue": true, "awaitPromise": awaitPromise])
         if let exc = result["exceptionDetails"] as? [String: Any] {
             throw DOMError.cdpError((exc["text"] as? String) ?? "evaluation threw")
         }

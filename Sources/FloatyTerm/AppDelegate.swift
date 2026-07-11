@@ -31,12 +31,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // window capture (Layer C / AgentCapture), and CDP element targeting
         // (Layer A / AgentDOM). All closures run on the main actor.
         DevtoolsRelay.shared.onAgentClick = { [weak self] b in
-            guard let self, let p = self.point(b) else { return ["error": "expected {x,y}"] }
-            let clicks = (b["clicks"] as? NSNumber)?.intValue ?? 1
-            let ok = AgentInput.click(at: p, button: self.button(b), modifiers: self.mods(b),
-                                      clicks: clicks, pacing: self.pacing(b),
-                                      target: self.target(b), targetPID: self.targetPID(b))
-            return ok ? ["ok": true] : self.inputFailure("click", b)
+            self?.performAction("click", b) ?? ["error": "no self"]
         }
         DevtoolsRelay.shared.onAgentMove = { [weak self] b in
             guard let self, let p = self.point(b) else { return ["error": "expected {x,y}"] }
@@ -45,46 +40,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             return ok ? ["ok": true] : self.inputFailure("move", b)
         }
         DevtoolsRelay.shared.onAgentDrag = { [weak self] b in
-            guard let self,
-                  let fx = (b["from_x"] as? NSNumber)?.doubleValue,
-                  let fy = (b["from_y"] as? NSNumber)?.doubleValue,
-                  let tx = (b["to_x"] as? NSNumber)?.doubleValue,
-                  let ty = (b["to_y"] as? NSNumber)?.doubleValue
-            else { return ["error": "expected {from_x,from_y,to_x,to_y}"] }
-            let ok = AgentInput.drag(from: CGPoint(x: fx, y: fy), to: CGPoint(x: tx, y: ty),
-                                     button: self.button(b), modifiers: self.mods(b),
-                                     pacing: self.pacing(b), target: self.target(b),
-                                     targetPID: self.targetPID(b))
-            return ok ? ["ok": true] : self.inputFailure("drag", b)
+            self?.performAction("drag", b) ?? ["error": "no self"]
         }
         DevtoolsRelay.shared.onAgentScroll = { [weak self] b in
-            guard let self else { return ["error": "no self"] }
-            let dx = (b["dx"] as? NSNumber)?.intValue ?? 0
-            let dy = (b["dy"] as? NSNumber)?.intValue ?? 0
-            let ok = AgentInput.scroll(dx: dx, dy: dy, at: self.point(b),
-                                       pacing: self.pacing(b), target: self.target(b),
-                                       targetPID: self.targetPID(b))
-            return ok ? ["ok": true] : self.inputFailure("scroll", b)
+            self?.performAction("scroll", b) ?? ["error": "no self"]
         }
         DevtoolsRelay.shared.onAgentType = { [weak self] b in
             guard let self, let text = b["text"] as? String else { return ["error": "expected {text}"] }
-            let ok = AgentInput.type(text, pacing: self.pacing(b),
-                                     target: self.target(b), targetPID: self.targetPID(b))
-            return ok ? ["ok": true, "typed": text.count] : self.inputFailure("type", b)
+            // --human sessions get overlaid replay controls (play/pause/stop/
+            // speed) on the terminal window; --no-controls opts out.
+            let noControls = (b["no_controls"] as? NSNumber)?.boolValue ?? false
+            let r = await AgentInput.type(text, pacing: self.pacing(b),
+                                          target: self.target(b), targetPID: self.targetPID(b),
+                                          showControls: !noControls)
+            guard r.ok else { return self.inputFailure("type", b) }
+            var out: [String: Any] = ["ok": true, "typed": r.typed]
+            if r.stopped { out["stopped"] = true; out["total"] = text.count }
+            return out
         }
         DevtoolsRelay.shared.onAgentKey = { [weak self] b in
-            guard let self, let key = b["key"] as? String else { return ["error": "expected {key}"] }
-            // Check the key name first so an unknown key reports its own precise
-            // cause instead of being lumped under the activation failure path.
-            guard AgentInput.isKnownKey(key) else {
-                return ["error": "key failed: \"\(key)\" is not a known key name. Use a single "
-                    + "character (a–z, 0–9, punctuation like / or -), a function key (f1–f12), or a "
-                    + "named key (return, tab, space, delete, escape, left/right/up/down, home, end, "
-                    + "pgup, pgdown). For arbitrary text use `type`, not `key`."]
-            }
-            let ok = AgentInput.pressKey(key, modifiers: self.mods(b),
-                                         target: self.target(b), targetPID: self.targetPID(b))
-            return ok ? ["ok": true, "key": key] : self.inputFailure("key", b)
+            self?.performAction("key", b) ?? ["error": "no self"]
         }
         DevtoolsRelay.shared.onAgentCapture = { b in
             let window = b["window"] as? String
@@ -109,9 +84,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 return ["error": "expected {window}, {window_id}, or {pid} (see `floaty list-windows`)"]
             }
             let ocr = (b["ocr"] as? NSNumber)?.boolValue ?? false
+            let fullRes = (b["full_res"] as? NSNumber)?.boolValue ?? false
+            var region: CGRect? = nil
+            if let rs = b["region"] as? String {
+                guard let r = Self.parseRegion(rs) else {
+                    return ["error": "bad --region \"\(rs)\" — expected x,y,WxH in GLOBAL screen points, e.g. 100,200,400x300"]
+                }
+                region = r
+            }
             do {
-                let r = try await AgentCapture.captureWindow(named: window, windowID: windowID, ocr: ocr)
-                let f = r.frame
+                let ifChanged = (b["if_changed"] as? NSNumber)?.boolValue ?? false
+                let r = try await AgentCapture.captureWindow(named: window, windowID: windowID,
+                                                             ocr: ocr, region: region, fullRes: fullRes,
+                                                             ifChanged: ifChanged)
+                // --if-changed short-circuit: same pixels as last time → one
+                // line, no image, and the previous frame stays valid.
+                if r.unchanged {
+                    return ["ok": true, "unchanged": true, "screen_hash": r.screenHash,
+                            "note": "pixels match the previous capture of this target — "
+                                + "your prior screenshot and frame_id are still valid"]
+                }
+                guard let f = r.frame else { return ["error": "capture returned no frame"] }
                 // The capture frame: everything click-in-frame needs to map an
                 // image-pixel coordinate back to a global screen point.
                 var out: [String: Any] = [
@@ -119,11 +112,556 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     "origin_x": f.origin.x, "origin_y": f.origin.y,
                     "width": f.size.width, "height": f.size.height, "scale": f.scale,
                     "image_width": f.imageWidth, "image_height": f.imageHeight,
+                    "screen_hash": r.screenHash,
                 ]
+                if ifChanged { out["changed"] = true }
                 if let t = r.textPath { out["text_path"] = t }          // OCR found text
                 else if ocr { out["note"] = "no text recognized in the capture" }
                 return out
             } catch { return ["error": error.localizedDescription] }
+        }
+        // capture --wait-change: long-poll until the window's pixels change
+        // (hash-only polls, ~0.6s apart — nothing saved while waiting), then
+        // return ONE fresh capture of the new state. Replaces the agent-side
+        // screenshot-poll loop during page loads / long operations: one call,
+        // one image, instead of N captures burned while nothing changed.
+        DevtoolsRelay.shared.onAgentCaptureWait = { b, reply in
+            Task { @MainActor in
+                let window = b["window"] as? String
+                var windowID = (b["window_id"] as? NSNumber)?.uint32Value
+                if windowID == nil, let pid = (b["pid"] as? NSNumber).map({ pid_t($0.intValue) }) {
+                    var win = AgentCapture.listWindows().filter({ $0.pid == pid }).max(by: { $0.area < $1.area })
+                    if win == nil {
+                        _ = await AgentAX.ensureOnScreen(pid: pid)
+                        win = AgentCapture.listWindows().filter({ $0.pid == pid }).max(by: { $0.area < $1.area })
+                    }
+                    if let win { windowID = win.id }
+                    else { reply(["error": "no window for pid \(pid) (it may have no open window — ⌘N in the app)"]); return }
+                }
+                if windowID == nil, let window, let win = AgentCapture.bestMatch(named: window) {
+                    windowID = win.id
+                }
+                guard let wid = windowID else {
+                    reply(["error": "expected {window}, {window_id}, or {pid} (see `floaty list-windows`)"]); return
+                }
+                var region: CGRect? = nil
+                if let rs = b["region"] as? String {
+                    guard let r = Self.parseRegion(rs) else {
+                        reply(["error": "bad --region \"\(rs)\" — expected x,y,WxH in GLOBAL screen points"]); return
+                    }
+                    region = r
+                }
+                let timeout = min(max((b["timeout"] as? NSNumber)?.doubleValue ?? 20, 1), 120)
+                do {
+                    // Explicit --region → strict comparison: the 8×8 hash grid
+                    // covers just that rect, so a 1-bit flip is real motion
+                    // (a whole-window hash needs the 3-bit noise allowance).
+                    let tol = region != nil ? 0 : 3
+                    let baseline = try await AgentCapture.hashWindow(windowID: wid, region: region)
+                    let start = Date()
+                    while Date().timeIntervalSince(start) < timeout {
+                        try await Task.sleep(nanoseconds: 600_000_000)
+                        let now = try await AgentCapture.hashWindow(windowID: wid, region: region)
+                        guard !AgentPerception.isUnchanged(baseline, now, tolerance: tol) else { continue }
+                        // Changed — return one fresh capture of the NEW state.
+                        let r = try await AgentCapture.captureWindow(named: window, windowID: wid,
+                                                                     region: region)
+                        guard let f = r.frame else { reply(["error": "capture returned no frame"]); return }
+                        reply(["ok": true, "changed": true,
+                               "waited_ms": Int(Date().timeIntervalSince(start) * 1000),
+                               "path": r.imagePath, "frame_id": f.id,
+                               "origin_x": f.origin.x, "origin_y": f.origin.y,
+                               "width": f.size.width, "height": f.size.height,
+                               "image_width": f.imageWidth, "image_height": f.imageHeight,
+                               "screen_hash": r.screenHash])
+                        return
+                    }
+                    reply(["ok": true, "changed": false,
+                           "waited_ms": Int(Date().timeIntervalSince(start) * 1000),
+                           "screen_hash": baseline,
+                           "note": "no visible change within \(Int(timeout))s — the screen still looks the same; no image returned"])
+                } catch { reply(["error": error.localizedDescription]) }
+            }
+        }
+        // click/drag/key/scroll --until-change / --settle: "act to an edge".
+        // The model declares one exact action plus a pixel edge, and the host
+        // runs the deterministic middle of the loop that used to burn a model
+        // round trip per iteration (drag → capture → drag → capture …):
+        //   --until-change  repeat the action verbatim until the watched
+        //                   pixels differ from the pre-loop baseline
+        //   --settle        after acting (or after the edge fires), wait for
+        //                   the pixels to hold still before the final capture,
+        //                   so the returned image is post-animation
+        //   --watch x,y,WxH the sensor rect (global points). Contract: pick a
+        //                   rect that only changes when the goal state arrives.
+        //                   Explicit rects compare strictly (any bit = change);
+        //                   whole windows keep the 3-bit noise allowance.
+        // The host never invents or adjusts action parameters — it repeats the
+        // given action and reports the edge. Change → one fresh capture; no
+        // change → no image and the prior frame stays valid.
+        DevtoolsRelay.shared.onAgentActUntil = { [weak self] b, reply in
+            Task { @MainActor in
+                guard let self else { reply(["error": "no self"]); return }
+                let action = b["_action"] as? String ?? ""
+                guard let wid = await self.resolveObservedWindow(b) else {
+                    reply(["error": "\(action) --until-change/--settle needs a window to watch — pass --pid, --window-id, --window, or --target"]); return
+                }
+                var watch: CGRect? = nil
+                if let ws = b["watch"] as? String {
+                    guard let r = Self.parseRegion(ws) else {
+                        reply(["error": "bad --watch \"\(ws)\" — expected x,y,WxH in GLOBAL screen points"]); return
+                    }
+                    watch = r
+                }
+                let untilChange = (b["until_change"] as? NSNumber)?.boolValue ?? false
+                let settle = (b["settle"] as? NSNumber)?.boolValue ?? false
+                let every = min(max((b["every"] as? NSNumber)?.doubleValue ?? 0.6, 0.15), 5)
+                let maxIters = untilChange ? min(max((b["max"] as? NSNumber)?.intValue ?? 10, 1), 25) : 1
+                let timeout = min(max((b["timeout"] as? NSNumber)?.doubleValue ?? 20, 1), 120)
+                let tol = watch != nil ? 0 : 3
+                do {
+                    let baseline = try await AgentCapture.hashWindow(windowID: wid, region: watch)
+                    let start = Date()
+                    var iterations = 0
+                    var lastHash = baseline
+                    var edge = false
+                    repeat {
+                        let r = self.performAction(action, b)
+                        if r["error"] != nil {
+                            var out = r; out["iterations"] = iterations
+                            reply(out); return
+                        }
+                        iterations += 1
+                        try await Task.sleep(nanoseconds: UInt64(every * 1_000_000_000))
+                        lastHash = try await AgentCapture.hashWindow(windowID: wid, region: watch)
+                        if !AgentPerception.isUnchanged(baseline, lastHash, tolerance: tol) {
+                            edge = true; break
+                        }
+                    } while untilChange && iterations < maxIters
+                        && Date().timeIntervalSince(start) < timeout
+                    var settled = false
+                    if settle {
+                        // Stillness = two consecutive equal polls (~0.8s quiet).
+                        var prev = lastHash, stable = 0
+                        let settleStart = Date()
+                        while Date().timeIntervalSince(settleStart) < 10 {
+                            try await Task.sleep(nanoseconds: 400_000_000)
+                            let now = try await AgentCapture.hashWindow(windowID: wid, region: watch)
+                            stable = AgentPerception.isUnchanged(prev, now, tolerance: tol) ? stable + 1 : 0
+                            prev = now
+                            if stable >= 2 { settled = true; break }
+                        }
+                        lastHash = prev
+                        edge = edge || !AgentPerception.isUnchanged(baseline, lastHash, tolerance: tol)
+                    }
+                    let waitedMs = Int(Date().timeIntervalSince(start) * 1000)
+                    if edge {
+                        // Edge reached — return one fresh capture of the new
+                        // state (full window: the watch rect is a sensor, not
+                        // the observation).
+                        let r = try await AgentCapture.captureWindow(named: nil, windowID: wid)
+                        guard let f = r.frame else { reply(["error": "capture returned no frame"]); return }
+                        var out: [String: Any] = [
+                            "ok": true, "changed": true, "iterations": iterations,
+                            "waited_ms": waitedMs, "path": r.imagePath, "frame_id": f.id,
+                            "origin_x": f.origin.x, "origin_y": f.origin.y,
+                            "width": f.size.width, "height": f.size.height,
+                            "image_width": f.imageWidth, "image_height": f.imageHeight,
+                            "screen_hash": r.screenHash,
+                        ]
+                        if settle { out["settled"] = settled }
+                        reply(out)
+                    } else {
+                        // The action DID run — only the change detection came up
+                        // empty. On a full-window hash that can be blindness, not
+                        // stasis (a selection highlight moves ~0 of 64 bits —
+                        // seen live), so say so rather than reading as failure.
+                        let caveat = watch == nil
+                            ? " at coarse full-window granularity — subtle changes (a selection, a highlight) "
+                                + "can be invisible to it; pass --watch \"x,y,WxH\" on the area that should "
+                                + "change, or verify with capture --region"
+                            : " in the watched rect"
+                        reply(["ok": true, "changed": false, "iterations": iterations,
+                               "waited_ms": waitedMs, "screen_hash": lastHash,
+                               "note": "performed \(action) ×\(iterations); no change detected\(caveat). "
+                                   + "No image returned — your prior frame is still valid"])
+                    }
+                } catch { reply(["error": error.localizedDescription]) }
+            }
+        }
+        // run: execute a pre-compiled LINEAR plan host-side — the model's motor
+        // program. Each step = one actuator call (repeated verbatim on retry;
+        // the host never invents or adjusts parameters) + an expected-outcome
+        // checkpoint resolved on the perception ladder: AX predicate
+        // (appears/disappears — resolved FRESH at execution time, never a
+        // stored mark id) or strict-hashed watch rect (canvas apps, where AX
+        // and full-window hashes are both blind) or pixel stillness (settle).
+        // The first divergence stops the run loudly with a state bundle; a
+        // success reply carries only the endgame (final capture + aggregates).
+        // Per-step forensics land in calls.ndjson as route "run.step" — free
+        // until someone greps them. No branching by design: a host that picks
+        // paths on proxy predicates executes confidently in the wrong world;
+        // anything unexpected must be an EXIT back to the model, not a guess.
+        DevtoolsRelay.shared.onAgentRun = { [weak self] b, reply in
+            Task { @MainActor in
+                guard let self else { reply(["error": "no self"]); return }
+                // Steps arrive as a JSON array, or a JSON string of one (CLI).
+                var rawSteps: [[String: Any]] = []
+                if let arr = b["steps"] as? [[String: Any]] { rawSteps = arr }
+                else if let s = b["steps"] as? String, let d = s.data(using: .utf8),
+                        let arr = (try? JSONSerialization.jsonObject(with: d)) as? [[String: Any]] {
+                    rawSteps = arr
+                }
+                guard !rawSteps.isEmpty else {
+                    reply(["error": "expected {steps: [...]} — a JSON array of "
+                        + "{do:{verb,…}, expect:{appears|disappears:{role,title} | watch:\"x,y,WxH\" | settle:true, timeout:N}, retry:N}"]); return
+                }
+                guard rawSteps.count <= 12 else {
+                    reply(["error": "plan too long (\(rawSteps.count) steps, max 12) — split it; long open-loop runs drift from reality"]); return
+                }
+                // Top-level target defaults merge into each step, so a plan
+                // for one app names it once.
+                var defaults: [String: Any] = [:]
+                for k in ["pid", "app", "target", "window", "window_id"] where b[k] != nil { defaults[k] = b[k]! }
+                let knownVerbs = ["click", "drag", "key", "scroll", "type", "press"]
+                // Validate the WHOLE plan before acting — a malformed step 5
+                // must not leave steps 1–4 half-executed.
+                var steps: [(doPart: [String: Any], verb: String, expect: [String: Any]?, retry: Int)] = []
+                for (i, step) in rawSteps.enumerated() {
+                    guard var doPart = step["do"] as? [String: Any] else {
+                        reply(["error": "step \(i + 1): missing {do:{verb,…}}"]); return
+                    }
+                    // The actuator edge flags don't run inside plans — refuse
+                    // rather than silently ignore them (seen live: a step's do
+                    // carried settle:true and did nothing).
+                    if doPart["until_change"] != nil || doPart["settle"] != nil {
+                        reply(["error": "step \(i + 1): until_change/settle belong in the step's expect "
+                            + "(watch/settle checkpoints), not in do — inside a plan they would be ignored"]); return
+                    }
+                    for (k, v) in defaults where doPart[k] == nil { doPart[k] = v }
+                    let verb = doPart["verb"] as? String ?? ""
+                    guard knownVerbs.contains(verb) else {
+                        reply(["error": "step \(i + 1): unknown verb \"\(verb)\" — one of \(knownVerbs.joined(separator: "/"))"]); return
+                    }
+                    var expect = step["expect"] as? [String: Any]
+                    if var e = expect {
+                        for (k, v) in defaults where e[k] == nil { e[k] = v }
+                        // One PRIMARY checkpoint per step; settle:true may ride
+                        // along any of them ("changed, then let the animation
+                        // finish" — same composite as --until-change --settle),
+                        // or stand alone as stillness-only.
+                        let kinds = ["appears", "disappears", "watch", "focused"].filter { e[$0] != nil }
+                        guard kinds.count == 1 || (kinds.isEmpty && e["settle"] != nil) else {
+                            reply(["error": "step \(i + 1): expect needs ONE of appears/disappears/watch/focused "
+                                + "(settle:true may accompany any of them, or stand alone) — got "
+                                + (kinds.isEmpty ? "none" : kinds.joined(separator: "+"))]); return
+                        }
+                        if let ws = e["watch"] as? String, Self.parseRegion(ws) == nil {
+                            reply(["error": "step \(i + 1): bad watch \"\(ws)\" — expected x,y,WxH in GLOBAL screen points"]); return
+                        }
+                        expect = e
+                    }
+                    let retry = min(max((step["retry"] as? NSNumber)?.intValue ?? 0, 0), 3)
+                    steps.append((doPart, verb, expect, retry))
+                }
+                // Pixel checkpoints (watch/settle) and the endgame capture need
+                // an observable window; resolve once up front.
+                let observedWID = await self.resolveObservedWindow(defaults)
+                if steps.contains(where: { $0.expect?["watch"] != nil || $0.expect?["settle"] != nil }),
+                   observedWID == nil {
+                    reply(["error": "the plan has watch/settle checkpoints but no window could be resolved to observe — "
+                        + "the given pid/window/target has no on-screen window (closed? still opening? — "
+                        + "`floaty list-windows` to check, `floaty raise` to surface it, ⌘N if none exist)"]); return
+                }
+
+                // One actuator step (press = AX predicate resolved fresh).
+                @MainActor
+                func performStep(_ verb: String, _ d: [String: Any]) async -> [String: Any] {
+                    switch verb {
+                    case "press":
+                        let role = d["role"] as? String
+                        let title = (d["title"] as? String) ?? (d["name"] as? String)
+                        do {
+                            let (matches, pressed) = try await AgentAX.query(
+                                app: (d["app"] as? String) ?? (d["target"] as? String),
+                                pid: (d["pid"] as? NSNumber).map { pid_t($0.intValue) },
+                                role: role, title: title, max: 5, press: true)
+                            if let p = pressed { return ["ok": true, "pressed": p.name] }
+                            return ["error": "press matched no element (role \(role ?? "*"), title \"\(title ?? "*")\") — \(matches.count) candidates"]
+                        } catch { return ["error": error.localizedDescription] }
+                    case "type":
+                        guard let text = d["text"] as? String else { return ["error": "type step needs {text}"] }
+                        let r = await AgentInput.type(text, pacing: self.pacing(d),
+                                                      target: self.target(d), targetPID: self.targetPID(d),
+                                                      showControls: false)
+                        return r.ok ? ["ok": true, "typed": r.typed] : self.inputFailure("type", d)
+                    default:
+                        return self.performAction(verb, d)
+                    }
+                }
+                @MainActor
+                func stepPID(_ d: [String: Any]) -> pid_t? {
+                    if let p = (d["pid"] as? NSNumber).map({ pid_t($0.intValue) }) { return p }
+                    if let name = (d["target"] as? String) ?? (d["app"] as? String) {
+                        return try? AgentAX.resolvePID(app: name, pid: nil)
+                    }
+                    return nil
+                }
+                // Host-side verification of a step's own effect — the guard
+                // against a silently-lost action (seen live: the user stole
+                // focus mid-plan, a `type` landed nowhere, and the plan sailed
+                // on to a false completed:true). Verdicts: true = confirmed,
+                // false = FAILED (fails the step), nil = unverifiable here —
+                // never fails the step, but a non-empty reason is surfaced as
+                // unverified_steps so the model knows the success is soft.
+                @MainActor
+                func verifyStep(_ verb: String, _ d: [String: Any], preValue: String?) async -> (Bool?, String) {
+                    guard verb == "type" || verb == "key" else { return (nil, "") }
+                    guard let pid = stepPID(d) else { return (nil, "") }
+                    // Keystrokes route to the FRONTMOST app: focus moved =
+                    // the keys landed somewhere else, though the events
+                    // posted fine.
+                    if let front = NSWorkspace.shared.frontmostApplication, front.processIdentifier != pid {
+                        return (false, "focus is on \(front.localizedName ?? "pid \(front.processIdentifier)"), not the target — "
+                            + "the keystrokes likely landed there")
+                    }
+                    guard verb == "type", let text = d["text"] as? String else { return (nil, "") }
+                    let head = String(text.trimmingCharacters(in: .whitespacesAndNewlines).prefix(40))
+                    guard !head.isEmpty else { return (nil, "") }
+                    // Re-read the focused element's value. AX lags the
+                    // keystrokes — poll ~1s before concluding (set-text's
+                    // hard-won lesson).
+                    var last: AgentAX.FocusedInfo? = nil
+                    for _ in 0..<8 {
+                        last = try? AgentAX.focused(app: nil, pid: pid)
+                        if let v = last?.value, v.contains(head) { return (true, "") }
+                        try? await Task.sleep(nanoseconds: 120_000_000)
+                    }
+                    guard let info = last, info.hasFocus, info.editable || !info.value.isEmpty else {
+                        return (nil, "typed text isn't host-verifiable here (focused element exposes no AX value — canvas/engine-drawn?)")
+                    }
+                    if let pre = preValue, info.value != pre {
+                        // Something landed but the echo is transformed
+                        // (secure field, formatter) — don't fail on it.
+                        return (nil, "the field's value changed but doesn't echo the typed text (secure/transformed field?)")
+                    }
+                    return (false, "the focused element's value is unchanged after typing — the keystrokes didn't land")
+                }
+                // Wait for a checkpoint: (satisfied, why-not description).
+                @MainActor
+                func awaitExpect(_ e: [String: Any]?, preHash: String?) async -> (Bool, String) {
+                    guard let e else {
+                        try? await Task.sleep(nanoseconds: 300_000_000)   // bare pacing
+                        return (true, "")
+                    }
+                    let timeout = min(max((e["timeout"] as? NSNumber)?.doubleValue ?? 8, 1), 60)
+                    let start = Date()
+                    let watch = (e["watch"] as? String).flatMap { Self.parseRegion($0) }
+                    let tol = watch != nil ? 0 : 3
+                    let wantSettle = e["settle"] != nil
+                    // Stillness: two consecutive equal polls (~0.8s quiet, 10s
+                    // cap). As a RIDER on a passed primary checkpoint it can't
+                    // fail the step — it just holds the next action until the
+                    // animation the change kicked off has finished.
+                    func settlePhase(seed: String?) async -> Bool {
+                        guard let wid = observedWID else { return false }
+                        var prev = seed ?? "", stable = 0
+                        let settleStart = Date()
+                        while Date().timeIntervalSince(settleStart) < 10 {
+                            try? await Task.sleep(nanoseconds: 400_000_000)
+                            guard let now = try? await AgentCapture.hashWindow(windowID: wid, region: watch) else { continue }
+                            stable = (!prev.isEmpty && AgentPerception.isUnchanged(prev, now, tolerance: tol)) ? stable + 1 : 0
+                            prev = now
+                            if stable >= 2 { return true }
+                        }
+                        return false
+                    }
+                    // focused: the target app's focused element matches — THE
+                    // checkpoint for "click/key opened a text editor". A caret
+                    // is pixel-invisible (watch falsely diverges on it — seen
+                    // live on excalidraw) but focus state is AX-readable even
+                    // in canvas apps, which edit text via a hidden textarea.
+                    // Accepts true (shorthand for {editable:true}) or
+                    // {editable:…, role:…}.
+                    if e["focused"] != nil {
+                        let want = e["focused"] as? [String: Any] ?? [:]
+                        let wantRole = want["role"] as? String
+                        let wantEditable = (want["editable"] as? NSNumber)?.boolValue
+                            ?? ((e["focused"] as? NSNumber)?.boolValue == true ? true : nil)
+                        let pid = (e["pid"] as? NSNumber).map { pid_t($0.intValue) }
+                        let app = (e["app"] as? String) ?? (e["target"] as? String)
+                        while true {
+                            if let info = try? AgentAX.focused(app: app, pid: pid), info.hasFocus,
+                               wantRole.map({ info.role == $0 }) ?? true,
+                               wantEditable.map({ info.editable == $0 }) ?? true {
+                                if wantSettle { _ = await settlePhase(seed: nil) }
+                                return (true, "")
+                            }
+                            if Date().timeIntervalSince(start) >= timeout {
+                                let desc = [wantRole.map { "role \($0)" },
+                                            wantEditable.map { "editable \($0)" }]
+                                    .compactMap { $0 }.joined(separator: ", ")
+                                return (false, "focused {\(desc.isEmpty ? "any" : desc)} not met within \(Int(timeout))s")
+                            }
+                            try? await Task.sleep(nanoseconds: 400_000_000)
+                        }
+                    }
+                    if let pred = (e["appears"] as? [String: Any]) ?? (e["disappears"] as? [String: Any]) {
+                        let wantGone = e["disappears"] != nil
+                        let role = pred["role"] as? String
+                        let title = (pred["title"] as? String) ?? (pred["name"] as? String)
+                        while true {
+                            let found = (try? await AgentAX.query(
+                                app: (e["app"] as? String) ?? (e["target"] as? String),
+                                pid: (e["pid"] as? NSNumber).map { pid_t($0.intValue) },
+                                role: role, title: title, max: 3)) .map { !$0.matches.isEmpty }
+                            if let found, found != wantGone {
+                                if wantSettle { _ = await settlePhase(seed: nil) }
+                                return (true, "")
+                            }
+                            if Date().timeIntervalSince(start) >= timeout {
+                                return (false, "\(wantGone ? "disappears" : "appears") {role \(role ?? "*"), title \"\(title ?? "*")\"} not met within \(Int(timeout))s")
+                            }
+                            try? await Task.sleep(nanoseconds: 700_000_000)
+                        }
+                    }
+                    if e["watch"] != nil {
+                        guard let base = preHash else { return (false, "no pre-action hash") }
+                        guard let wid = observedWID else { return (false, "no observable window") }
+                        while Date().timeIntervalSince(start) < timeout {
+                            if let now = try? await AgentCapture.hashWindow(windowID: wid, region: watch),
+                               !AgentPerception.isUnchanged(base, now, tolerance: tol) {
+                                if wantSettle { _ = await settlePhase(seed: now) }
+                                return (true, "")
+                            }
+                            try? await Task.sleep(nanoseconds: 400_000_000)
+                        }
+                        return (false, "watch rect never changed within \(Int(timeout))s")
+                    }
+                    // settle ALONE remains a hard checkpoint — stillness itself
+                    // is the declared expectation.
+                    guard observedWID != nil else { return (false, "no observable window") }
+                    return await settlePhase(seed: preHash) ? (true, "")
+                        : (false, "pixels never settled within \(Int(timeout))s")
+                }
+                // Failure bundle: which step, why, and a capture of where the
+                // world diverged from the plan.
+                @MainActor
+                func failBundle(_ stepIndex: Int, _ reason: String, _ retriesTotal: Int, _ runStart: Date) async -> [String: Any] {
+                    var out: [String: Any] = [
+                        "ok": true, "completed": false,
+                        "failed_step": stepIndex + 1, "steps_done": stepIndex, "steps": steps.count,
+                        "reason": reason, "retries_total": retriesTotal,
+                        "waited_ms": Int(Date().timeIntervalSince(runStart) * 1000),
+                        "note": "stopped at step \(stepIndex + 1)/\(steps.count) — the world diverged from the plan; "
+                            + "the capture shows where. Per-step forensics: route run.step in calls.ndjson",
+                    ]
+                    if let wid = observedWID,
+                       let r = try? await AgentCapture.captureWindow(named: nil, windowID: wid),
+                       let f = r.frame {
+                        out["path"] = r.imagePath; out["frame_id"] = f.id
+                        out["origin_x"] = f.origin.x; out["origin_y"] = f.origin.y
+                        out["width"] = f.size.width; out["height"] = f.size.height
+                        out["image_width"] = f.imageWidth; out["image_height"] = f.imageHeight
+                        out["screen_hash"] = r.screenHash
+                    }
+                    return out
+                }
+
+                if let pid = (defaults["pid"] as? NSNumber).map({ pid_t($0.intValue) }) {
+                    _ = await AgentAX.ensureOnScreen(pid: pid)
+                }
+                let runStart = Date()
+                var retriesTotal = 0
+                var unverified: [Int] = []       // steps whose effect the host couldn't check
+                for (i, step) in steps.enumerated() {
+                    guard Date().timeIntervalSince(runStart) < 300 else {
+                        reply(await failBundle(i, "run budget exhausted (300s)", retriesTotal, runStart)); return
+                    }
+                    var attempt = 0
+                    var lastReason = ""
+                    var stepOK = false
+                    var stepUnverifiable = ""
+                    while attempt <= step.retry {
+                        let stepStart = Date()
+                        // Watch checkpoints hash BEFORE acting, fresh per attempt.
+                        var preHash: String? = nil
+                        if step.expect?["watch"] != nil || step.expect?["settle"] != nil, let wid = observedWID {
+                            let watch = (step.expect?["watch"] as? String).flatMap { Self.parseRegion($0) }
+                            preHash = try? await AgentCapture.hashWindow(windowID: wid, region: watch)
+                        }
+                        // Snapshot the focused value before a type step, so
+                        // verifyStep can tell "didn't land" from "landed but
+                        // echoed transformed".
+                        var preValue: String? = nil
+                        if step.verb == "type", let pid = stepPID(step.doPart) {
+                            preValue = (try? AgentAX.focused(app: nil, pid: pid))?.value
+                        }
+                        let r = await performStep(step.verb, step.doPart)
+                        var satisfied = false
+                        var ledger: [String: Any] = [:]
+                        if let err = r["error"] as? String {
+                            lastReason = "action failed: \(err)"
+                        } else {
+                            let (verdict, why) = await verifyStep(step.verb, step.doPart, preValue: preValue)
+                            if verdict == false {
+                                lastReason = "host verification failed: \(why)"
+                                ledger["verified"] = false
+                            } else {
+                                if let v = verdict { ledger["verified"] = v }
+                                else if !why.isEmpty { ledger["verified"] = "unverifiable"; stepUnverifiable = why }
+                                let (ok, why2) = await awaitExpect(step.expect, preHash: preHash)
+                                satisfied = ok
+                                if !ok { lastReason = "expect not met: \(why2)" }
+                            }
+                        }
+                        ledger["ok"] = r["error"] == nil
+                        ledger["satisfied"] = satisfied
+                        if !satisfied { ledger["reason"] = lastReason }
+                        DevtoolsRelay.shared.logRunStep(
+                            args: ["step": i + 1, "verb": step.verb, "attempt": attempt]
+                                .merging(DevtoolsRelay.summarizeAgentArgs(step.doPart)) { a, _ in a },
+                            ms: Int(Date().timeIntervalSince(stepStart) * 1000),
+                            result: ledger)
+                        if satisfied { stepOK = true; break }
+                        attempt += 1
+                    }
+                    retriesTotal += min(attempt, step.retry)
+                    if !stepOK {
+                        reply(await failBundle(i, lastReason, retriesTotal, runStart)); return
+                    }
+                    if !stepUnverifiable.isEmpty { unverified.append(i + 1) }
+                }
+                // Endgame: aggregates + ONE final capture (the "last final
+                // pieces" — fishy numbers here are the cue to grep run.step).
+                var out: [String: Any] = [
+                    "ok": true, "completed": true, "steps": steps.count,
+                    "retries_total": retriesTotal,
+                    "waited_ms": Int(Date().timeIntervalSince(runStart) * 1000),
+                ]
+                if let wid = observedWID,
+                   let r = try? await AgentCapture.captureWindow(named: nil, windowID: wid),
+                   let f = r.frame {
+                    out["path"] = r.imagePath; out["frame_id"] = f.id
+                    out["origin_x"] = f.origin.x; out["origin_y"] = f.origin.y
+                    out["width"] = f.size.width; out["height"] = f.size.height
+                    out["image_width"] = f.imageWidth; out["image_height"] = f.imageHeight
+                    out["screen_hash"] = r.screenHash
+                }
+                var notes: [String] = []
+                if retriesTotal > 0 {
+                    notes.append("completed, but \(retriesTotal) retr\(retriesTotal == 1 ? "y" : "ies") were needed — "
+                        + "if the final state looks off, grep route run.step in calls.ndjson")
+                }
+                if !unverified.isEmpty {
+                    out["unverified_steps"] = unverified
+                    notes.append("step\(unverified.count == 1 ? "" : "s") \(unverified.map(String.init).joined(separator: ",")) "
+                        + "couldn't be host-verified (no readable AX value — canvas?): completed means the checkpoints "
+                        + "passed, NOT that those effects landed — re-check them (read-text / capture --region) before trusting the result")
+                }
+                if !notes.isEmpty { out["note"] = notes.joined(separator: ". ") }
+                reply(out)
+            }
         }
         DevtoolsRelay.shared.onAgentMark = { [weak self] b in
             guard let self, let p = self.point(b) else { return ["error": "expected {x,y}"] }
@@ -181,20 +719,30 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             guard let selector = b["selector"] as? String else { return ["error": "expected {selector}"] }
             let port = UInt16((b["port"] as? NSNumber)?.intValue ?? 9222)
             let match = b["match"] as? String
+            let viaExt = (b["via_extension"] as? NSNumber)?.boolValue ?? false
             do {
-                let matches = try await AgentDOM.screenRects(selector: selector, port: port, match: match)
-                let arr: [[String: Any]] = matches.map { m in
-                    ["x": m.rect.origin.x, "y": m.rect.origin.y,
-                     "width": m.rect.size.width, "height": m.rect.size.height,
-                     "center_x": m.center.x, "center_y": m.center.y, "text": m.text]
-                }
+                let matches = try await AgentDOM.screenRects(selector: selector, port: port, match: match, viaExtension: viaExt)
                 // Top-level fields mirror the FIRST match (back-compat with the
-                // single-result shape); `matches`/`count` expose them all.
+                // single-result shape). The full list is compact by default — one
+                // line per element; --json restores the verbose matches[].
                 let f = matches[0]
-                return ["ok": true, "count": matches.count, "matches": arr,
+                var out: [String: Any] = ["ok": true, "count": matches.count,
                         "x": f.rect.origin.x, "y": f.rect.origin.y,
                         "width": f.rect.size.width, "height": f.rect.size.height,
                         "center_x": f.center.x, "center_y": f.center.y]
+                if (b["json"] as? NSNumber)?.boolValue ?? false {
+                    out["matches"] = matches.map { m -> [String: Any] in
+                        ["x": m.rect.origin.x, "y": m.rect.origin.y,
+                         "width": m.rect.size.width, "height": m.rect.size.height,
+                         "center_x": m.center.x, "center_y": m.center.y, "text": m.text]
+                    }
+                } else {
+                    out["elements"] = Self.elementLines(
+                        matches.enumerated().map { (id: $0.offset + 1, role: "",
+                                                    name: $0.element.text, rect: $0.element.rect) },
+                        brief: (b["brief"] as? NSNumber)?.boolValue ?? false)
+                }
+                return out
             } catch { return ["error": error.localizedDescription] }
         }
         DevtoolsRelay.shared.onAgentEval = { b in
@@ -203,8 +751,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             }
             let port = UInt16((b["port"] as? NSNumber)?.intValue ?? 9222)
             let match = b["match"] as? String
+            let viaExt = (b["via_extension"] as? NSNumber)?.boolValue ?? false
             do {
-                let json = try await AgentDOM.runJavaScript(expression: expr, port: port, match: match)
+                let json = try await AgentDOM.runJavaScript(expression: expr, port: port, match: match, viaExtension: viaExt)
                 // Re-parse so the value embeds natively in the response (an
                 // array stays an array), not as an escaped string.
                 if let json, let val = try? JSONSerialization.jsonObject(
@@ -218,19 +767,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             guard let url = b["url"] as? String else { return ["error": "expected {url}"] }
             let port = UInt16((b["port"] as? NSNumber)?.intValue ?? 9222)
             let match = b["match"] as? String
-            do { try await AgentDOM.navigate(url: url, port: port, match: match); return ["ok": true, "url": url] }
+            let viaExt = (b["via_extension"] as? NSNumber)?.boolValue ?? false
+            do { try await AgentDOM.navigate(url: url, port: port, match: match, viaExtension: viaExt); return ["ok": true, "url": url] }
             catch { return ["error": error.localizedDescription] }
         }
         DevtoolsRelay.shared.onAgentTabs = { b in
             let port = UInt16((b["port"] as? NSNumber)?.intValue ?? 9222)
-            do { return ["ok": true, "tabs": try await AgentDOM.tabs(port: port)] }
+            let viaExt = (b["via_extension"] as? NSNumber)?.boolValue ?? false
+            do { return ["ok": true, "tabs": try await AgentDOM.tabs(port: port, viaExtension: viaExt)] }
             catch { return ["error": error.localizedDescription] }
         }
         DevtoolsRelay.shared.onAgentFocus = { b in
             let port = UInt16((b["port"] as? NSNumber)?.intValue ?? 9222)
             let match = b["match"] as? String
+            let viaExt = (b["via_extension"] as? NSNumber)?.boolValue ?? false
             do {
-                try await AgentDOM.bringToFront(port: port, match: match)
+                try await AgentDOM.bringToFront(port: port, match: match, viaExtension: viaExt)
                 return ["ok": true]
             } catch { return ["error": error.localizedDescription] }
         }
@@ -242,11 +794,81 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             let maxMarks = (b["max"] as? NSNumber)?.intValue ?? 100
             let app = b["app"] as? String
             let axPID = (b["pid"] as? NSNumber).map { pid_t($0.intValue) }
+            // Table-first SoM: the annotated screenshot is the EXPENSIVE half of
+            // this verb (image tokens + several MB of transfer per loop step) and
+            // redundant whenever the mark table carries usable names — the model
+            // acts by id either way. So the image is produced only when names are
+            // sparse (icon toolbars, canvas apps) or explicitly requested.
+            //   --image  force the annotated screenshot
+            //   --json   verbose marks[] array (scripts) instead of the text table
+            //   --brief  drop geometry from the table (id/role/name only)
+            //   --diff   only what changed since the last som of this target
+            let wantImage = (b["image"] as? NSNumber)?.boolValue ?? false
+            let wantJSON = (b["json"] as? NSNumber)?.boolValue ?? false
+            let brief = (b["brief"] as? NSNumber)?.boolValue ?? false
+            let wantDiff = (b["diff"] as? NSNumber)?.boolValue ?? false
+
+            func emitMarks(_ stored: [AgentCapture.Mark], into out: inout [String: Any]) {
+                if wantJSON {
+                    out["marks"] = stored.map { m -> [String: Any] in
+                        ["id": m.id, "role": m.role, "name": m.name,
+                         "x": m.rect.origin.x, "y": m.rect.origin.y,
+                         "width": m.rect.size.width, "height": m.rect.size.height,
+                         "center_x": m.center.x, "center_y": m.center.y]
+                    }
+                } else {
+                    out["elements"] = Self.elementLines(
+                        stored.map { (id: $0.id, role: $0.role, name: $0.name, rect: $0.rect) },
+                        brief: brief)
+                }
+            }
+
+            // With --diff: compare against the last som of the same target and
+            // return only added/removed rows — after a click the delta is
+            // usually "a menu's worth of rows", tens of tokens instead of the
+            // full table. Every som (diff or not) refreshes the baseline.
+            func emitMarksOrDiff(_ stored: [AgentCapture.Mark], key: String,
+                                 into out: inout [String: Any], notes: inout [String]) {
+                let els = stored.map { AgentPerception.Element(role: $0.role, name: $0.name, rect: $0.rect) }
+                if wantDiff {
+                    let d = AgentPerception.diffAndStore(key: key, current: els)
+                    if d.hadBaseline {
+                        out["diff"] = true
+                        out["added"] = d.added.count
+                        out["removed"] = d.removed.count
+                        out["unchanged"] = d.unchangedCount
+                        let addedHashes = Set(d.added.map(\.hash))
+                        let addedMarks = stored.filter {
+                            addedHashes.contains(AgentPerception.Element(
+                                role: $0.role, name: $0.name, rect: $0.rect).hash)
+                        }
+                        if !addedMarks.isEmpty {
+                            out["elements_added"] = Self.elementLines(
+                                addedMarks.map { (id: $0.id, role: $0.role, name: $0.name, rect: $0.rect) },
+                                brief: brief)
+                        }
+                        if !d.removed.isEmpty {
+                            out["elements_removed"] = Self.elementLines(
+                                d.removed.enumerated().map { (id: $0.offset + 1, role: $0.element.role,
+                                                              name: $0.element.name, rect: $0.element.rect) },
+                                brief: brief)
+                        }
+                        notes.append("diff vs the previous som of this target — added ids are "
+                            + "click-mark ids in THIS frame; removed rows are informational "
+                            + "(a moved element shows as removed+added)")
+                        return
+                    }
+                    out["diff"] = "baseline"
+                    notes.append("no previous som snapshot for this target — stored one; returning the full table")
+                } else {
+                    AgentPerception.store(key: key, current: els)
+                }
+                emitMarks(stored, into: &out)
+            }
 
             // AX-backed Set-of-Mark: read the target app's tree (by PID — works on
-            // native apps AND the live default-profile Chrome), screenshot its
-            // window, and draw the numbered boxes ourselves (native elements can't
-            // inject their own overlay like the DOM path does).
+            // native apps AND the live default-profile Chrome). The tree is read
+            // FIRST; the window is screenshotted + annotated only when needed.
             if app != nil || axPID != nil {
                 do {
                     let pid = try AgentAX.resolvePID(app: app, pid: axPID)
@@ -261,93 +883,127 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     guard let win else {
                         return ["error": "no window for that app/pid (it may have no open windows — ⌘N in the app)"]
                     }
-                    let shot = try await AgentCapture.rawCapture(windowID: win.id, fallbackName: app)
                     // Query generously, then keep only this window's elements.
                     let (matches, _) = try await AgentAX.query(app: nil, pid: pid, role: nil,
                                                                title: nil, max: 500, press: false)
-                    let winRect = CGRect(origin: shot.origin, size: shot.size)
-                    let pppX = Double(shot.image.width) / Double(max(shot.size.width, 1))
-                    let pppY = Double(shot.image.height) / Double(max(shot.size.height, 1))
+                    let winRect = win.bounds
                     var stored: [AgentCapture.Mark] = []
-                    var boxes: [(label: Int, rect: CGRect)] = []
-                    var marksOut: [[String: Any]] = []
                     for m in matches {
                         guard winRect.contains(m.center) else { continue }   // this window's elements only
-                        let id = stored.count + 1
-                        let ir = CGRect(x: (m.rect.origin.x - shot.origin.x) * pppX,
-                                        y: (m.rect.origin.y - shot.origin.y) * pppY,
-                                        width: m.rect.size.width * pppX, height: m.rect.size.height * pppY)
-                        boxes.append((label: id, rect: ir))
-                        stored.append(AgentCapture.Mark(id: id, role: m.role, name: m.name,
+                        stored.append(AgentCapture.Mark(id: stored.count + 1, role: m.role, name: m.name,
                                                         rect: m.rect, center: m.center))
-                        marksOut.append(["id": id, "role": m.role, "name": m.name,
-                                         "x": m.rect.origin.x, "y": m.rect.origin.y,
-                                         "width": m.rect.size.width, "height": m.rect.size.height,
-                                         "center_x": m.center.x, "center_y": m.center.y])
                         if stored.count >= maxMarks { break }
                     }
-                    let annotated = AgentCapture.annotate(image: shot.image, boxes: boxes) ?? shot.image
-                    guard let url = ContextSnap.saveImage(annotated) else {
-                        return ["error": "som: could not save the annotated screenshot"]
+                    let named = stored.filter { !$0.name.isEmpty }.count
+                    // --diff is a text feature: no auto-image (only --image forces one).
+                    let needImage = wantImage
+                        || (!wantDiff && Self.somNeedsImage(named: named, total: stored.count))
+
+                    var out: [String: Any] = ["ok": true, "source": "ax", "count": stored.count]
+                    var notes: [String] = []
+                    if needImage {
+                        let shot = try await AgentCapture.rawCapture(windowID: win.id, fallbackName: app)
+                        // Downscale BEFORE annotating so boxes and labels render at
+                        // the resolution the model actually sees.
+                        let img = AgentCapture.downscale(shot.image)
+                        let pppX = Double(img.width) / Double(max(shot.size.width, 1))
+                        let pppY = Double(img.height) / Double(max(shot.size.height, 1))
+                        let boxes: [(label: Int, rect: CGRect)] = stored.map { m in
+                            (label: m.id,
+                             rect: CGRect(x: (m.rect.origin.x - shot.origin.x) * pppX,
+                                          y: (m.rect.origin.y - shot.origin.y) * pppY,
+                                          width: m.rect.size.width * pppX,
+                                          height: m.rect.size.height * pppY))
+                        }
+                        let annotated = AgentCapture.annotate(image: img, boxes: boxes) ?? img
+                        guard let url = ContextSnap.saveImage(annotated) else {
+                            return ["error": "som: could not save the annotated screenshot"]
+                        }
+                        out["image"] = true
+                        out["path"] = url.path
+                        out["image_width"] = annotated.width
+                        out["image_height"] = annotated.height
+                    } else {
+                        out["image"] = false
+                        notes.append("marks are well-named; table only — pass --image for the annotated screenshot")
                     }
                     let fid = AgentCapture.nextMarkFrameID()
                     AgentCapture.rememberMarks(AgentCapture.MarkFrame(
                         id: fid, source: "ax", marks: stored, capturedAt: Date(),
-                        pid: pid, owner: shot.owner, windowID: win.id, windowBounds: winRect))
-                    var out: [String: Any] = [
-                        "ok": true, "source": "ax", "path": url.path, "frame_id": fid,
-                        "count": marksOut.count, "image_width": annotated.width,
-                        "image_height": annotated.height, "marks": marksOut,
-                    ]
-                    if marksOut.count >= maxMarks {
+                        pid: pid, owner: win.owner, windowID: win.id, windowBounds: winRect))
+                    out["frame_id"] = fid
+                    emitMarksOrDiff(stored, key: "som:ax:\(pid)", into: &out, notes: &notes)
+                    if stored.count >= maxMarks {
                         out["truncated"] = true
-                        out["note"] = "capped at \(maxMarks) marks; pass --max to raise"
+                        notes.append("capped at \(maxMarks) marks; pass --max to raise")
                     }
+                    if !notes.isEmpty { out["note"] = notes.joined(separator: "; ") }
                     return out
                 } catch { return ["error": error.localizedDescription] }
             }
 
-            // CDP-backed Set-of-Mark (DOM apps): the page draws its own overlay.
+            // CDP-backed Set-of-Mark (DOM apps): collect the mark table first (no
+            // overlay, no screenshot); only when the table can't stand alone does
+            // a second pass draw the in-page overlay and screenshot it.
             let port = UInt16((b["port"] as? NSNumber)?.intValue ?? 9222)
             let match = b["match"] as? String
+            let viaExt = (b["via_extension"] as? NSNumber)?.boolValue ?? false
             do {
-                let r = try await AgentDOM.setOfMarks(port: port, match: match, max: maxMarks)
-                // Decode + save the annotated PNG through ContextSnap so it joins
-                // snap history and pruning, like a normal capture.
-                guard let data = Data(base64Encoded: r.pngBase64),
-                      let rep = NSBitmapImageRep(data: data),
-                      let img = rep.cgImage,
-                      let url = ContextSnap.saveImage(img)
-                else { return ["error": "som: could not save the annotated screenshot"] }
+                var r = try await AgentDOM.setOfMarks(port: port, match: match,
+                                                      max: maxMarks, includeImage: false, viaExtension: viaExt)
+                let named = r.marks.filter { !$0.name.isEmpty }.count
+                // --diff is a text feature: no auto-image (only --image forces one).
+                let needImage = wantImage
+                    || (!wantDiff && Self.somNeedsImage(named: named, total: r.marks.count))
+                if needImage {
+                    // Re-run with the overlay + screenshot; ITS marks are the
+                    // authoritative set (the page may have shifted between passes).
+                    r = try await AgentDOM.setOfMarks(port: port, match: match,
+                                                      max: maxMarks, includeImage: true, viaExtension: viaExt)
+                }
 
-                // Assign 1-based ids (matching the drawn labels), store the frame,
-                // and emit the table the model reads beside the image.
+                // Assign 1-based ids (matching the drawn labels) and store the frame.
                 var stored: [AgentCapture.Mark] = []
-                var marksOut: [[String: Any]] = []
                 for (i, m) in r.marks.enumerated() {
-                    let id = i + 1
-                    stored.append(AgentCapture.Mark(id: id, role: m.role, name: m.name,
+                    stored.append(AgentCapture.Mark(id: i + 1, role: m.role, name: m.name,
                                                     rect: m.rect, center: m.center))
-                    marksOut.append(["id": id, "role": m.role, "name": m.name,
-                                     "x": m.rect.origin.x, "y": m.rect.origin.y,
-                                     "width": m.rect.size.width, "height": m.rect.size.height,
-                                     "center_x": m.center.x, "center_y": m.center.y])
+                }
+
+                var out: [String: Any] = ["ok": true, "source": "cdp", "count": stored.count]
+                var notes: [String] = []
+                if needImage {
+                    // Decode, downscale, and save through ContextSnap so it joins
+                    // snap history and pruning, like a normal capture.
+                    guard let data = Data(base64Encoded: r.pngBase64),
+                          let rep = NSBitmapImageRep(data: data),
+                          let raw = rep.cgImage
+                    else { return ["error": "som: could not save the annotated screenshot"] }
+                    let img = AgentCapture.downscale(raw)
+                    guard let url = ContextSnap.saveImage(img) else {
+                        return ["error": "som: could not save the annotated screenshot"]
+                    }
+                    out["image"] = true
+                    out["path"] = url.path
+                    out["image_width"] = img.width
+                    out["image_height"] = img.height
+                } else {
+                    out["image"] = false
+                    notes.append("marks are well-named; table only — pass --image for the annotated screenshot")
                 }
                 let fid = AgentCapture.nextMarkFrameID()
                 AgentCapture.rememberMarks(AgentCapture.MarkFrame(
                     id: fid, source: "cdp", marks: stored, capturedAt: Date(),
-                    port: port, match: match, url: r.url,
+                    port: port, match: match, viaExtension: viaExt, url: r.url,
                     screenX: r.screenX, screenY: r.screenY,
                     scrollX: r.scrollX, scrollY: r.scrollY))
-
-                var out: [String: Any] = [
-                    "ok": true, "source": "cdp", "path": url.path, "frame_id": fid, "count": marksOut.count,
-                    "image_width": img.width, "image_height": img.height, "marks": marksOut,
-                ]
-                if marksOut.count >= maxMarks {
+                out["frame_id"] = fid
+                emitMarksOrDiff(stored, key: "som:cdp:\(viaExt ? "ext" : String(port)):\(match ?? "*")",
+                                into: &out, notes: &notes)
+                if stored.count >= maxMarks {
                     out["truncated"] = true
-                    out["note"] = "capped at \(maxMarks) marks; pass --max to raise"
+                    notes.append("capped at \(maxMarks) marks; pass --max to raise")
                 }
+                if !notes.isEmpty { out["note"] = notes.joined(separator: "; ") }
                 return out
             } catch { return ["error": error.localizedDescription] }
         }
@@ -370,18 +1026,66 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             do {
                 // Auto-raise (default for --pid/--app): Chromium/Flutter expose their
                 // a11y tree only when foreground, so surface an off-Space window first.
-                if let rp = try? AgentAX.resolvePID(app: app, pid: pid) {
+                let resolvedPID = try? AgentAX.resolvePID(app: app, pid: pid)
+                if let rp = resolvedPID {
                     _ = await AgentAX.ensureOnScreen(pid: rp)
                 }
                 let (matches, pressed) = try await AgentAX.query(
                     app: app, pid: pid, role: role, title: title, max: maxN, press: press)
-                let arr: [[String: Any]] = matches.map { m in
-                    ["role": m.role, "name": m.name,
-                     "x": m.rect.origin.x, "y": m.rect.origin.y,
-                     "width": m.rect.size.width, "height": m.rect.size.height,
-                     "center_x": m.center.x, "center_y": m.center.y]
+                var out: [String: Any] = ["ok": true, "count": matches.count]
+                let brief = (b["brief"] as? NSNumber)?.boolValue ?? false
+                // Snapshot key: same target + same filters = comparable observations.
+                let els = matches.map { AgentPerception.Element(role: $0.role, name: $0.name, rect: $0.rect) }
+                let targetKey = "ax:\(resolvedPID.map(String.init) ?? app ?? "?"):\(role ?? "*"):\(title ?? "*")"
+                var emittedDiff = false
+                if (b["diff"] as? NSNumber)?.boolValue ?? false {
+                    // --diff: only what changed since the last identical query —
+                    // after a click the delta is usually a handful of rows.
+                    let d = AgentPerception.diffAndStore(key: targetKey, current: els)
+                    if d.hadBaseline {
+                        out["diff"] = true
+                        out["added"] = d.added.count
+                        out["removed"] = d.removed.count
+                        out["unchanged"] = d.unchangedCount
+                        if !d.added.isEmpty {
+                            out["elements_added"] = Self.elementLines(
+                                d.added.enumerated().map { (id: $0.offset + 1, role: $0.element.role,
+                                                            name: $0.element.name, rect: $0.element.rect) },
+                                brief: brief)
+                        }
+                        if !d.removed.isEmpty {
+                            out["elements_removed"] = Self.elementLines(
+                                d.removed.enumerated().map { (id: $0.offset + 1, role: $0.element.role,
+                                                              name: $0.element.name, rect: $0.element.rect) },
+                                brief: brief)
+                        }
+                        out["note"] = "diff vs the previous identical query (a moved element shows as removed+added); pass no --diff for the full table"
+                        emittedDiff = true
+                    } else {
+                        out["diff"] = "baseline"
+                        out["note"] = "no previous snapshot for this target/filter — stored one; returning the full table"
+                    }
+                } else {
+                    AgentPerception.store(key: targetKey, current: els)
                 }
-                var out: [String: Any] = ["ok": true, "count": arr.count, "matches": arr]
+                // Compact by default: one line per element (~4× fewer tokens than
+                // the object array). --json restores the verbose matches[] for
+                // scripts; --brief drops geometry (id/role/name only).
+                if !emittedDiff {
+                    if (b["json"] as? NSNumber)?.boolValue ?? false {
+                        out["matches"] = matches.map { m -> [String: Any] in
+                            ["role": m.role, "name": m.name,
+                             "x": m.rect.origin.x, "y": m.rect.origin.y,
+                             "width": m.rect.size.width, "height": m.rect.size.height,
+                             "center_x": m.center.x, "center_y": m.center.y]
+                        }
+                    } else {
+                        out["elements"] = Self.elementLines(
+                            matches.enumerated().map { (id: $0.offset + 1, role: $0.element.role,
+                                                        name: $0.element.name, rect: $0.element.rect) },
+                            brief: brief)
+                    }
+                }
                 if let f = matches.first {   // mirror first match (parity with query-dom)
                     out["x"] = f.rect.origin.x; out["y"] = f.rect.origin.y
                     out["width"] = f.rect.size.width; out["height"] = f.rect.size.height
@@ -422,6 +1126,66 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 let released = self.windows.filter { $0.isAgentGhosted }
                 released.forEach { $0.setAgentGhost(false) }
                 return ["ok": true, "ghost": false, "released": released.count]
+            }
+        }
+        // sessions/peek: the terminal tunnel — one agent reading another
+        // session's command output. `sessions` lists every terminal with its
+        // stable id; `peek` returns a command block (OSC 133-delimited, with
+        // exit code) or a raw line window from any of them, and `--wait`
+        // long-polls until the target's next command completes. An agent
+        // identifies itself via $FLOATYTERM_SESSION_ID (injected into every
+        // pty) and passes it as --exclude to mean "everyone but me".
+        DevtoolsRelay.shared.onAgentSessions = { [weak self] _ in
+            guard let self else { return ["error": "no self"] }
+            let items: [[String: Any]] = self.sessionEntries().compactMap { e in
+                guard let term = e.tab as? TerminalController else { return nil }
+                var item: [String: Any] = [
+                    "id": term.sessionID,
+                    "name": e.name,
+                    "location": e.location,
+                    "status": String(describing: e.status),
+                    "is_agent": e.isAgent,
+                    "shell_integration": term.sawShellIntegration,
+                    "transcript_end": term.transcriptAbsoluteEnd,
+                ]
+                if let last = term.commandBlocks.last {
+                    item["last_block"] = last.id
+                    item["running"] = last.endLine == nil
+                    if let code = last.exitCode { item["last_exit_code"] = Int(code) }
+                }
+                return item
+            }
+            return ["ok": true, "count": items.count, "sessions": items]
+        }
+        DevtoolsRelay.shared.onAgentPeek = { [weak self] b, reply in
+            guard let self else { reply(["error": "no self"]); return }
+            let resolved = self.resolvePeekTarget(b)
+            guard let term = resolved.term else {
+                reply(resolved.error ?? ["error": "no session"]); return
+            }
+            let wantsWait = (b["wait"] as? NSNumber)?.boolValue ?? false
+            guard wantsWait else {
+                reply(self.peekResult(term: term, body: b)); return
+            }
+            guard term.sawShellIntegration else {
+                reply(["error": "--wait needs OSC 133 shell integration in the target session (none seen); poll with --since instead"])
+                return
+            }
+            let timeout = min(max((b["timeout"] as? NSNumber)?.doubleValue ?? 60, 1), 300)
+            // Both closures run on the main thread, so the flag needs no lock.
+            var done = false
+            let token = term.awaitNextCompletedBlock { [weak self] block in
+                guard !done, let self else { return }
+                done = true
+                var body = b
+                body["block"] = NSNumber(value: block.id)
+                reply(self.peekResult(term: term, body: body))
+            }
+            DispatchQueue.main.asyncAfter(deadline: .now() + timeout) { [weak term] in
+                guard !done else { return }
+                done = true
+                term?.cancelBlockWait(token)
+                reply(["error": "timeout: no command completed in the target session within \(Int(timeout))s"])
             }
         }
         // focused: report the target app's focused element (AXFocusedUIElement)
@@ -626,7 +1390,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 // so JSON.stringify here would double-encode to a String and the
                 // [String:Any] cast below would silently fail (skipping the guard).
                 let probe = "({sx:window.screenX,sy:window.screenY,scx:window.scrollX,scy:window.scrollY,url:location.href})"
-                if let json = try await AgentDOM.runJavaScript(expression: probe, port: frame.port, match: frame.match),
+                if let json = try await AgentDOM.runJavaScript(expression: probe, port: frame.port, match: frame.match, viaExtension: frame.viaExtension),
                    let st = try? JSONSerialization.jsonObject(with: Data(json.utf8)) as? [String: Any] {
                     func d(_ k: String) -> Double { (st[k] as? NSNumber)?.doubleValue ?? .nan }
                     let tol = 2.0
@@ -638,7 +1402,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 }
             } catch { return ["error": "click-mark: \(error.localizedDescription)"] }
             // Raise the tab's window so the screen-point click lands on it.
-            try? await AgentDOM.bringToFront(port: frame.port, match: frame.match)
+            try? await AgentDOM.bringToFront(port: frame.port, match: frame.match, viaExtension: frame.viaExtension)
             let clicks = (b["clicks"] as? NSNumber)?.intValue ?? 1
             let ok = AgentInput.click(at: mark.center, button: self.button(b), modifiers: self.mods(b),
                                       clicks: clicks, pacing: self.pacing(b), target: self.target(b))
@@ -1160,6 +1924,139 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
+    // MARK: - Session tunnel (peek) helpers
+
+    /// Resolves peek's target session: by exact sessionID, id prefix (≥6
+    /// chars), exact tab name, then name substring — after removing the
+    /// caller's own session (--exclude $FLOATYTERM_SESSION_ID). With no
+    /// --session and exactly one candidate left, that one wins, which is
+    /// what makes `peek --exclude $FLOATYTERM_SESSION_ID` just work in a
+    /// two-terminal setup.
+    private func resolvePeekTarget(_ b: [String: Any]) -> (term: TerminalController?, error: [String: Any]?) {
+        var entries = sessionEntries().filter { $0.tab is TerminalController }
+        if let excluded = b["exclude"] as? String, !excluded.isEmpty {
+            entries.removeAll { ($0.tab as? TerminalController)?.sessionID == excluded }
+        }
+        let terms: [(name: String, term: TerminalController)] = entries.compactMap { e in
+            (e.tab as? TerminalController).map { (e.name, $0) }
+        }
+        // Ambiguity replies carry the machine-readable roster, so a calling
+        // agent picks a session from THIS reply instead of prose-parsing or
+        // making a second `floaty sessions` round-trip.
+        let roster: [[String: Any]] = entries.compactMap { e in
+            guard let t = e.tab as? TerminalController else { return nil }
+            return ["id": t.sessionID, "name": e.name,
+                    "status": String(describing: e.status), "is_agent": e.isAgent]
+        }
+        guard !terms.isEmpty else {
+            return (nil, ["error": "no terminal sessions to peek (after --exclude)"])
+        }
+        guard let query = (b["session"] as? String)?
+                .trimmingCharacters(in: .whitespaces), !query.isEmpty else {
+            if terms.count == 1 { return (terms[0].term, nil) }
+            return (nil, ["error": "several sessions — pass --session <name|id>",
+                          "sessions": roster])
+        }
+        let q = query.lowercased()
+        if let hit = terms.first(where: { $0.term.sessionID.lowercased() == q })
+            ?? (q.count >= 6 ? terms.first(where: { $0.term.sessionID.lowercased().hasPrefix(q) }) : nil)
+            ?? terms.first(where: { $0.name.lowercased() == q })
+            ?? terms.first(where: { $0.name.lowercased().contains(q) }) {
+            return (hit.term, nil)
+        }
+        return (nil, ["error": "no session matches \"\(query)\"", "sessions": roster])
+    }
+
+    /// Builds the peek reply: a command block (default: the latest), a raw
+    /// absolute-index line window (--since), or — when the target shell has
+    /// no OSC 133 integration — the transcript tail.
+    private func peekResult(term: TerminalController, body b: [String: Any]) -> [String: Any] {
+        func epoch(_ t: TimeInterval) -> Double {
+            Date(timeIntervalSinceReferenceDate: t).timeIntervalSince1970.rounded()
+        }
+        let maxLines = min(max((b["max_lines"] as? NSNumber)?.intValue ?? 500, 1), 5000)
+        var out: [String: Any] = [
+            "ok": true,
+            "session": ["id": term.sessionID, "name": term.displayName],
+            "transcript_end": term.transcriptAbsoluteEnd,
+        ]
+
+        // --since: raw line window in absolute transcript coordinates,
+        // reading forward; next_since makes polling a one-liner. Always
+        // verbatim rows — joining/collapsing would break the index math.
+        if let since = (b["since"] as? NSNumber)?.intValue {
+            let (lines, _, dropped) = term.blockLines(start: max(0, since), end: nil)
+            let page = Array(lines.prefix(maxLines))
+            out["mode"] = "since"
+            out["since"] = since
+            out["dropped_prefix"] = dropped
+            out["lines"] = page
+            out["next_since"] = max(0, since) + dropped + page.count
+            out["more"] = lines.count > page.count
+            return out
+        }
+
+        // Lines are cleaned for agent consumption by default — soft-wrapped
+        // rows joined back into logical lines, repaint dupes and blank runs
+        // folded. --raw returns the verbatim screen rows.
+        let raw = (b["raw"] as? NSNumber)?.boolValue ?? false
+        func present(_ lines: [String], _ wraps: [Bool]) -> (lines: [String], collapsed: Int) {
+            if raw { return (lines, 0) }
+            return TerminalController.cleanedForPeek(
+                TerminalController.logicalLines(lines, wraps: wraps))
+        }
+
+        let blocks = term.commandBlocks
+        guard !blocks.isEmpty else {
+            // No 133 markers seen: still useful — return the tail.
+            let start = max(0, term.transcriptAbsoluteEnd - min(maxLines, 200))
+            let (lines, wraps, _) = term.blockLines(start: start, end: nil)
+            let (page, collapsed) = present(lines, wraps)
+            out["mode"] = "tail"
+            out["no_blocks"] = true
+            out["hint"] = "no OSC 133 shell integration in this session; returned the transcript tail (page with --since)"
+            out["lines"] = Array(page.suffix(maxLines))
+            if collapsed > 0 { out["noise_collapsed"] = collapsed }
+            return out
+        }
+
+        let block: TerminalController.CommandBlock?
+        switch b["block"] {
+        case let n as NSNumber:
+            block = blocks.first { $0.id == n.intValue }
+        case let s as String where s.lowercased() != "last":
+            block = Int(s).flatMap { id in blocks.first { $0.id == id } }
+        default:
+            block = blocks.last
+        }
+        guard let block else {
+            return ["error": "no such block — this session has blocks \(blocks.first!.id)…\(blocks.last!.id)"]
+        }
+
+        let (rawLines, wraps, dropped) = term.blockText(block)
+        let (lines, collapsed) = present(rawLines, wraps)
+        let tail = Array(lines.suffix(maxLines))
+        var blk: [String: Any] = [
+            "id": block.id,
+            "running": block.endLine == nil,
+            "start_line": block.startLine,
+            "line_count": lines.count,
+            "dropped_prefix": dropped,
+            "head_truncated": max(0, lines.count - tail.count),
+            "started_at": epoch(block.startedAt),
+            "lines": tail,
+        ]
+        if collapsed > 0 { blk["noise_collapsed"] = collapsed }
+        if let c = block.command { blk["command"] = c }
+        if let e = block.endLine { blk["end_line"] = e }
+        if let x = block.exitCode { blk["exit_code"] = Int(x) }
+        if let t = block.endedAt { blk["ended_at"] = epoch(t) }
+        out["mode"] = "block"
+        out["block"] = blk
+        out["blocks"] = ["first": blocks.first!.id, "last": blocks.last!.id]
+        return out
+    }
+
     private func location(of wc: TerminalWindowController) -> String {
         // The app this window was pinned over, e.g. "another Space (Chrome)".
         let app = wc.pinnedAppName.map { " (\($0))" } ?? ""
@@ -1204,9 +2101,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             wc.selectTab(at: idx)
             if wc.isGhosted { wc.setGhosted(false) }   // summon = interactive again
             if wc.isCollapsed {
-                wc.expandFromAvatar()
+                wc.expandFromAvatar(to: crossScreenSummonTarget(for: wc))
             } else if wc.isTicker {
-                wc.expandFromTicker()
+                wc.expandFromTicker(to: crossScreenSummonTarget(for: wc))
             } else {
                 wc.show()
             }
@@ -1232,6 +2129,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
+    /// Expanding a collapsed session normally unfolds it in place, around its
+    /// bubble / ticker strip. But when that representative sits on a DIFFERENT
+    /// screen than the user (roaming bubbles don't follow the mouse across
+    /// displays), in-place expansion would land the window over there — so give
+    /// the expand an explicit destination at the summon grid point instead.
+    /// nil = same screen; expand in place.
+    private func crossScreenSummonTarget(for wc: TerminalWindowController) -> NSRect? {
+        guard let repFrame = wc.collapsedRepresentativeFrame else { return nil }
+        let mouse = NSEvent.mouseLocation
+        guard let userScreen = NSScreen.screens.first(where: {
+            NSMouseInRect(mouse, $0.frame, false)
+        }), !userScreen.frame.intersects(repFrame) else { return nil }
+        return summonTargetFrame(size: wc.expandedSize)
+    }
+
     /// The user's summon grid point on the active screen, sized to `size` —
     /// where borrowed and whole-summoned windows land, away from whatever
     /// terminal is already in view. The screen under the mouse is "where the
@@ -1246,6 +2158,121 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     // MARK: - Agent route body parsing
+
+    /// One line per element — the token-lean default the model reads (roughly
+    /// 4× fewer tokens than the equivalent object array). Geometry stays for
+    /// spatial reasoning; centers are host-side concerns (the model acts by
+    /// mark id / --press / first-match mirror, never by emitting a coordinate).
+    /// `brief` drops geometry too: id, role, name only.
+    static func elementLines(_ rows: [(id: Int, role: String, name: String, rect: CGRect)],
+                             brief: Bool) -> String {
+        rows.map { r in
+            let name = r.name
+                .replacingOccurrences(of: "\n", with: " ")
+                .replacingOccurrences(of: "\t", with: " ")
+            var line = r.role.isEmpty ? "\(r.id)\t\"\(name)\"" : "\(r.id)\t\(r.role)\t\"\(name)\""
+            if !brief {
+                line += "\t@\(Int(r.rect.origin.x.rounded())),\(Int(r.rect.origin.y.rounded()))"
+                    + " \(Int(r.rect.width.rounded()))x\(Int(r.rect.height.rounded()))"
+            }
+            return line
+        }.joined(separator: "\n")
+    }
+
+    /// Table-first SoM's image decision: pixels are needed only when the mark
+    /// table can't stand alone — few marks (canvas app whose semantics are off)
+    /// or mostly-unnamed marks (icon-only toolbars).
+    static func somNeedsImage(named: Int, total: Int) -> Bool {
+        total < 3 || Double(named) < 0.8 * Double(total)
+    }
+
+    /// Parse a `--region` string — "x,y,WxH" (or "x,y,w,h") in GLOBAL screen
+    /// points — into a rect. nil = malformed.
+    static func parseRegion(_ s: String) -> CGRect? {
+        let nums = s.lowercased()
+            .replacingOccurrences(of: "x", with: ",")
+            .split(separator: ",")
+            .compactMap { Double($0.trimmingCharacters(in: .whitespaces)) }
+        guard nums.count == 4, nums[2] > 0, nums[3] > 0 else { return nil }
+        return CGRect(x: nums[0], y: nums[1], width: nums[2], height: nums[3])
+    }
+
+    /// Resolve the window a perception check should observe: window_id /
+    /// pid (auto-raising an off-Space window) / window name, falling back to
+    /// the action's --target app name. Shared by act-until and run plans.
+    @MainActor
+    private func resolveObservedWindow(_ b: [String: Any]) async -> UInt32? {
+        if let wid = (b["window_id"] as? NSNumber)?.uint32Value { return wid }
+        if let pid = (b["pid"] as? NSNumber).map({ pid_t($0.intValue) }) {
+            var win = AgentCapture.listWindows().filter({ $0.pid == pid }).max(by: { $0.area < $1.area })
+            if win == nil {
+                _ = await AgentAX.ensureOnScreen(pid: pid)
+                win = AgentCapture.listWindows().filter({ $0.pid == pid }).max(by: { $0.area < $1.area })
+            }
+            if let win { return win.id }
+        }
+        if let name = (b["window"] as? String) ?? (b["target"] as? String) ?? (b["app"] as? String) {
+            if let win = AgentCapture.bestMatch(named: name) { return win.id }
+            // Name matched no on-screen window — the app may be on another
+            // Space (seen live: `run --target MarkEdit` failed while MarkEdit
+            // sat off-Space). Resolve to a pid and raise, like the pid path.
+            if let pid = try? AgentAX.resolvePID(app: name, pid: nil) {
+                _ = await AgentAX.ensureOnScreen(pid: pid)
+                if let win = AgentCapture.listWindows().filter({ $0.pid == pid }).max(by: { $0.area < $1.area }) {
+                    return win.id
+                }
+            }
+        }
+        return nil
+    }
+
+    /// One actuator step, shared by the plain one-shot routes and the
+    /// act-until edge loop (which repeats it verbatim).
+    @MainActor
+    private func performAction(_ action: String, _ b: [String: Any]) -> [String: Any] {
+        switch action {
+        case "click":
+            guard let p = point(b) else { return ["error": "expected {x,y}"] }
+            let clicks = (b["clicks"] as? NSNumber)?.intValue ?? 1
+            let ok = AgentInput.click(at: p, button: button(b), modifiers: mods(b),
+                                      clicks: clicks, pacing: pacing(b),
+                                      target: target(b), targetPID: targetPID(b))
+            return ok ? ["ok": true] : inputFailure("click", b)
+        case "drag":
+            guard let fx = (b["from_x"] as? NSNumber)?.doubleValue,
+                  let fy = (b["from_y"] as? NSNumber)?.doubleValue,
+                  let tx = (b["to_x"] as? NSNumber)?.doubleValue,
+                  let ty = (b["to_y"] as? NSNumber)?.doubleValue
+            else { return ["error": "expected {from_x,from_y,to_x,to_y}"] }
+            let ok = AgentInput.drag(from: CGPoint(x: fx, y: fy), to: CGPoint(x: tx, y: ty),
+                                     button: button(b), modifiers: mods(b),
+                                     pacing: pacing(b), target: target(b),
+                                     targetPID: targetPID(b))
+            return ok ? ["ok": true] : inputFailure("drag", b)
+        case "key":
+            guard let key = b["key"] as? String else { return ["error": "expected {key}"] }
+            // Check the key name first so an unknown key reports its own precise
+            // cause instead of being lumped under the activation failure path.
+            guard AgentInput.isKnownKey(key) else {
+                return ["error": "key failed: \"\(key)\" is not a known key name. Use a single "
+                    + "character (a–z, 0–9, punctuation like / or -), a function key (f1–f12), or a "
+                    + "named key (return, tab, space, delete, escape, left/right/up/down, home, end, "
+                    + "pgup, pgdown). For arbitrary text use `type`, not `key`."]
+            }
+            let ok = AgentInput.pressKey(key, modifiers: mods(b),
+                                         target: target(b), targetPID: targetPID(b))
+            return ok ? ["ok": true, "key": key] : inputFailure("key", b)
+        case "scroll":
+            let dx = (b["dx"] as? NSNumber)?.intValue ?? 0
+            let dy = (b["dy"] as? NSNumber)?.intValue ?? 0
+            let ok = AgentInput.scroll(dx: dx, dy: dy, at: point(b),
+                                       pacing: pacing(b), target: target(b),
+                                       targetPID: targetPID(b))
+            return ok ? ["ok": true] : inputFailure("scroll", b)
+        default:
+            return ["error": "unknown action \"\(action)\""]
+        }
+    }
 
     /// Optional pacing from the JSON body: `duration` (seconds) wins, else a
     /// truthy `human` flag uses a default duration; absent → instant.
@@ -1263,7 +2290,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         AgentInput.MouseButton(rawValue: (b["button"] as? String) ?? "left") ?? .left
     }
     private func mods(_ b: [String: Any]) -> [String] {
-        (b["modifiers"] as? [Any])?.compactMap { $0 as? String } ?? []
+        if let arr = b["modifiers"] as? [Any] { return arr.compactMap { $0 as? String } }
+        // Hand-written plan JSON often says "modifiers":"cmd" (string, not
+        // array). Accept it: silently dropping the modifier would turn ⌘S
+        // into a literal "s" typed into the document (observed live in a P8
+        // run) — the worst failure class, wrong action with no error.
+        if let s = b["modifiers"] as? String {
+            return s.split(separator: ",").map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty }
+        }
+        return []
     }
     private func target(_ b: [String: Any]) -> String? { b["target"] as? String }
     /// PID target (wins over `--target` name): pins input to one exact process,

@@ -24,6 +24,7 @@ enum AgentCapture {
         case windowNotFound(String)
         case windowOffScreen(String, Int)
         case captureFailed
+        case regionOutsideWindow
         var errorDescription: String? {
             switch self {
             case .permissionDenied: return "Screen Recording permission not granted."
@@ -34,6 +35,9 @@ enum AgentCapture {
                     + "`floaty raise --app \"\(n)\"` to surface it (or bring it forward manually), then retry "
                     + "— off-screen windows can't be captured. Don't just re-run this command."
             case .captureFailed: return "ScreenCaptureKit capture failed."
+            case .regionOutsideWindow:
+                return "--region does not overlap the target window (region is GLOBAL screen "
+                    + "points: x,y,WxH — check the window bounds via `floaty list-windows`)."
             }
         }
     }
@@ -51,18 +55,29 @@ enum AgentCapture {
         let id: String
         let windowID: CGWindowID
         let owner: String          // owning app — raised before the click
-        let origin: CGPoint        // window top-left, global screen POINTS
+        let origin: CGPoint        // captured region's top-left, global screen POINTS
         let size: CGSize           // captured region, POINTS
         let scale: CGFloat         // backing scale at capture time
         let imageWidth: Int        // PNG dimensions, PIXELS
         let imageHeight: Int
         let capturedAt: Date
+        /// The WINDOW's bounds at capture time — the staleness reference. For a
+        /// full-window capture this equals (origin, size); for a `--region` crop
+        /// the region stays valid as long as the window itself hasn't moved.
+        var windowBounds: CGRect = .zero
     }
 
     struct CaptureResult {
         let imagePath: String
         let textPath: String?
-        let frame: CaptureFrame
+        /// nil only when `unchanged` — no new frame was minted; the previous
+        /// capture's frame is still valid (the screen didn't change).
+        let frame: CaptureFrame?
+        /// Perceptual fingerprint of the captured pixels (see AgentPerception).
+        var screenHash: String = ""
+        /// --if-changed: the target looks identical to the previous capture,
+        /// so nothing was saved and no image path is returned.
+        var unchanged: Bool = false
     }
 
     enum FrameError: LocalizedError {
@@ -108,14 +123,17 @@ enum AgentCapture {
         guard f.size.width > 0, f.size.height > 0 else { throw FrameError.windowMoved }
 
         // Staleness guard: re-read the window's current bounds; bail if it drifted.
+        // Compare against the WINDOW bounds recorded at capture (a --region crop's
+        // origin/size describe the crop, not the window).
         guard let current = listWindows().first(where: { $0.id == f.windowID }) else {
             throw FrameError.windowMoved
         }
+        let wb = f.windowBounds == .zero ? CGRect(origin: f.origin, size: f.size) : f.windowBounds
         let tol: CGFloat = 4
-        if abs(current.bounds.origin.x - f.origin.x) > tol
-            || abs(current.bounds.origin.y - f.origin.y) > tol
-            || abs(current.bounds.size.width - f.size.width) > tol
-            || abs(current.bounds.size.height - f.size.height) > tol {
+        if abs(current.bounds.origin.x - wb.origin.x) > tol
+            || abs(current.bounds.origin.y - wb.origin.y) > tol
+            || abs(current.bounds.size.width - wb.size.width) > tol
+            || abs(current.bounds.size.height - wb.size.height) > tol {
             throw FrameError.windowMoved
         }
 
@@ -155,6 +173,7 @@ enum AgentCapture {
         // CDP staleness
         var port: UInt16 = 9222
         var match: String? = nil
+        var viaExtension: Bool = false
         var url: String = ""
         var screenX: Double = 0
         var screenY: Double = 0
@@ -273,9 +292,17 @@ enum AgentCapture {
     /// file path when text was found — best-effort: an image-heavy window (a
     /// video, a canvas) legitimately has no text, which is NOT a failure; in
     /// that case `textPath` is nil and the screenshot still comes back.
+    /// `region` (global screen points) crops the capture to a slice of the
+    /// window — verifying "did the dialog open" needs a 400×300 crop, not a
+    /// full Retina frame. `fullRes` skips the model-friendly downscale (see
+    /// `downscale`) when the agent genuinely needs pixel detail. `ifChanged`
+    /// compares the perceptual hash against the previous capture of the same
+    /// target and, when the pixels look identical, returns `unchanged: true`
+    /// with no saved image — "nothing changed" for one line, zero image tokens.
     @MainActor
     static func captureWindow(named name: String?, windowID: CGWindowID? = nil,
-                              ocr: Bool = false) async throws -> CaptureResult
+                              ocr: Bool = false, region: CGRect? = nil,
+                              fullRes: Bool = false, ifChanged: Bool = false) async throws -> CaptureResult
     {
         // Reuse ContextSnap's permission gate (Screen Recording). Note the
         // purpose string so the prompt is honest about why.
@@ -303,37 +330,127 @@ enum AgentCapture {
         }
 
         let shot = try await rawCapture(windowID: targetID, fallbackName: name)
+        let windowBounds = CGRect(origin: shot.origin, size: shot.size)
+
+        // Optional region crop (global screen points → image pixels). The crop
+        // becomes the frame's mapping region, so click-in-frame coordinates read
+        // off the cropped PNG still invert to the right screen point.
+        var image = shot.image
+        var origin = shot.origin
+        var size = shot.size
+        if let region {
+            let clipped = region.intersection(windowBounds)
+            guard clipped.width >= 8, clipped.height >= 8 else {
+                throw CaptureError.regionOutsideWindow
+            }
+            let pppX = Double(image.width) / Double(max(size.width, 1))
+            let pppY = Double(image.height) / Double(max(size.height, 1))
+            let px = CGRect(x: (clipped.minX - origin.x) * pppX,
+                            y: (clipped.minY - origin.y) * pppY,
+                            width: clipped.width * pppX, height: clipped.height * pppY)
+            guard let cropped = image.cropping(to: px) else { throw CaptureError.captureFailed }
+            image = cropped
+            origin = clipped.origin
+            size = clipped.size
+        }
+
+        // Perceptual fingerprint of the (cropped) pixels — always computed and
+        // remembered, so both --if-changed and a later --wait-change have a
+        // baseline. Key includes the region: a crop and the full window are
+        // different observations.
+        let hashKey = "cap:\(targetID):\(region.map { "\(Int($0.minX)),\(Int($0.minY)),\(Int($0.width))x\(Int($0.height))" } ?? "full")"
+        let hash = AgentPerception.screenHash(image)
+        let prevHash = AgentPerception.rememberHash(key: hashKey, hash: hash)
+        if ifChanged, let prevHash, AgentPerception.isUnchanged(hash, prevHash) {
+            return CaptureResult(imagePath: "", textPath: nil, frame: nil,
+                                 screenHash: hash, unchanged: true)
+        }
+
+        // OCR is additive and best-effort. Run it on the FULL-RES (cropped)
+        // image — small text survives; the downscale below is only for the
+        // model-facing PNG. recognizeText yields nil when the window has no
+        // readable text — return the screenshot anyway rather than
+        // masquerading "no text" as a capture failure.
+        var textPath: String? = nil
+        if ocr {
+            let ocrImage = image
+            let text: String? = await withCheckedContinuation { cont in
+                ContextSnap.recognizeText(in: ocrImage) { cont.resume(returning: $0) }
+            }
+            if let text, let textURL = ContextSnap.saveText(text) { textPath = textURL.path }
+        }
+
+        // Downscale to a model-friendly resolution unless full-res was asked
+        // for. Safe for click-in-frame: the frame records the FINAL pixel
+        // dimensions, and resolveInFrame uses the real pixel:point ratio.
+        if !fullRes { image = downscale(image) }
 
         // Always save the screenshot (history + pruning come for free). A nil
         // here is a genuine save failure, so it's the one case that throws.
-        guard let imageURL = ContextSnap.saveImage(shot.image) else { throw CaptureError.captureFailed }
+        guard let imageURL = ContextSnap.saveImage(image) else { throw CaptureError.captureFailed }
 
-        // Build + remember the frame from the EXACT region we captured
-        // (scWindow.frame is the window's global-point rect) and the image's
-        // real pixel dimensions, so click-in-frame can invert it precisely.
+        // Build + remember the frame from the EXACT region we captured and the
+        // SAVED image's pixel dimensions, so click-in-frame inverts precisely.
         let frame = CaptureFrame(
             id: nextFrameID(),
             windowID: targetID,
             owner: shot.owner,
-            origin: shot.origin,
-            size: shot.size,
+            origin: origin,
+            size: size,
             scale: shot.scale,
-            imageWidth: shot.image.width,
-            imageHeight: shot.image.height,
-            capturedAt: Date())
+            imageWidth: image.width,
+            imageHeight: image.height,
+            capturedAt: Date(),
+            windowBounds: windowBounds)
         remember(frame)
+        return CaptureResult(imagePath: imageURL.path, textPath: textPath, frame: frame,
+                             screenHash: hash)
+    }
 
-        // OCR is additive and best-effort. recognizeText yields nil when the
-        // window has no readable text — return the screenshot anyway rather
-        // than masquerading "no text" as a capture failure.
-        var textPath: String? = nil
-        if ocr {
-            let text: String? = await withCheckedContinuation { cont in
-                ContextSnap.recognizeText(in: shot.image) { cont.resume(returning: $0) }
+    /// Hash-only observation of a window (optionally a --region slice): SCK
+    /// capture + crop + perceptual hash, nothing saved, no frame minted. The
+    /// cheap poll step behind `capture --wait-change`.
+    @MainActor
+    static func hashWindow(windowID: CGWindowID, region: CGRect?) async throws -> String {
+        let shot = try await rawCapture(windowID: windowID, fallbackName: nil)
+        var image = shot.image
+        if let region {
+            let windowBounds = CGRect(origin: shot.origin, size: shot.size)
+            let clipped = region.intersection(windowBounds)
+            guard clipped.width >= 8, clipped.height >= 8 else {
+                throw CaptureError.regionOutsideWindow
             }
-            if let text, let textURL = ContextSnap.saveText(text) { textPath = textURL.path }
+            let pppX = Double(image.width) / Double(max(shot.size.width, 1))
+            let pppY = Double(image.height) / Double(max(shot.size.height, 1))
+            let px = CGRect(x: (clipped.minX - shot.origin.x) * pppX,
+                            y: (clipped.minY - shot.origin.y) * pppY,
+                            width: clipped.width * pppX, height: clipped.height * pppY)
+            guard let cropped = image.cropping(to: px) else { throw CaptureError.captureFailed }
+            image = cropped
         }
-        return CaptureResult(imagePath: imageURL.path, textPath: textPath, frame: frame)
+        return AgentPerception.screenHash(image)
+    }
+
+    /// Downscale a capture to a model-friendly long edge. A Retina window shot
+    /// is ~2× the pixels a vision model needs to pick a mark or read a layout —
+    /// at full size it costs ~3–4× the image tokens and several MB of transfer.
+    /// 1440px keeps UI text legible while roughly quartering the payload;
+    /// anything already smaller passes through untouched.
+    static func downscale(_ image: CGImage, maxLongEdge: Int = 1440) -> CGImage {
+        let w = image.width, h = image.height
+        let long = max(w, h)
+        guard long > maxLongEdge else { return image }
+        let s = Double(maxLongEdge) / Double(long)
+        let nw = max(1, Int((Double(w) * s).rounded()))
+        let nh = max(1, Int((Double(h) * s).rounded()))
+        guard let ctx = CGContext(
+            data: nil, width: nw, height: nh, bitsPerComponent: 8, bytesPerRow: 0,
+            space: image.colorSpace ?? CGColorSpaceCreateDeviceRGB(),
+            bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)
+        else { return image }
+        ctx.interpolationQuality = .high
+        ctx.draw(image, in: CGRect(x: 0, y: 0, width: nw, height: nh))
+        return ctx.makeImage() ?? image
     }
 
     /// SCK capture of one window → its CGImage plus the geometry needed to map
@@ -1102,8 +1219,10 @@ enum AgentElectron {
                     + "bundle with a debug port), or pass its exact name. See `floaty list-windows`."
             case .isBrowser(let s):
                 return "\"\(s)\" is a web browser — don't relaunch it for a debug port (personal profile / "
-                    + "singleton lock makes it destructive). Drive it with osascript + `read-text`/`query-ax` "
-                    + "instead (see ref/cdp.md). enable-cdp is for Electron apps like Slack/VS Code/Discord."
+                    + "singleton lock makes it destructive). Use `--via-extension` on tabs/eval/query-dom/"
+                    + "navigate/som (the FloatyTerm CDP extension drives the LIVE browser, no port), or "
+                    + "osascript + `read-text`/`query-ax` (see ref/cdp.md). enable-cdp is for Electron apps "
+                    + "like Slack/VS Code/Discord."
             case .launchFailed(let s):
                 return "Couldn't relaunch \"\(s)\" with a debug port."
             }

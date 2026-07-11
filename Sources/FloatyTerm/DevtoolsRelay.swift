@@ -37,7 +37,11 @@ final class DevtoolsRelay {
     var onAgentMove:     (([String: Any]) -> [String: Any])?
     var onAgentDrag:     (([String: Any]) -> [String: Any])?
     var onAgentScroll:   (([String: Any]) -> [String: Any])?
-    var onAgentType:     (([String: Any]) -> [String: Any])?
+    /// async: human-paced typing runs as a pausable replay session off the
+    /// main thread (so the overlay controls stay live) and resolves when the
+    /// text completes or the user stops it. The relay queue still blocks for
+    /// the duration — agent commands stay serial, exactly as before.
+    var onAgentType:     (([String: Any]) async -> [String: Any])?
     var onAgentKey:      (([String: Any]) -> [String: Any])?
     var onAgentCapture:  (([String: Any]) async -> [String: Any])?
     var onAgentQueryDOM: (([String: Any]) async -> [String: Any])?
@@ -58,6 +62,25 @@ final class DevtoolsRelay {
     var onAgentSetText:   (([String: Any]) async -> [String: Any])?
     var onAgentEnableCDP: (([String: Any]) async -> [String: Any])?
     var onAgentHost:      (([String: Any]) -> [String: Any])?
+    var onAgentSessions:  (([String: Any]) async -> [String: Any])?
+    /// Completion-style, not sync/async-return: `peek --wait` long-polls
+    /// until the target session's next command completes, and the relay's
+    /// connection queue is SERIAL — blocking it semaphore-style (like
+    /// agentSync/agentAsync do) would stall every other agent command for
+    /// the duration. The handler owns the reply and must call it exactly
+    /// once.
+    var onAgentPeek:      (([String: Any], @escaping ([String: Any]) -> Void) -> Void)?
+    /// `capture --wait-change`: long-polls until the target window's pixels
+    /// change, so it rides the same deferred bridge as `peek --wait` (a 60s
+    /// wait must not stall the relay's other agent commands).
+    var onAgentCaptureWait: (([String: Any], @escaping ([String: Any]) -> Void) -> Void)?
+    /// click/drag/key/scroll --until-change/--settle: the act-to-an-edge loop.
+    /// Long-running (repeat + hash polls, up to 120s) → deferred bridge. The
+    /// body carries "_action" = the actuator route name.
+    var onAgentActUntil: (([String: Any], @escaping ([String: Any]) -> Void) -> Void)?
+    /// run: execute a pre-compiled linear plan (steps of do+expect) host-side.
+    /// Long-running by nature → deferred bridge.
+    var onAgentRun: (([String: Any], @escaping ([String: Any]) -> Void) -> Void)?
 
     private var listener: NWListener?
     private let queue = DispatchQueue(label: "floatyterm.devtools-relay")
@@ -75,7 +98,16 @@ final class DevtoolsRelay {
             let l = try NWListener(using: params)
             l.newConnectionHandler = { [weak self] conn in
                 guard let self else { conn.cancel(); return }
-                conn.start(queue: self.queue)
+                // Each connection gets its OWN serial queue, not one shared relay
+                // queue. A blocking route (agentSync/agentAsync hold the thread on
+                // sem.wait) must not stall other connections — critically the CDP
+                // extension bridge, whose socket lives on its own connection: a
+                // via-extension command blocks its request thread waiting for the
+                // extension's reply, which arrives on the bridge connection. On a
+                // shared serial queue that reply could never be delivered → deadlock.
+                // Input stays serialized because every handler hops to @MainActor.
+                let connQueue = DispatchQueue(label: "floatyterm.devtools-relay.conn")
+                conn.start(queue: connQueue)
                 self.receive(conn, buffer: Data())
             }
             l.start(queue: queue)
@@ -94,7 +126,11 @@ final class DevtoolsRelay {
             var buf = buffer
             if let data { buf.append(data) }
             if error != nil { conn.cancel(); return }
-            if let response = self.handle(request: buf) {
+            if let response = self.handle(request: buf, conn: conn) {
+                // The deferred marker means a long-poll route (peek --wait)
+                // took ownership of the connection and will send its own
+                // reply later — nothing more to do here.
+                if response == Self.deferredMarker { return }
                 conn.send(content: response,
                           completion: .contentProcessed { _ in conn.cancel() })
             } else if complete || buf.count > 2 * 1024 * 1024 {
@@ -105,8 +141,13 @@ final class DevtoolsRelay {
         }
     }
 
+    /// Sentinel return from `handle`: the route replies on the connection
+    /// itself, later (long-poll). Distinct from nil, which means "request not
+    /// fully buffered yet, keep receiving".
+    private static let deferredMarker = Data("\u{0}floaty-deferred\u{0}".utf8)
+
     /// Full response once the request is completely buffered; nil = need more.
-    private func handle(request buf: Data) -> Data? {
+    private func handle(request buf: Data, conn: NWConnection) -> Data? {
         guard let headerEnd = buf.range(of: Data("\r\n\r\n".utf8)) else { return nil }
         let head = String(decoding: buf[..<headerEnd.lowerBound], as: UTF8.self)
         let lines = head.components(separatedBy: "\r\n")
@@ -123,6 +164,38 @@ final class DevtoolsRelay {
         // query params, and matching the full URL string would 404 exactly
         // the requests that matter.
         let path = parts[1].components(separatedBy: "?")[0]
+
+        // WebSocket upgrade for the CDP extension bridge. The extension's MV3
+        // service worker connects here; we hand the raw connection to CDPBridge,
+        // which completes the RFC6455 handshake and speaks CDP frames over it.
+        // Returning deferredMarker tells the receive loop the route owns the
+        // connection now (no request/response reply to send).
+        if parts[0] == "GET", path == "/cdp-bridge",
+           lines.contains(where: { $0.lowercased().hasPrefix("upgrade:")
+                                   && $0.lowercased().contains("websocket") }) {
+            guard let keyLine = lines.first(where: { $0.lowercased().hasPrefix("sec-websocket-key:") }) else {
+                return response(400, "text/plain", "missing Sec-WebSocket-Key")
+            }
+            // Browsers always send an Origin on WebSocket handshakes, so this
+            // shuts out a malicious WEB PAGE posing as the extension (it could
+            // feed the agent fabricated CDP results). An absent Origin means a
+            // non-browser local client (tests, tools) — allowed, same loopback
+            // trust as /agent/*. chrome-extension:// covers Chrome/Edge/Brave.
+            if let originLine = lines.first(where: { $0.lowercased().hasPrefix("origin:") }) {
+                let origin = originLine.dropFirst("origin:".count)
+                    .trimmingCharacters(in: .whitespaces).lowercased()
+                guard origin.hasPrefix("chrome-extension://") else {
+                    return response(403, "text/plain", "origin not allowed")
+                }
+            }
+            let key = keyLine.dropFirst("sec-websocket-key:".count).trimmingCharacters(in: .whitespaces)
+            // A GET upgrade has no Content-Length; hand over EVERYTHING already
+            // buffered past the headers — frames the client raced in must not be
+            // dropped on the floor.
+            CDPBridge.shared.adopt(conn, secWebSocketKey: key, leftover: Data(body))
+            return Self.deferredMarker
+        }
+
         switch (parts[0], path) {
         case ("OPTIONS", _):
             return response(204, nil, "")
@@ -133,13 +206,22 @@ final class DevtoolsRelay {
             return response(200, "text/plain", "ok")
         case ("POST", "/diff"):
             return handleDiff(Data(body.prefix(contentLength)))
-        case ("POST", "/agent/click"):     return agentSync("click", onAgentClick,    Data(body.prefix(contentLength)))
+        case ("POST", "/agent/click"):     return actOrDefer("click", onAgentClick,  Data(body.prefix(contentLength)), conn: conn)
         case ("POST", "/agent/move"):      return agentSync("move", onAgentMove,     Data(body.prefix(contentLength)))
-        case ("POST", "/agent/drag"):      return agentSync("drag", onAgentDrag,     Data(body.prefix(contentLength)))
-        case ("POST", "/agent/scroll"):    return agentSync("scroll", onAgentScroll,   Data(body.prefix(contentLength)))
-        case ("POST", "/agent/type"):      return agentSync("type", onAgentType,     Data(body.prefix(contentLength)))
-        case ("POST", "/agent/key"):       return agentSync("key", onAgentKey,      Data(body.prefix(contentLength)))
-        case ("POST", "/agent/capture"):   return agentAsync("capture", onAgentCapture, Data(body.prefix(contentLength)))
+        case ("POST", "/agent/drag"):      return actOrDefer("drag", onAgentDrag,    Data(body.prefix(contentLength)), conn: conn)
+        case ("POST", "/agent/scroll"):    return actOrDefer("scroll", onAgentScroll, Data(body.prefix(contentLength)), conn: conn)
+        case ("POST", "/agent/type"):      return agentAsync("type", onAgentType,    Data(body.prefix(contentLength)))
+        case ("POST", "/agent/key"):       return actOrDefer("key", onAgentKey,      Data(body.prefix(contentLength)), conn: conn)
+        case ("POST", "/agent/capture"):
+            let captureBody = Data(body.prefix(contentLength))
+            // --wait-change long-polls (up to minutes) → deferred bridge, like
+            // peek --wait. Plain captures stay on the blocking fast path.
+            if let obj = parseBody(captureBody),
+               (obj["wait_change"] as? NSNumber)?.boolValue == true {
+                agentDeferred("capture", onAgentCaptureWait, captureBody, conn: conn)
+                return Self.deferredMarker
+            }
+            return agentAsync("capture", onAgentCapture, captureBody)
         case ("POST", "/agent/query-dom"): return agentAsync("query-dom", onAgentQueryDOM, Data(body.prefix(contentLength)))
         case ("POST", "/agent/eval"):      return agentAsync("eval", onAgentEval,     Data(body.prefix(contentLength)))
         case ("POST", "/agent/navigate"):  return agentAsync("navigate", onAgentNavigate, Data(body.prefix(contentLength)))
@@ -158,6 +240,13 @@ final class DevtoolsRelay {
         case ("POST", "/agent/set-text"):   return agentAsync("set-text", onAgentSetText,   Data(body.prefix(contentLength)))
         case ("POST", "/agent/enable-cdp"): return agentAsync("enable-cdp", onAgentEnableCDP, Data(body.prefix(contentLength)))
         case ("POST", "/agent/host"):       return agentSync("host", onAgentHost,       Data(body.prefix(contentLength)))
+        case ("POST", "/agent/sessions"):   return agentAsync("sessions", onAgentSessions, Data(body.prefix(contentLength)))
+        case ("POST", "/agent/run"):
+            agentDeferred("run", onAgentRun, Data(body.prefix(contentLength)), conn: conn)
+            return Self.deferredMarker
+        case ("POST", "/agent/peek"):
+            agentDeferred("peek", onAgentPeek, Data(body.prefix(contentLength)), conn: conn)
+            return Self.deferredMarker
         default:
             return response(404, "text/plain", "not found")
         }
@@ -165,7 +254,7 @@ final class DevtoolsRelay {
 
     private func response(_ status: Int, _ type: String?, _ body: String) -> Data {
         let reason = [200: "OK", 204: "No Content", 400: "Bad Request",
-                      404: "Not Found"][status] ?? "OK"
+                      403: "Forbidden", 404: "Not Found"][status] ?? "OK"
         var head = "HTTP/1.1 \(status) \(reason)\r\n"
         head += "Access-Control-Allow-Origin: *\r\n"
         head += "Access-Control-Allow-Headers: *\r\n"
@@ -199,6 +288,24 @@ final class DevtoolsRelay {
         try? JSONSerialization.jsonObject(with: body) as? [String: Any]
     }
 
+    /// Actuator routes that grow an edge loop: a plain call stays on the
+    /// blocking fast path; --until-change/--settle (repeat + hash polls, up
+    /// to 120s) reroutes to the deferred act-until handler with the route
+    /// name tagged into the body as "_action".
+    private func actOrDefer(_ route: String, _ sync: (([String: Any]) -> [String: Any])?,
+                            _ body: Data, conn: NWConnection) -> Data {
+        if let obj = parseBody(body),
+           (obj["until_change"] as? NSNumber)?.boolValue == true
+            || (obj["settle"] as? NSNumber)?.boolValue == true {
+            var tagged = obj
+            tagged["_action"] = route
+            let taggedBody = (try? JSONSerialization.data(withJSONObject: tagged)) ?? body
+            agentDeferred(route, onAgentActUntil, taggedBody, conn: conn)
+            return Self.deferredMarker
+        }
+        return agentSync(route, sync, body)
+    }
+
     private func agentSync(_ route: String, _ handler: (([String: Any]) -> [String: Any])?, _ body: Data) -> Data {
         guard let obj = parseBody(body) else { return jsonResponse(["error": "invalid JSON body"], status: 400) }
         var result: [String: Any] = ["error": "no handler"]
@@ -221,6 +328,45 @@ final class DevtoolsRelay {
         sem.wait()
         logAgentCall(route: route, args: obj, ms: Int(Date().timeIntervalSince(start) * 1000), result: result)
         return jsonResponse(result, status: result["error"] == nil ? 200 : 400)
+    }
+
+    /// The deferred bridge: parses the body, hops to the main actor, and
+    /// hands the handler a one-shot reply callback that sends the HTTP
+    /// response whenever it's ready — seconds or a minute later for a
+    /// `peek --wait` long-poll — without ever blocking the relay queue.
+    private func agentDeferred(
+        _ route: String,
+        _ handler: (([String: Any], @escaping ([String: Any]) -> Void) -> Void)?,
+        _ body: Data, conn: NWConnection
+    ) {
+        func send(_ result: [String: Any]) {
+            let data = jsonResponse(result, status: result["error"] == nil ? 200 : 400)
+            conn.send(content: data, completion: .contentProcessed { _ in conn.cancel() })
+        }
+        guard let obj = parseBody(body) else {
+            send(["error": "invalid JSON body"]); return
+        }
+        guard let handler else { send(["error": "no handler"]); return }
+        let start = Date()
+        markAgentCallStart()
+        // One-shot guard: the handler contract is a single reply, but a
+        // misbehaving double-call must not double-send on the connection or
+        // unbalance the in-flight counter.
+        let replied = NSLock()
+        var done = false
+        DispatchQueue.main.async {
+            handler(obj) { [weak self] result in
+                replied.lock()
+                let first = !done; done = true
+                replied.unlock()
+                guard first, let self else { return }
+                self.markAgentCallEnd()
+                self.logAgentCall(route: route, args: obj,
+                                  ms: Int(Date().timeIntervalSince(start) * 1000),
+                                  result: result)
+                send(result)
+            }
+        }
     }
 
     // MARK: - Agent activity (so auto-surface doesn't fight an active drive)
@@ -277,7 +423,27 @@ final class DevtoolsRelay {
         for k in ["count", "frame_id", "source", "pressed", "truncated", "url",
                   "screen_x", "screen_y", "on_screen", "ghost", "released",
                   "landed", "settable", "editable", "has_focus", "role",
-                  "port", "cdp", "relaunched"] {
+                  "port", "cdp", "relaunched",
+                  // Honest-signal fields for the loop-attribution diff: what a
+                  // `type` actually landed (and whether the user stopped it),
+                  // how much text a read pulled, how many windows ghosted.
+                  "typed", "stopped", "chars", "ghosted",
+                  // Perception-economy signals: whether som paid for an image,
+                  // what a --diff returned, whether --if-changed/--wait-change
+                  // short-circuited — the fields that show a loop is (or isn't)
+                  // using the cheap path.
+                  "image", "diff", "added", "removed", "unchanged",
+                  "changed", "waited_ms", "screen_hash", "note",
+                  // Act-to-an-edge: how many host-side repeats one call
+                  // absorbed (each was a model round trip before), and whether
+                  // the post-edge animation had settled at capture time.
+                  "iterations", "settled",
+                  // run plans: the endgame the reply carried, plus per-step
+                  // ledger fields (route "run.step") — the forensics that make
+                  // a fishy success diggable without paying model context.
+                  "completed", "failed_step", "steps_done", "steps",
+                  "retries_total", "reason", "satisfied", "attempt",
+                  "verified", "unverified_steps"] {
             if let v = result[k] { outcome[k] = (v as? String).map { String($0.prefix(120)) } ?? v }
         }
         if !outcome.isEmpty { line["result"] = outcome }
@@ -287,6 +453,13 @@ final class DevtoolsRelay {
         DevtoolsLog.shared.append(s + "\n", to: url)
     }
 
+    /// Per-step ledger line for `run` plans: every step's action + checkpoint
+    /// verdict lands in calls.ndjson as route "run.step" (host-side, free),
+    /// while the run's HTTP reply carries only the endgame.
+    func logRunStep(args: [String: Any], ms: Int, result: [String: Any]) {
+        logAgentCall(route: "run.step", args: args, ms: ms, result: result)
+    }
+
     /// Compact, privacy-aware arg summary: small scalars verbatim, long text
     /// fields as length + a short head (so a 4 KB paste or eval isn't logged raw).
     static func summarizeAgentArgs(_ b: [String: Any]) -> [String: Any] {
@@ -294,13 +467,23 @@ final class DevtoolsRelay {
         let scalars = ["x", "y", "id", "pid", "port", "app", "target", "role", "title",
                        "match", "url", "key", "button", "clicks", "max", "frame", "frame_id",
                        "window", "window_id", "dx", "dy", "duration", "human", "ocr", "press",
-                       "filter", "from_x", "from_y", "to_x", "to_y", "label", "ghost"]
+                       "filter", "from_x", "from_y", "to_x", "to_y", "label", "ghost",
+                       "sections", "no_controls",
+                       // Perception-economy flags (Lever 1/2): which mode the
+                       // agent ASKED for — diffing trace vs golden depends on it.
+                       "region", "full_res", "image", "json", "brief", "diff",
+                       "if_changed", "wait_change", "timeout", "via_extension",
+                       // Act-to-an-edge flags on click/drag/key/scroll.
+                       "until_change", "settle", "watch", "every",
+                       // run plans: step index / action verb / attempt number
+                       // on run.step ledger lines.
+                       "step", "verb", "attempt", "retry"]
         for k in scalars where b[k] != nil {
             if let s = b[k] as? String { o[k] = String(s.prefix(120)) } else { o[k] = b[k] }
         }
         if let mods = b["modifiers"] as? [Any] { o["modifiers"] = mods.compactMap { $0 as? String } }
         if let sel = b["selector"] as? String { o["selector"] = String(sel.prefix(120)) }
-        for k in ["text", "expression", "js"] {
+        for k in ["text", "expression", "js", "steps"] {
             if let s = b[k] as? String { o["\(k)_len"] = s.count; o["\(k)_head"] = String(s.prefix(48)) }
         }
         return o

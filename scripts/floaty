@@ -26,10 +26,69 @@
 #   floaty scroll --dx 0 --dy 400 [--x 700 --y 400] [--human|--duration N] [--target App]
 #                 (pass --x/--y to put the cursor over the area to scroll — wheel
 #                  events go to whatever is UNDER the cursor, not the focused view)
-#   floaty type   --text "hello" [--human|--duration N] [--target Notes | --pid 8123]
+#   floaty type   --text "hello" [--human|--duration N] [--target Notes | --pid 8123] [--no-controls]
+#                 (--human replays your recorded typing profile as a pausable session, with
+#                  play/pause/stop/speed controls overlaid on the terminal window; the reply
+#                  reports chars actually typed, plus "stopped":true if you hit Stop.
+#                  --no-controls skips the overlay)
 #   floaty key    --key return [--modifiers cmd,shift] [--target Cursor | --pid 8123]
 #                 (--pid pins input to ONE exact process — disambiguates two same-named
 #                  apps, e.g. two Chromes, where --target "Google Chrome" is a coin flip)
+#
+#   ACT TO AN EDGE — click/drag/key/scroll all take, on top of their own flags:
+#     --until-change [--watch "x,y,WxH"] [--every 0.6] [--max 10] [--timeout 20]
+#                 # HOST repeats the exact action until the watched pixels differ from the
+#                 # pre-loop baseline, then returns ONE fresh capture (frame_id + PNG) —
+#                 # replaces the act → capture → act → capture loop (one call, not N round
+#                 # trips). Pick a --watch rect that ONLY changes when the goal state
+#                 # arrives (a ledge, a status area, where the dialog will appear); explicit
+#                 # rects compare strictly (1 px of real motion counts), whole windows
+#                 # tolerate caret-blink noise. No change after max/timeout →
+#                 # {"changed":false,"iterations":N}, NO image, prior frame stays valid.
+#     --settle    # after acting (or after the edge fires), wait until pixels hold STILL
+#                 # (~0.8s quiet, 10s cap) before the final capture — the returned image is
+#                 # post-animation, not mid-flight. Alone (no --until-change) it fuses
+#                 # act + wait + capture into one call.
+#                 # Watch-window resolution: --pid / --window-id / --window, else --target.
+#
+#   RUN A PLAN — a pre-compiled linear sequence, executed host-side (max 12 steps, 300s):
+#     floaty run --pid 8123 --steps '[
+#       {"do":{"verb":"press","role":"AXButton","title":"Export"},
+#        "expect":{"appears":{"role":"AXSheet"},"timeout":5}},
+#       {"do":{"verb":"key","key":"return"},
+#        "expect":{"disappears":{"role":"AXSheet"}},"retry":1}
+#     ]'
+#                 # Each step = one actuator call + an expected-outcome checkpoint. Verbs:
+#                 # click/drag/key/scroll/type + press (AX element by role/title, resolved
+#                 # FRESH at execution time — never a stale mark id). In step JSON,
+#                 # "modifiers" accepts ["cmd","shift"] or "cmd,shift". Checkpoints:
+#                 #   appears/disappears:{role,title}  AX predicate, polled (default 8s)
+#                 #   watch:"x,y,WxH"                  strict pixel edge — REQUIRED form on
+#                 #                                    canvas apps (AX + full-window hash blind)
+#                 #   focused:true | {editable:true, role:"AXTextArea"}   the app's focused
+#                 #                                    element matches — THE checkpoint for
+#                 #                                    "click/key opened a text editor": a caret
+#                 #                                    is pixel-invisible (watch falsely diverges)
+#                 #                                    but focus is AX-readable even in canvas
+#                 #                                    apps (they edit via a hidden textarea)
+#                 #   settle:true                      pixels hold still (animation done);
+#                 #                                    may RIDE ALONG appears/watch/focused
+#                 #                                    ("changed, then let it finish" — best-
+#                 #                                    effort rider, hard checkpoint only alone)
+#                 # IDEMPOTENT steps (select a maybe-already-selected tool, focus a maybe-
+#                 # focused field): a watch there is a no-op → false divergence. Use a
+#                 # checkpoint that holds in BOTH worlds (appears on the post-state) or omit
+#                 # the expect for that step.
+#                 # Top-level --pid/--app/--target/--window merge into every step. retry:N
+#                 # (≤3) re-runs THAT step verbatim on a failed checkpoint. First divergence
+#                 # stops the run: {"completed":false,"failed_step":N,reason,capture}. Success
+#                 # returns the ENDGAME only: {"completed":true,steps,retries_total} + one
+#                 # final capture; per-step forensics = route "run.step" in calls.ndjson.
+#                 # The host self-verifies keystroke steps: focus still on the target after
+#                 # type/key (stolen focus FAILS the step — retry re-raises, so give those
+#                 # steps retry:1) and typed text re-read from the focused element's AX value.
+#                 # Unreadable value (canvas) → step passes UNVERIFIED and the reply lists it
+#                 # in unverified_steps — re-check those effects before trusting completed:true.
 #   floaty focused --app "Notes" | --pid 8123           # the focused element (role/value/editable):
 #                                                        # confirm a text cursor exists BEFORE typing
 #   floaty set-text --pid 8123 --text "hello"           # write text into the FOCUSED field via the AX API
@@ -46,10 +105,34 @@
 #                 # click-through + unable to steal focus (but still visible) so synthetic clicks/keys
 #                 # reach the app you're driving. Click the on-screen badge — or it auto-surfaces when
 #                 # your session needs input — to release. Run `--ghost on` BEFORE a click/type sequence.
+#   floaty sessions                                      # every FloatyTerm terminal session: stable id,
+#                 # name, status, is_agent, last command block + exit code. Your OWN session's id is in
+#                 # $FLOATYTERM_SESSION_ID — pass it as --exclude to peek to mean "everyone but me".
+#   floaty peek   [--session <name|id-prefix>] [--block last|N] [--max-lines 500] [--raw]
+#                 # the terminal tunnel: read a command block (output + exit code, OSC 133-delimited)
+#                 # from ANOTHER session. Lines arrive CLEANED by default — soft-wrapped rows joined
+#                 # back into logical lines, TUI repaint dupes/blank runs folded (--raw = verbatim rows).
+#                 # Ambiguous/missing --session replies carry a machine-readable sessions[] roster.
+#                 # When only one other session exists --session is optional:
+#                 #   floaty peek --exclude "$FLOATYTERM_SESSION_ID"     # the other terminal's last command
+#   floaty peek   --session build --wait [--timeout 60]  # long-poll: returns the MOMENT that session's
+#                 # next command finishes, exit code included — cross-agent coordination without polling
+#   floaty peek   --session build --since 1200           # raw transcript window from absolute line 1200
+#                 # (works without shell integration; reply carries next_since for paging)
 #   floaty capture --window "Flutter" [--ocr]           # returns a capture FRAME (frame_id +
 #                                                        # origin/size/scale/image dims) + PNG
 #   floaty capture --window-id 12345 [--ocr]            # exact window from list-windows
 #   floaty capture --pid 8123 [--ocr]                   # that process's largest on-screen window
+#   floaty capture --pid 8123 --region "100,200,400x300" # crop to a GLOBAL-screen-point region
+#                 # (x,y,WxH) — verifying "did the dialog open" needs a small crop, not a full frame.
+#                 # PNGs are downscaled to ~1440px long edge for the model (click-in-frame still
+#                 # inverts exactly); --full-res keeps native pixels. OCR always reads full-res.
+#   floaty capture --pid 8123 --if-changed              # pixels identical to your LAST capture of this
+#                 # target → {"unchanged":true,"screen_hash":…} and NO image (prior frame stays valid).
+#                 # Every capture reply carries screen_hash (perceptual fingerprint).
+#   floaty capture --pid 8123 --wait-change [--timeout 20] [--region …]  # long-poll: blocks until the
+#                 # window (or region) visibly changes, then returns ONE fresh capture — replaces
+#                 # screenshot-poll loops during page loads. Timeout → {"changed":false}, no image.
 #   floaty click-in-frame --frame cap_… --x <imgpx> --y <imgpx> [--button right] [--clicks 2] [--human]
 #                 (x/y are PIXELS in the captured PNG, as your vision model reads them;
 #                  FloatyTerm inverts to a screen point and clicks — no scale math, no re-capture)
@@ -68,12 +151,22 @@
 #   floaty navigate --url "https://example.com" [--port 9222] [--match console.cloud]  # drive a tab
 #   floaty tabs     [--port 9222]                       # list open tabs (id/title/url) to pick --match
 #   floaty focus    --match youtube.com [--port 9222]   # raise that tab's window (then key/type land there)
-#   floaty som      [--port 9222] [--match …] [--max 100]   # Set-of-Mark (DOM): numbered boxes on a
-#                                                            # screenshot → PNG + frame_id + marks[]
+#   floaty som      [--port 9222] [--match …] [--max 100]   # Set-of-Mark (DOM): numbered marks →
+#                                                            # frame_id + elements table (TABLE-FIRST:
+#                                                            # the annotated PNG is produced only when
+#                                                            # marks are poorly named, or with --image)
 #   floaty som      --app "Notes"  [--max 100]              # Set-of-Mark (AX): same, for native apps
 #   floaty som      --pid 8123     [--max 100]              # & live Chrome (by PID, no debug port)
+#                 # som/query-ax/query-dom output one element per line: `id  role  "name"  @x,y WxH`.
+#                 # --brief drops geometry (id/role/name only); --json restores the verbose array.
+#   floaty som      --pid 8123 --diff                   # only what CHANGED since your last som of this
+#                 # target: added rows (their ids are click-mark ids in THIS frame) + removed rows +
+#                 # counts. After a click, the delta is usually a menu's worth of rows, not the page.
+#   floaty query-ax --pid 8123 --diff                   # same, vs the last identical query-ax
+#                 # (same target + same --role/--title). First call stores a baseline & returns full.
 #   floaty click-mark --frame som_… --id 5 [--clicks 2] [--human]  # click the element labeled 5
-#                                                            # (model picks a NUMBER, not a pixel)
+#                                                            # (model picks a NUMBER, not a pixel —
+#                                                            # works with or without the image)
 #
 # --match <substring> selects WHICH tab (url or title contains it) for eval/query-dom/navigate/focus/som;
 # without it they use the first real page. Use `floaty tabs` to see what's open.
@@ -88,7 +181,93 @@ set -euo pipefail
 HOST="127.0.0.1:7777"
 
 cmd="${1:-}"; shift || true
-[ -n "$cmd" ] || { echo "usage: floaty <click|move|drag|scroll|type|key|set-text|enable-cdp|capture|query-dom|query-ax|focused|read-text|eval|navigate|tabs|focus|list-windows|mark|click-in-frame|move-in-frame|som|click-mark|host|raise> [--flag value ...]" >&2; exit 2; }
+[ -n "$cmd" ] || { echo "usage: floaty <command> [--flag value ...]   (try: floaty help)" >&2; exit 2; }
+
+case "$cmd" in help|--help|-h) cat <<'HELP'
+floaty — drive the macOS GUI and peek other terminal sessions, via FloatyTerm.
+Every command POSTs to the app (127.0.0.1:7777) and prints a JSON reply on
+stdout. Failure = {"error": "..."} + exit 1. The app must be running.
+
+POINTER / KEYBOARD
+  click  --x N --y N [--button left|right|center] [--clicks 2] [--modifiers cmd,shift] [--human]
+  move   --x N --y N [--human]         drag --from-x N --from-y N --to-x N --to-y N
+  scroll --dx N --dy N [--x N --y N]   # cursor position decides WHAT scrolls
+  type   --text "…" [--target App | --pid N] [--human] [--no-controls]   # --human = your recorded
+         # rhythm, replayed as a pausable session w/ overlaid play/pause/stop/speed controls
+  key    --key return [--modifiers cmd,shift] [--target App | --pid N]
+  set-text --pid N --text "…"          # AX write into the FOCUSED field (reliable for Electron)
+  focused  --app "…" | --pid N         # confirm a text cursor exists BEFORE typing
+
+ACT TO AN EDGE (click/drag/key/scroll — kills the act→capture→act→capture loop)
+  … --until-change [--watch "x,y,WxH"] [--every 0.6] [--max 10] [--timeout 20] --pid N
+      # HOST repeats the exact action until the watched pixels change, then returns ONE
+      # fresh capture. Pick a --watch rect that ONLY changes when the goal state arrives.
+      # No change → {"changed":false,"iterations":N}, no image, prior frame stays valid.
+  … --settle       # act once, wait for pixels to hold still (post-animation), capture.
+                   # Combine: --until-change --settle = repeat to the edge, then let the
+                   # animation finish before the capture.
+
+RUN A PLAN (linear steps, host-executed — the model only returns on divergence)
+  run --pid N --steps '[{"do":{"verb":…},"expect":{…},"retry":1}, …]'
+      # verbs: click/drag/key/scroll/type + press:{role,title} (AX, resolved fresh).
+      # checkpoints: appears/disappears:{role,title} (AX) · watch:"x,y,WxH" (strict
+      # pixels — the ONLY honest check on canvas apps) · settle:true (stillness).
+      # Success → endgame only ({"completed":true,steps,retries_total} + one capture);
+      # divergence → {"completed":false,"failed_step":N,reason} + capture of where.
+      # Forensics per step: route "run.step" in calls.ndjson. Full schema: script header.
+
+SEE THE SCREEN (cheapest first — climb only when the previous rung failed)
+  query-ax  --app "…" | --pid N [--role button] [--title Save] [--press] [--diff]
+  som     --app "…" | --pid N | [--port 9222] [--diff]   # numbered marks: TABLE by default (one
+                                                 # element per line); annotated PNG only when marks
+                                                 # are poorly named or you pass --image.
+                                                 # --diff = only rows added/removed since last som
+  click-mark --frame som_… --id N                # click by NUMBER — no image needed
+  capture --window "…" | --window-id N | --pid N [--ocr] [--region "x,y,WxH"] [--full-res]
+          [--if-changed] [--wait-change [--timeout 20]]
+                                                 # PNG + frame_id + screen_hash; ~1440px for the
+                                                 # model. --region = small verification crops.
+                                                 # --if-changed = skip the image when pixels match
+                                                 # your last capture. --wait-change = block until
+                                                 # the window changes, then one fresh capture.
+  click-in-frame / move-in-frame --frame cap_… --x <imgpx> --y <imgpx>
+  read-text --app "…" | --pid N [--sections]     # window text via AX (OCR fallback)
+  list-windows [--filter Chrome]                 # window ids + pids to target
+  mark --x N --y N [--label "…"]                 # flash a crosshair to verify a target
+  (--brief = id/role/name only · --json = verbose arrays for scripts)
+
+BROWSER / ELECTRON (CDP; app must be launched with a debug port)
+  tabs / focus / navigate / eval / query-dom  [--port 9222] [--match <url-or-title substr>]
+  enable-cdp --app "Slack" [--port 9225]         # relaunch an Electron app with CDP on
+  --via-extension   # drive your LIVE Chrome tabs via the FloatyTerm CDP extension
+                    # (no debug port, no relaunch, session intact). Chrome only.
+                    # Works with tabs/eval/query-dom/navigate/focus/som. See extension/README.md
+
+HOST
+  host --ghost on|off      # make FloatyTerm click-through BEFORE driving another app
+  raise --app "…" | --pid N
+
+TERMINAL TUNNEL — read another session's command output
+  sessions
+      Lists every FloatyTerm terminal: id, name, status, is_agent, last_block,
+      last_exit_code. Your OWN session's id is in $FLOATYTERM_SESSION_ID.
+  peek …    read one command's output (+ exit code) from another session:
+      floaty peek --exclude "$FLOATYTERM_SESSION_ID"   # one other session? → its last command
+      floaty peek --session build                      # target by name substring or id prefix
+      floaty peek --session build --block 12           # a specific earlier block
+      floaty peek --session build --wait               # BLOCK until its NEXT command finishes,
+                                                       # then return it — no polling loop needed
+      floaty peek --session build --since 1200         # raw lines from absolute index 1200;
+                                                       # reply's next_since = where to poll from next
+      Read the reply's block.lines (output), block.exit_code, block.running.
+      Lines are cleaned for you (wrapped rows re-joined, repaint noise folded);
+      add --raw for verbatim screen rows. If --session is ambiguous the error
+      reply includes sessions[] — pick one and retry. If the target shell has
+      no OSC 133 integration you get the transcript tail + a hint instead.
+
+Full flag detail lives in the comment header of this script (open: command -v floaty).
+HELP
+exit 0;; esac
 
 args=("$@")
 # Expand the array in a way that's safe when it's EMPTY under `set -u` on the
@@ -99,7 +278,7 @@ import sys, json
 cmd = sys.argv[1]; toks = sys.argv[2:]
 obj = {}; i = 0
 # numeric flags → numbers; --modifiers → array; bare flags (--human/--ocr) → true.
-NUM = {"x","y","port","clicks","dx","dy","duration","from_x","from_y","to_x","to_y","window_id","id","max","pid"}
+NUM = {"x","y","port","clicks","dx","dy","duration","from_x","from_y","to_x","to_y","window_id","id","max","pid","since","timeout","max_lines","every"}
 while i < len(toks):
     if not toks[i].startswith("--"): i += 1; continue
     key = toks[i][2:].replace("-", "_")
@@ -124,7 +303,9 @@ paths = {"click":"/agent/click","move":"/agent/move","drag":"/agent/drag",
          "query-ax":"/agent/query-ax","focused":"/agent/focused",
          "set-text":"/agent/set-text","enable-cdp":"/agent/enable-cdp",
          "host":"/agent/host","raise":"/agent/raise",
-         "read-text":"/agent/read-text"}
+         "read-text":"/agent/read-text",
+         "sessions":"/agent/sessions","peek":"/agent/peek",
+         "run":"/agent/run"}
 print(json.dumps({"path": paths.get(cmd, "/agent/"+cmd), "body": obj}))
 PY
 )
