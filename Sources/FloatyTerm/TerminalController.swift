@@ -787,6 +787,11 @@ final class TerminalController: NSObject, LocalProcessTerminalViewDelegate, TabC
             self.onOpenChildTab?(viewer)
         }
 
+        // ⌘-click on a detected link or file path in the output.
+        terminalView.onOpenLink = { [weak self] link, _ in
+            self?.routeLink(link)
+        }
+
         // Restore the previous run's transcript before any shell output can
         // commit, so old history sits cleanly below the new session's lines.
         if isRestored { restoreTranscriptFromDisk() }
@@ -971,12 +976,104 @@ final class TerminalController: NSObject, LocalProcessTerminalViewDelegate, TabC
         )
     }
 
+    // MARK: - ⌘-click link routing
+
+    /// Routes a ⌘-clicked link (explicit OSC 8 or SwiftTerm's implicit
+    /// URL/path detection) somewhere useful. SwiftTerm's default handler is
+    /// `NSWorkspace.open(URL(string:))`, which handles https but silently
+    /// drops bare filesystem paths (scheme-less URL) and can't resolve
+    /// relative ones against the shell's cwd.
+    private func routeLink(_ link: String) {
+        // Web links → a browser tab right next to this terminal (child tab:
+        // closes with it, like the image/Markdown viewers).
+        if link.hasPrefix("http://") || link.hasPrefix("https://") {
+            onOpenChildTab?(BrowserController(initialURL: link))
+            return
+        }
+        // file: URLs (OSC 8 emitters like `ls --hyperlink`) → path routing.
+        if let url = URL(string: link), url.isFileURL {
+            routePath(url.path)
+            return
+        }
+        // Bare paths never parse a scheme (the '/' before any ':' breaks
+        // scheme syntax), so anything with a scheme here is a real URL
+        // (mailto:, vscode:, ssh:…) → system handler.
+        if let url = URL(string: link), url.scheme != nil {
+            NSWorkspace.shared.open(url)
+            return
+        }
+        routePath(link)
+    }
+
+    /// Opens a resolved filesystem path: images and Markdown in their
+    /// child-tab viewers, directories revealed in Finder, everything else
+    /// with its default application. Unresolvable paths are a quiet no-op
+    /// (implicit detection has false positives; beeping on each would nag).
+    private func routePath(_ raw: String) {
+        guard let hit = resolvePathCandidate(raw) else { return }
+        if hit.isDirectory {
+            NSWorkspace.shared.selectFile(hit.path, inFileViewerRootedAtPath: "")
+        } else if ImageViewerController.isImageFile(hit.path),
+                  let viewer = ImageViewerController(path: hit.path) {
+            onOpenChildTab?(viewer)
+        } else if MarkdownViewerController.isMarkdownFile(hit.path),
+                  let viewer = MarkdownViewerController(path: hit.path) {
+            onOpenChildTab?(viewer)
+        } else {
+            // `hit.line` (from a `path:42` compiler reference) is resolved but
+            // unused until an editor preference exists to pass it to.
+            NSWorkspace.shared.open(URL(fileURLWithPath: hit.path))
+        }
+    }
+
+    /// Expands `~` and resolves relative paths against the shell's live cwd.
+    /// Tries the string verbatim first, then with a trailing `:line[:col]`
+    /// stripped — so `Sources/Foo.swift:42` from compiler output finds the
+    /// file even though the detected match includes the line reference.
+    /// Returns nil when neither form names something on disk.
+    private func resolvePathCandidate(_ raw: String)
+        -> (path: String, isDirectory: Bool, line: Int?)?
+    {
+        var candidates: [(String, Int?)] = [(raw, nil)]
+        if let m = raw.range(of: #":\d+(?::\d+)?$"#, options: .regularExpression) {
+            let base = String(raw[..<m.lowerBound])
+            let line = Int(raw[m.lowerBound...].dropFirst().split(separator: ":")[0])
+            candidates.append((base, line))
+        }
+        let fm = FileManager.default
+        for (candidate, line) in candidates {
+            var path = (candidate as NSString).expandingTildeInPath
+            if !(path as NSString).isAbsolutePath {
+                let cwd = currentWorkingDirectory ?? NSHomeDirectory()
+                path = (cwd as NSString).appendingPathComponent(path)
+            }
+            var isDir: ObjCBool = false
+            if fm.fileExists(atPath: path, isDirectory: &isDir) {
+                return (path, isDir.boolValue, line)
+            }
+        }
+        return nil
+    }
+
     // MARK: - LocalProcessTerminalViewDelegate
 
     func sizeChanged(source: LocalProcessTerminalView, newCols: Int, newRows: Int) {
         // Keep the transcript mirror's geometry in lockstep so line wrapping
         // and the "scrolled off screen" boundary match the real terminal.
-        if newCols > 0, newRows > 0 { mirror.resize(cols: newCols, rows: newRows) }
+        guard newCols > 0, newRows > 0 else { return }
+        let colsChanged = newCols != mirror.cols
+        // Commit everything already stable at the old width first — the
+        // resize below reflows the scrollback and invalidates the
+        // harvester's row indices.
+        if colsChanged { harvestTranscript() }
+        mirror.resize(cols: newCols, rows: newRows)
+        if colsChanged {
+            if mirror.isCurrentBufferAlternate {
+                mirrorNeedsReanchor = true
+            } else {
+                reanchorTranscriptHarvest()
+            }
+        }
     }
 
     func setTerminalTitle(source: LocalProcessTerminalView, title: String) {

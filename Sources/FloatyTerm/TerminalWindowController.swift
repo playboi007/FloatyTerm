@@ -1216,15 +1216,9 @@ final class TerminalWindowController: NSObject, NSWindowDelegate {
         // One-time resource notice.
         showBrowserResourceNoticeIfNeeded()
 
-        let tab = BrowserController(initialURL: initialURL)
-        tab.onTitleChanged = { [weak self] in
-            self?.refreshTabStrip()
-            self?.syncURLBar()
-        }
-        // Fires on URL / canGoBack / canGoForward changes — title KVO alone
-        // misses same-title navigations and back/forward state flips.
-        tab.onNavChanged = { [weak self] in self?.syncURLBar() }
-        insertTab(tab)
+        // Title/nav → URL-bar wiring happens in insertTab, which is the single
+        // entry for every browser tab (incl. ⌘-click child tabs from terminals).
+        insertTab(BrowserController(initialURL: initialURL))
     }
 
     /// Wires the baseline title callback (refresh the strip on rename) and
@@ -1314,6 +1308,13 @@ final class TerminalWindowController: NSObject, NSWindowDelegate {
         // for tabs joining a window (new, restored, AND adopted from another
         // window), so the chip always reports to the current host.
         if let bc = tab as? BrowserController {
+            bc.onTitleChanged = { [weak self] in
+                self?.refreshTabStrip()
+                self?.syncURLBar()
+            }
+            // Fires on URL / canGoBack / canGoForward changes — title KVO
+            // alone misses same-title navigations and back/forward flips.
+            bc.onNavChanged = { [weak self] in self?.syncURLBar() }
             bc.onSelectionChanged = { [weak self, weak bc] sel in
                 guard let self, let bc else { return }
                 self.browserSelectionChanged(bc, sel)
@@ -2075,20 +2076,43 @@ final class TerminalWindowController: NSObject, NSWindowDelegate {
     /// SwiftTerm's mouse handlers aren't `open`, so selection is detected via
     /// a local event monitor: mouse-up over the active terminal with a live
     /// selection shows the bar; mouse-down anywhere else dismisses it.
+    /// Key events ride the same monitor: backspace (or ⌥⌘⌫) while the focused
+    /// terminal has a selection dismisses it — and is swallowed, so the
+    /// shell/TUI never sees that keypress.
     private var mouseMonitor: Any?
 
     private func installSelectionMonitor() {
         mouseMonitor = NSEvent.addLocalMonitorForEvents(
-            matching: [.leftMouseDown, .leftMouseUp]
+            matching: [.leftMouseDown, .leftMouseUp, .keyDown]
         ) { [weak self] event in
-            self?.handleSelectionMouse(event)
+            guard let self, event.window === self.panel else { return event }
+            if event.type == .keyDown {
+                return self.handleSelectionKey(event)
+            }
+            self.handleSelectionMouse(event)
             return event
         }
     }
 
-    private func handleSelectionMouse(_ event: NSEvent) {
-        guard event.window === panel else { return }
+    /// Backspace with an active selection dismisses the highlight instead of
+    /// reaching the shell — the keypress is consumed (returns nil); the next
+    /// backspace types normally. ⌥⌘⌫ gets the same treatment here so its
+    /// clear-scrollback meaning (handled by the terminal view) only fires
+    /// when no selection is up. Only intercepts when the terminal itself has
+    /// focus, so backspace in the find bar or URL bar is never touched.
+    private func handleSelectionKey(_ event: NSEvent) -> NSEvent? {
+        guard event.keyCode == 51 else { return event }   // ⌫
+        let flags = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
+        guard flags.isEmpty || flags == [.command, .option] else { return event }
+        guard let tv = activeTerminalView,
+              panel.firstResponder === tv,
+              tv.hasSelection else { return event }
+        tv.selectNone()
+        hideSelectionBar()
+        return nil
+    }
 
+    private func handleSelectionMouse(_ event: NSEvent) {
         if event.type == .leftMouseDown {
             // Keep the bar when the click is ON the bar (its buttons).
             let p = root.convert(event.locationInWindow, from: nil)
