@@ -218,12 +218,23 @@ final class TerminalController: NSObject, LocalProcessTerminalViewDelegate, TabC
     private let mirrorDelegate = MirrorTerminalDelegate()
     private var mirrorNextRow = 0    // next scroll-invariant row to commit
     private var mirrorProbedEnd = 0  // rows examined so far
+    /// A width change reflowed the mirror's scrollback while the alt screen
+    /// was active; re-anchor on the next normal-buffer harvest.
+    private var mirrorNeedsReanchor = false
 
     /// Committed output lines: everything that has scrolled off the mirror's
     /// live screen since the shell started — so a transcript reader opened
     /// mid-session still has the full history. Each line commits exactly
     /// once; runs of blank lines are collapsed.
     private(set) var transcriptLines: [String] = []
+
+    /// Parallel to `transcriptLines`: true = this row soft-wraps into the
+    /// next (its last cell was occupied when it scrolled off), so the two
+    /// are one logical line. Heuristic — SwiftTerm's real isWrapped flag is
+    /// internal — used by peek to hand agents logical lines instead of
+    /// fragments broken at this window's width. Not persisted to disk;
+    /// restored history simply doesn't re-join.
+    private(set) var transcriptWraps: [Bool] = []
 
     /// How many lines have been dropped off the front of `transcriptLines`
     /// (by the memory cap or the TTL) — readers use it to keep absolute
@@ -248,30 +259,57 @@ final class TerminalController: NSObject, LocalProcessTerminalViewDelegate, TabC
     /// (including a TUI's whole current frame). The reader renders this as a
     /// volatile tail it rewrites in place, so the frame updates live without
     /// committing repaint spam.
-    var transcriptVolatile: [String] {
-        var lines: [String] = []
+    var transcriptVolatile: [String] { transcriptVolatileDetailed.map(\.text) }
+
+    /// The volatile tail with the soft-wrap heuristic attached, so peek can
+    /// rebuild logical lines across the committed/live seam.
+    var transcriptVolatileDetailed: [(text: String, wrapsNext: Bool)] {
+        var lines: [(text: String, wrapsNext: Bool)] = []
+        func append(_ line: BufferLine) {
+            lines.append((Self.transcriptText(line),
+                          Self.rowWrapsNext(line, cols: mirror.cols)))
+        }
         if mirror.isCurrentBufferAlternate {
             // Alt-screen apps (vim, less…) paint a screen, not a log: show it
             // live, commit nothing.
             for row in 0..<mirror.rows {
                 guard let line = mirror.getLine(row: row) else { break }
-                lines.append(line.translateToString(trimRight: true))
+                append(line)
             }
         } else {
             var row = mirrorNextRow
             while let line = mirror.getScrollInvariantLine(row: row) {
-                lines.append(line.translateToString(trimRight: true))
+                append(line)
                 row += 1
             }
         }
-        while let last = lines.last, last.isEmpty { lines.removeLast() }
+        while let last = lines.last, last.text.isEmpty { lines.removeLast() }
         return lines
+    }
+
+    /// Serializes one mirror row for the transcript. Cells a program never
+    /// wrote hold NUL, which SwiftTerm returns as an invisible U+0000 —
+    /// renderers like Claude Code position text with cursor motion instead
+    /// of printing spaces, so their gaps read back as nothing and words fuse
+    /// ("when the" → "whenthe"). Render unwritten cells as the blanks a real
+    /// screen shows; skip the NUL placeholder after a wide (CJK/emoji) cell.
+    private static func transcriptText(_ line: BufferLine) -> String {
+        line.translateToString(trimRight: true,
+                               skipNullCellsFollowingWide: true) { cell in
+            let ch = cell.getCharacter()
+            return ch == "\u{0}" ? " " : ch
+        }
     }
 
     /// Commits every line that has scrolled off the mirror's live screen.
     /// Called after each output chunk is fed to the mirror.
     private func harvestTranscript() {
         guard !mirror.isCurrentBufferAlternate else { return }
+
+        if mirrorNeedsReanchor {
+            mirrorNeedsReanchor = false
+            reanchorTranscriptHarvest()
+        }
 
         // Extend to the current end of the mirror's scroll buffer.
         var end = max(mirrorProbedEnd, mirrorNextRow)
@@ -289,10 +327,202 @@ final class TerminalController: NSObject, LocalProcessTerminalViewDelegate, TabC
         let stableEnd = max(mirrorNextRow, end - mirror.rows)
         while mirrorNextRow < stableEnd {
             if let line = mirror.getScrollInvariantLine(row: mirrorNextRow) {
-                commitTranscriptLine(line.translateToString(trimRight: true))
+                commitTranscriptLine(Self.transcriptText(line),
+                                     wrapsNext: Self.rowWrapsNext(line, cols: mirror.cols))
             }
             mirrorNextRow += 1
         }
+    }
+
+    /// True when the row's last cell is occupied — the soft-wrap heuristic:
+    /// text that reaches the final column almost certainly continues on the
+    /// next row. (The rare full-width line that ends exactly there joins two
+    /// abutting lines; harmless for agent consumption.)
+    private static func rowWrapsNext(_ line: BufferLine, cols: Int) -> Bool {
+        let last = cols - 1
+        return last >= 0 && last < line.count && line.hasContent(index: last)
+    }
+
+    /// A width change makes SwiftTerm reflow the scrollback — rows split and
+    /// merge in the middle of the buffer, so the scroll-invariant indices the
+    /// harvester holds no longer point at the lines they did (the transcript
+    /// then commits skipped, truncated, or blank lines). Everything above the
+    /// live screen was committed before the resize; re-find the buffer end
+    /// and re-anchor the cursor at the live screen's start. The live screen
+    /// itself gets repainted after SIGWINCH and commits as it scrolls off.
+    private func reanchorTranscriptHarvest() {
+        var end = max(mirrorProbedEnd, mirrorNextRow)
+        // Reflow can move the end in either direction: probe down to the
+        // last real row, then extend up.
+        while end > 0, mirror.getScrollInvariantLine(row: end - 1) == nil { end -= 1 }
+        while mirror.getScrollInvariantLine(row: end) != nil { end += 1 }
+        mirrorProbedEnd = end
+        mirrorNextRow = max(0, end - mirror.rows)
+    }
+
+    // MARK: - Command blocks (cross-session output sharing)
+    //
+    // The transcript segmented into prompt-cycle units: a block opens at
+    // `133;C` (command output begins) and closes at `133;D;<exit>` (command
+    // finished). Blocks are what another session's agent reads through
+    // `floaty peek` — "the output of the last command over there", with its
+    // exit code, instead of a raw line window.
+
+    /// One command's output span. Line indices are absolute transcript
+    /// positions (`transcriptDropped`-aware), so a block stays addressable
+    /// while the transcript trims underneath it.
+    struct CommandBlock {
+        let id: Int
+        /// The prompt line as it looked when the command launched (prompt
+        /// decoration included) — the best available "what ran here".
+        let command: String?
+        let startLine: Int
+        var endLine: Int?          // exclusive; nil while still running
+        var exitCode: Int32?
+        let startedAt: TimeInterval
+        var endedAt: TimeInterval?
+        /// Small blocks keep their text at close, so they outlive transcript
+        /// trimming and the TTL. `snapshotWraps` is the parallel soft-wrap
+        /// map, so peek's logical-line join works on archived blocks too.
+        var snapshot: [String]?
+        var snapshotWraps: [Bool]?
+    }
+
+    private(set) var commandBlocks: [CommandBlock] = []
+    private var nextBlockID = 1
+    private static let blockCap = 50
+    private static let blockSnapshotCap = 200   // lines
+
+    /// Absolute transcript index of "now" — committed lines plus the live
+    /// tail still on the mirror's screen.
+    var transcriptAbsoluteEnd: Int {
+        transcriptDropped + transcriptLines.count + transcriptVolatile.count
+    }
+
+    /// One-shot waiters fired when the next `133;D` closes a block — the
+    /// relay's `peek --wait` long-poll. Cancelable so a timed-out waiter
+    /// doesn't hold its reply closure (and connection) until the next D.
+    private var blockWaiters: [UUID: (CommandBlock) -> Void] = [:]
+
+    @discardableResult
+    func awaitNextCompletedBlock(_ cb: @escaping (CommandBlock) -> Void) -> UUID {
+        let token = UUID()
+        blockWaiters[token] = cb
+        return token
+    }
+
+    func cancelBlockWait(_ token: UUID) {
+        blockWaiters.removeValue(forKey: token)
+    }
+
+    /// `133;C` — a command's output is starting. Close any dangling open
+    /// block (a lost `133;D`, e.g. a killed shell), then open the new one
+    /// anchored at the current end of the transcript.
+    private func openCommandBlock() {
+        let anchor = transcriptAbsoluteEnd
+        if var open = commandBlocks.last, open.endLine == nil {
+            open.endLine = anchor
+            open.endedAt = Date().timeIntervalSinceReferenceDate
+            commandBlocks[commandBlocks.count - 1] = open
+        }
+        // The last non-empty line on screen right now is the prompt with the
+        // just-echoed command.
+        let prompt = transcriptVolatile.last(where: { !$0.isEmpty })
+            ?? transcriptLines.last(where: { !$0.isEmpty })
+        commandBlocks.append(CommandBlock(
+            id: nextBlockID, command: prompt, startLine: anchor, endLine: nil,
+            exitCode: nil, startedAt: Date().timeIntervalSinceReferenceDate,
+            endedAt: nil, snapshot: nil))
+        nextBlockID += 1
+        if commandBlocks.count > Self.blockCap {
+            commandBlocks.removeFirst(commandBlocks.count - Self.blockCap)
+        }
+    }
+
+    /// `133;D` — the running command finished. Close the block, snapshot it
+    /// if small, and wake any `peek --wait` long-polls.
+    private func closeCommandBlock(exitCode: Int32?) {
+        guard var open = commandBlocks.last, open.endLine == nil else { return }
+        open.endLine = transcriptAbsoluteEnd
+        open.exitCode = exitCode
+        open.endedAt = Date().timeIntervalSinceReferenceDate
+        let (lines, wraps, dropped) = blockLines(start: open.startLine, end: open.endLine)
+        if dropped == 0, lines.count <= Self.blockSnapshotCap {
+            open.snapshot = lines
+            open.snapshotWraps = wraps
+        }
+        commandBlocks[commandBlocks.count - 1] = open
+        let waiters = blockWaiters
+        blockWaiters.removeAll()
+        for (_, w) in waiters { w(open) }
+    }
+
+    /// Resolves an absolute line range against the committed transcript plus
+    /// the live tail, with the parallel soft-wrap map. `droppedPrefix` counts
+    /// leading lines that have already aged out — report it, never silently
+    /// truncate.
+    func blockLines(start: Int, end: Int?) -> (lines: [String], wraps: [Bool], droppedPrefix: Int) {
+        let volatileLines = transcriptVolatileDetailed
+        let committedEnd = transcriptDropped + transcriptLines.count
+        let absEnd = min(end ?? Int.max, committedEnd + volatileLines.count)
+        let first = max(start, transcriptDropped)
+        guard first < absEnd else { return ([], [], max(0, transcriptDropped - start)) }
+        var out: [String] = []
+        var wraps: [Bool] = []
+        out.reserveCapacity(absEnd - first)
+        wraps.reserveCapacity(absEnd - first)
+        for i in first..<absEnd {
+            if i < committedEnd {
+                out.append(transcriptLines[i - transcriptDropped])
+                wraps.append(transcriptWraps[i - transcriptDropped])
+            } else {
+                let v = volatileLines[i - committedEnd]
+                out.append(v.text)
+                wraps.append(v.wrapsNext)
+            }
+        }
+        return (out, wraps, first - start)
+    }
+
+    /// The block's text: the snapshot when one was kept, else resolved live.
+    func blockText(_ block: CommandBlock) -> (lines: [String], wraps: [Bool], droppedPrefix: Int) {
+        if let snap = block.snapshot {
+            return (snap, block.snapshotWraps ?? Array(repeating: false, count: snap.count), 0)
+        }
+        return blockLines(start: block.startLine, end: block.endLine)
+    }
+
+    /// Joins soft-wrapped rows into logical lines — a long path or URL that
+    /// the source window broke at its width comes out whole.
+    static func logicalLines(_ lines: [String], wraps: [Bool]) -> [String] {
+        var out: [String] = []
+        var current = ""
+        for (i, line) in lines.enumerated() {
+            current += line
+            if i < wraps.count && wraps[i] { continue }
+            out.append(current)
+            current = ""
+        }
+        if !current.isEmpty { out.append(current) }
+        return out
+    }
+
+    /// Collapses TUI repaint noise for agent consumption: runs of identical
+    /// lines and runs of blanks become one, and blank padding is trimmed
+    /// from both ends. Returns how many lines were folded away so the reply
+    /// can say so instead of pretending this is the verbatim screen.
+    static func cleanedForPeek(_ lines: [String]) -> (lines: [String], collapsed: Int) {
+        var out: [String] = []
+        var collapsed = 0
+        for line in lines {
+            // Identical to the previous line — covers repaint dupes and, via
+            // "" == "", blank runs.
+            if line == out.last { collapsed += 1; continue }
+            out.append(line)
+        }
+        while out.last?.isEmpty == true { out.removeLast(); collapsed += 1 }
+        while out.first?.isEmpty == true { out.removeFirst(); collapsed += 1 }
+        return (out, collapsed)
     }
 
     private var lineBytes: [UInt8] = []
@@ -365,6 +595,7 @@ final class TerminalController: NSObject, LocalProcessTerminalViewDelegate, TabC
         case "C":        // command executed — output begins
             sawShellIntegration = true
             commandRunning = true
+            openCommandBlock()
         case "D":        // command finished, optionally with `;<exit code>`
             sawShellIntegration = true
             commandRunning = false
@@ -375,6 +606,7 @@ final class TerminalController: NSObject, LocalProcessTerminalViewDelegate, TabC
             } else {
                 lastExitCode = nil
             }
+            closeCommandBlock(exitCode: lastExitCode)
             if notifyWhenDone && armedSawJob { markerDoneSinceArm = true }
         default:
             break
@@ -449,15 +681,17 @@ final class TerminalController: NSObject, LocalProcessTerminalViewDelegate, TabC
     /// Appends the current line to the transcript. Consecutive duplicates are
     /// dropped (TUI frameworks repaint the same lines on every frame); memory
     /// is bounded by trimming the oldest lines in bulk.
-    private func commitTranscriptLine(_ line: String) {
+    private func commitTranscriptLine(_ line: String, wrapsNext: Bool = false) {
         purgeExpiredTranscript()
         // Keep blank lines (they're real separators) but collapse runs.
         if line.isEmpty, transcriptLines.last?.isEmpty != false { return }
         let now = Date().timeIntervalSinceReferenceDate
         transcriptLines.append(line)
+        transcriptWraps.append(wrapsNext && !line.isEmpty)
         transcriptTimes.append(now)
         if transcriptLines.count > 10_000 {
             transcriptLines.removeFirst(2_000)
+            transcriptWraps.removeFirst(2_000)
             transcriptTimes.removeFirst(2_000)
             transcriptDropped += 2_000
         }
@@ -482,6 +716,9 @@ final class TerminalController: NSObject, LocalProcessTerminalViewDelegate, TabC
                                                     maxLines: 5_000)
         guard !lines.isEmpty else { return }
         transcriptLines = lines
+        // No wrap info survives the disk round-trip; restored lines just
+        // don't re-join into logical lines.
+        transcriptWraps = Array(repeating: false, count: lines.count)
         transcriptTimes = times
         commitTranscriptLine("─── earlier session · restored ───")
     }
@@ -496,6 +733,7 @@ final class TerminalController: NSObject, LocalProcessTerminalViewDelegate, TabC
         while n < transcriptTimes.count, transcriptTimes[n] < cutoff { n += 1 }
         guard n > 0 else { return }
         transcriptLines.removeFirst(n)
+        transcriptWraps.removeFirst(n)
         transcriptTimes.removeFirst(n)
         transcriptDropped += n
     }
@@ -700,6 +938,9 @@ final class TerminalController: NSObject, LocalProcessTerminalViewDelegate, TabC
         if let bin = TerminalCommandTools.binDirectory()?.path {
             vars["PATH"] = bin + ":" + (vars["PATH"] ?? "")
         }
+        // This session's identity, so an agent inside knows which session it
+        // is — `floaty peek`/`sessions` can then address "everyone but me".
+        vars["FLOATYTERM_SESSION_ID"] = sessionID
         let env = vars.map { "\($0.key)=\($0.value)" }
 
         // Determine start directory: honour the requested directory when it is a
