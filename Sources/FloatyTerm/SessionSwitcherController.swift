@@ -51,7 +51,20 @@ final class SessionSwitcherController: NSObject, NSTextFieldDelegate,
     // MARK: - Show / hide
 
     func toggle() {
-        if panel?.isVisible == true { dismiss() } else { show() }
+        guard let panel, panel.isVisible else { show(); return }
+        // The palette is dismissed by click-away (resign key), but a Space
+        // swipe or a move to another display resigns nothing — the palette
+        // stays open where it was summoned. From over there, a plain
+        // isVisible toggle would dismiss it invisibly and the user would see
+        // nothing happen. If it's not in front of the user (their screen is
+        // wherever the mouse is), re-summon it here instead.
+        let mouse = NSEvent.mouseLocation
+        let onUserScreen = panel.screen.map { NSMouseInRect(mouse, $0.frame, false) } ?? false
+        if panel.isOnActiveSpace && onUserScreen {
+            dismiss()
+        } else {
+            show()
+        }
     }
 
     func show() {
@@ -79,6 +92,18 @@ final class SessionSwitcherController: NSObject, NSTextFieldDelegate,
         panel?.orderOut(nil)
     }
 
+    /// The palette is a transient, per-summon affordance (like Spotlight):
+    /// leaving the Space it was summoned on dismisses it. Without this, a
+    /// still-open palette on the old Space keeps key focus (eating keystrokes)
+    /// and makes the next toggle a no-op from anywhere else.
+    @objc private func activeSpaceChanged() {
+        dismiss()
+    }
+
+    deinit {
+        NSWorkspace.shared.notificationCenter.removeObserver(self)
+    }
+
     // MARK: - NSWindowDelegate
 
     /// Clicking anywhere else dismisses the palette.
@@ -103,6 +128,10 @@ final class SessionSwitcherController: NSObject, NSTextFieldDelegate,
         p.isFloatingPanel = true
         p.isReleasedWhenClosed = false
         p.delegate = self
+
+        NSWorkspace.shared.notificationCenter.addObserver(
+            self, selector: #selector(activeSpaceChanged),
+            name: NSWorkspace.activeSpaceDidChangeNotification, object: nil)
 
         let blur = NSVisualEffectView(frame: size)
         blur.material = .hudWindow

@@ -7,6 +7,19 @@ import AppKit
 ///
 /// Lifecycle (delegate, close, move) is handled by `TerminalWindowController`,
 /// which owns the panel.
+private extension NSView {
+    /// Walks up the view hierarchy to the FloatyTerminalView a hit-test
+    /// landed in (the hit may be a subview, e.g. the caret view).
+    func enclosingTerminalView() -> FloatyTerminalView? {
+        var v: NSView? = self
+        while let current = v {
+            if let terminal = current as? FloatyTerminalView { return terminal }
+            v = current.superview
+        }
+        return nil
+    }
+}
+
 final class FloatingPanel: NSPanel {
 
     init(contentRect: NSRect) {
@@ -18,9 +31,15 @@ final class FloatingPanel: NSPanel {
         )
     }
 
+    /// While true (Agent Ghost mode), the panel refuses key status — so a
+    /// synthetic click that lands on it can't steal the text cursor from the app
+    /// the agent is driving. Paired with `ignoresMouseEvents` (clicks pass
+    /// through) in `TerminalWindowController.setAgentGhost`.
+    var blocksKey = false
+
     // Allow the panel to receive keyboard focus when the user clicks into it,
-    // so they can actually type in the terminal.
-    override var canBecomeKey: Bool { true }
+    // so they can actually type in the terminal — unless agent-ghosted.
+    override var canBecomeKey: Bool { !blocksKey }
     override var canBecomeMain: Bool { false }
 
     /// When true, this window is "linked"/pinned to a single Space: it drops
@@ -38,6 +57,38 @@ final class FloatingPanel: NSPanel {
     override func performKeyEquivalent(with event: NSEvent) -> Bool {
         if keyCommandHandler?(event) == true { return true }
         return super.performKeyEquivalent(with: event)
+    }
+
+    // MARK: - ⌥-mouse gesture relay
+
+    /// The terminal view an ⌥-mouse-down landed on, tracked until its mouse-up.
+    /// SwiftTerm's mouse handlers aren't `open`, so FloatyTerminalView can't
+    /// override them — the window relays the gesture around the dispatch
+    /// instead: optionMouseDown fires BEFORE the event reaches the view,
+    /// optionMouseUp AFTER it has been fully processed.
+    private weak var optionGestureView: FloatyTerminalView?
+
+    override func sendEvent(_ event: NSEvent) {
+        switch event.type {
+        case .leftMouseDown:
+            optionGestureView = nil
+            if event.modifierFlags.contains(.option),
+               let hit = contentView?.hitTest(event.locationInWindow),
+               let terminal = hit.enclosingTerminalView() {
+                optionGestureView = terminal
+                terminal.optionMouseDown(event)
+            }
+            super.sendEvent(event)
+        case .leftMouseDragged:
+            optionGestureView?.optionMouseDragged()
+            super.sendEvent(event)
+        case .leftMouseUp:
+            super.sendEvent(event)
+            optionGestureView?.optionMouseUp()
+            optionGestureView = nil
+        default:
+            super.sendEvent(event)
+        }
     }
 
     func setupFloatingBehavior() {
@@ -105,8 +156,10 @@ final class FloatingPanel: NSPanel {
         // Only grab key focus if we actually landed on the active Space. A
         // pinned window being revealed onto a DIFFERENT Space must not makeKey,
         // or it would yank the user across Spaces. Roaming windows join all
-        // Spaces, so isOnActiveSpace is true for them.
-        if isOnActiveSpace { makeKey() }
+        // Spaces, so isOnActiveSpace is true for them. And never grab key while
+        // agent-ghosted (`blocksKey`) — a stray show path must not steal focus
+        // back from the app the agent is driving.
+        if isOnActiveSpace && !blocksKey { makeKey() }
     }
 
     // MARK: - Legacy frame restore (migration fallback)

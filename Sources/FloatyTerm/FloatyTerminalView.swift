@@ -2,7 +2,7 @@ import AppKit
 import SwiftTerm
 
 /// A terminal view that adds the standard macOS clipboard shortcuts, file-drop
-/// support, and a right-click context menu.
+/// support, a right-click context menu, and ⌘-click link/path routing.
 ///
 /// Because FloatyTerm is a menu-less accessory app, the system doesn't route
 /// ⌘C/⌘V/⌘A to the terminal automatically (there's no Edit menu to carry the
@@ -17,11 +17,47 @@ final class FloatyTerminalView: LocalProcessTerminalView {
     override init(frame: NSRect) {
         super.init(frame: frame)
         registerDragTypes()
+        installLinkInterceptor()
     }
 
     required init?(coder: NSCoder) {
         super.init(coder: coder)
         registerDragTypes()
+        installLinkInterceptor()
+    }
+
+    // MARK: - ⌘-click link interception
+
+    /// Wired by TerminalController: receives the link/path string when the
+    /// user ⌘-clicks a detected link (explicit OSC 8 or SwiftTerm's implicit
+    /// URL/filesystem-path detection). When nil, SwiftTerm's default handling
+    /// applies (NSWorkspace.open — fine for https, a silent no-op for bare
+    /// paths).
+    var onOpenLink: ((String, [String: String]) -> Void)?
+
+    /// Strong reference — `terminalDelegate` is weak.
+    private var linkInterceptor: LinkInterceptingDelegate?
+
+    /// `requestOpenLink` lives in a TerminalViewDelegate protocol *extension*,
+    /// and LocalProcessTerminalView (which is its own terminalDelegate) never
+    /// declares it — so a subclass override here would never dispatch: the
+    /// conformance witness is statically bound to the extension default.
+    /// Instead we splice a forwarding proxy in front of the delegate chain:
+    /// every callback passes through to the view's own implementation (pty
+    /// writes, resize, title…), only requestOpenLink is redirected.
+    private func installLinkInterceptor() {
+        let proxy = LinkInterceptingDelegate()
+        proxy.inner = terminalDelegate
+        proxy.onOpenLink = { [weak self] link, params in
+            guard let self else { return }
+            if let handler = self.onOpenLink {
+                handler(link, params)
+            } else if let url = URL(string: link) {
+                NSWorkspace.shared.open(url)   // SwiftTerm's default behavior
+            }
+        }
+        terminalDelegate = proxy
+        linkInterceptor = proxy
     }
 
     // MARK: - Output hook
@@ -34,6 +70,40 @@ final class FloatyTerminalView: LocalProcessTerminalView {
     override func dataReceived(slice: ArraySlice<UInt8>) {
         super.dataReceived(slice: slice)
         onOutput?(slice)
+    }
+
+    // MARK: - Live-resize freeze
+    //
+    // SwiftTerm's setFrameSize resizes the terminal grid on EVERY frame of a
+    // live window drag: each pass reflows the whole scrollback (splitting and
+    // merging wrapped rows) and SIGWINCHes the pty, so a TUI like Claude Code
+    // re-renders at every intermediate width. The intermediate renders are
+    // committed into the scrollback and the repeated reflows scramble them —
+    // permanent visual garbage in both the terminal and the transcript.
+    //
+    // Freeze the grid while the drag is in flight: swallow intermediate
+    // sizes and apply only the final one when the drag ends. One reflow,
+    // one SIGWINCH, one TUI re-render per drag.
+
+    /// The most recent size requested during a live resize; applied once the
+    /// drag ends.
+    private var liveResizeDeferredSize: NSSize?
+
+    override func setFrameSize(_ newSize: NSSize) {
+        if window?.inLiveResize == true, newSize != frame.size {
+            liveResizeDeferredSize = newSize
+            return
+        }
+        liveResizeDeferredSize = nil
+        super.setFrameSize(newSize)
+    }
+
+    override func viewDidEndLiveResize() {
+        super.viewDidEndLiveResize()
+        if let size = liveResizeDeferredSize {
+            liveResizeDeferredSize = nil
+            super.setFrameSize(size)
+        }
     }
 
     // MARK: - Window-drag guard
@@ -67,10 +137,110 @@ final class FloatyTerminalView: LocalProcessTerminalView {
         scroll(toPosition: 0.0)
     }
 
-    // MARK: - Key equivalents (⌘C/V/A/Z)
+    // MARK: - ⌥-mouse: talk to the terminal, not the app inside it
+    //
+    // Two gestures share the ⌥ modifier, split by who currently owns the
+    // mouse:
+    //  • A TUI has enabled mouse reporting (vim, tmux…): ⌥-drag bypasses the
+    //    reporting for the duration of the gesture so local text selection
+    //    works again — otherwise every drag is swallowed by the app and
+    //    selecting text is impossible.
+    //  • No mouse reporting (shell prompt): ⌥-click moves the shell's cursor
+    //    to the clicked column by synthesizing ←/→ arrow keys — the line
+    //    editor does the actual moving, so this can't corrupt anything.
+    //
+    // SwiftTerm's mouseDown/Dragged/Up are `public` but not `open`, so these
+    // can't be overridden here. FloatingPanel.sendEvent calls the three hooks
+    // below instead: optionMouseDown BEFORE the event dispatches (so the
+    // reporting bypass is in place when SwiftTerm sees the click) and
+    // optionMouseUp AFTER (so the TUI never receives a stray button-release
+    // and the click has fully resolved before the cursor moves).
+
+    /// True while an ⌥-initiated gesture has `allowMouseReporting` forced off;
+    /// restored on mouse-up.
+    private var optionGestureBypassedReporting = false
+
+    /// The mouse-down point of a candidate ⌥-click cursor move; cancelled if
+    /// the gesture turns into a drag (which means selection, not a jump).
+    private var optionClickPending: NSPoint?
+
+    /// Pre-dispatch hook for an ⌥-mouse-down inside this view.
+    func optionMouseDown(_ event: NSEvent) {
+        if getTerminal().mouseMode != .off, allowMouseReporting {
+            allowMouseReporting = false
+            optionGestureBypassedReporting = true
+        } else if event.clickCount == 1 {
+            optionClickPending = convert(event.locationInWindow, from: nil)
+        }
+    }
+
+    /// Called for any drag while the ⌥-gesture is in flight.
+    func optionMouseDragged() {
+        optionClickPending = nil
+    }
+
+    /// Post-dispatch hook for the mouse-up ending the ⌥-gesture.
+    func optionMouseUp() {
+        if optionGestureBypassedReporting {
+            allowMouseReporting = true
+            optionGestureBypassedReporting = false
+        }
+        if let point = optionClickPending {
+            optionClickPending = nil
+            moveShellCursor(toward: point)
+        }
+    }
+
+    /// Sends the arrow presses that walk the shell cursor to the clicked
+    /// column. Constraints keep it safe: mouse reporting must be off, the
+    /// viewport must be at the live screen (in scrollback the clicked row
+    /// can't be compared against the cursor's), and the click must land on
+    /// the cursor's own visual row — arrows aimed at other rows are how you
+    /// accidentally walk through shell history.
+    private func moveShellCursor(toward point: NSPoint) {
+        let terminal = getTerminal()
+        guard terminal.mouseMode == .off else { return }
+        guard !(canScroll && scrollPosition < 1.0) else { return }
+        let rows = terminal.rows, cols = terminal.cols
+        guard rows > 0, cols > 0 else { return }
+
+        // Cell geometry: height is exact from the optimal frame (cellH × rows);
+        // width replicates SwiftTerm's own metric ("W" glyph advance) via
+        // CoreText. calculateMouseHit is internal, so this mirrors its math.
+        let cellHeight = getOptimalFrameSize().height / CGFloat(rows)
+        let ctFont = font as CTFont
+        var wChar: [UniChar] = [UniChar(87)]  // "W"
+        var wGlyph: [CGGlyph] = [0]
+        CTFontGetGlyphsForCharacters(ctFont, &wChar, &wGlyph, 1)
+        var advance = CGSize.zero
+        CTFontGetAdvancesForGlyphs(ctFont, .horizontal, wGlyph, &advance, 1)
+        let cellWidth = advance.width
+        guard cellWidth > 0, cellHeight > 0 else { return }
+
+        let row = Int((frame.height - point.y) / cellHeight)
+        let col = max(0, min(cols - 1, Int(point.x / cellWidth)))
+        guard row == terminal.buffer.y else { return }
+        let delta = col - terminal.buffer.x
+        guard delta != 0 else { return }
+
+        let arrow = terminal.applicationCursor
+            ? (delta > 0 ? "\u{1B}OC" : "\u{1B}OD")
+            : (delta > 0 ? "\u{1B}[C" : "\u{1B}[D")
+        send(txt: String(repeating: arrow, count: abs(delta)))
+    }
+
+    // MARK: - Key equivalents (⌘C/V/A/Z, ⌥⌘⌫)
 
     override func performKeyEquivalent(with event: NSEvent) -> Bool {
         let flags = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
+        // ⌥⌘⌫ — clear scrollback (also in the right-click menu). Contextual:
+        // when a selection is active, the window's selection monitor consumes
+        // this combo first to dismiss the highlight, so it only lands here —
+        // and clears scrollback — when nothing is selected.
+        if event.type == .keyDown, flags == [.command, .option], event.keyCode == 51 {
+            clearScrollback(nil)
+            return true
+        }
         guard event.type == .keyDown, flags == .command else {
             return super.performKeyEquivalent(with: event)
         }
@@ -230,6 +400,16 @@ final class FloatyTerminalView: LocalProcessTerminalView {
         )
         clearItem.target = self
 
+        // Clear Scrollback — visual only; the transcript keeps its history.
+        let clearSBItem = menu.addItem(
+            withTitle: "Clear Scrollback",
+            action: #selector(clearScrollback(_:)),
+            keyEquivalent: "\u{08}"
+        )
+        clearSBItem.keyEquivalentModifierMask = [.command, .option]
+        clearSBItem.target = self
+        clearSBItem.isEnabled = canScroll
+
         // Scroll to Bottom — only useful when the user has scrolled up.
         let scrollBottomItem = menu.addItem(
             withTitle: "Scroll to Bottom",
@@ -305,6 +485,17 @@ final class FloatyTerminalView: LocalProcessTerminalView {
     /// Sends Ctrl-L to the shell, which triggers the `clear` built-in in most shells.
     @objc private func clearTerminal(_ sender: Any?) {
         send([0x0C]) // Ctrl-L
+    }
+
+    /// Erases the scrollback buffer (CSI 3 J, fed straight to the view — the
+    /// pty never sees it). Purely visual: the transcript mirror and tunnel
+    /// history are fed from pty output, so the session record is untouched.
+    @objc private func clearScrollback(_ sender: Any?) {
+        feed(text: "\u{1B}[3J")
+        // CSI 3 J trims the buffer without marking anything dirty; normalize
+        // the viewport and force a repaint so the change shows immediately.
+        scrollToBottom()
+        setNeedsDisplay(bounds)
     }
 
     /// Action wrapper so the menu item can target `self` with a selector.
@@ -402,5 +593,53 @@ final class FloatyTerminalView: LocalProcessTerminalView {
         // Replace each ' with '\'' then wrap the whole thing in outer quotes.
         let escaped = s.replacingOccurrences(of: "'", with: "'\\''")
         return "'\(escaped)'"
+    }
+}
+
+/// Forwards every TerminalViewDelegate callback to the terminal view's own
+/// implementation — LocalProcessTerminalView is its own delegate and its
+/// implementations feed the pty (send), track resizes, titles, cwd, etc. —
+/// except `requestOpenLink`, which is redirected to `onOpenLink`.
+///
+/// `inner` is weak (it's the view itself; the view strongly retains this
+/// proxy), so there is no retain cycle.
+private final class LinkInterceptingDelegate: TerminalViewDelegate {
+    weak var inner: TerminalViewDelegate?
+    var onOpenLink: ((String, [String: String]) -> Void)?
+
+    func requestOpenLink(source: TerminalView, link: String, params: [String: String]) {
+        if let onOpenLink {
+            onOpenLink(link, params)
+        } else {
+            inner?.requestOpenLink(source: source, link: link, params: params)
+        }
+    }
+
+    func sizeChanged(source: TerminalView, newCols: Int, newRows: Int) {
+        inner?.sizeChanged(source: source, newCols: newCols, newRows: newRows)
+    }
+    func setTerminalTitle(source: TerminalView, title: String) {
+        inner?.setTerminalTitle(source: source, title: title)
+    }
+    func hostCurrentDirectoryUpdate(source: TerminalView, directory: String?) {
+        inner?.hostCurrentDirectoryUpdate(source: source, directory: directory)
+    }
+    func send(source: TerminalView, data: ArraySlice<UInt8>) {
+        inner?.send(source: source, data: data)
+    }
+    func scrolled(source: TerminalView, position: Double) {
+        inner?.scrolled(source: source, position: position)
+    }
+    func bell(source: TerminalView) {
+        inner?.bell(source: source)
+    }
+    func clipboardCopy(source: TerminalView, content: Data) {
+        inner?.clipboardCopy(source: source, content: content)
+    }
+    func iTermContent(source: TerminalView, content: ArraySlice<UInt8>) {
+        inner?.iTermContent(source: source, content: content)
+    }
+    func rangeChanged(source: TerminalView, startY: Int, endY: Int) {
+        inner?.rangeChanged(source: source, startY: startY, endY: endY)
     }
 }

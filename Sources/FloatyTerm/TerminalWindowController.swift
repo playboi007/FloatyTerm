@@ -35,6 +35,20 @@ final class TerminalWindowController: NSObject, NSWindowDelegate {
     /// summoning the session (the window itself can't be clicked).
     private(set) var isGhosted = false
 
+    /// True while this window is in AGENT GHOST mode: click-through AND non-key
+    /// (so synthetic input passes to the app being driven and the floating panel
+    /// can't steal the text cursor back), but STILL fully visible — unlike
+    /// `isGhosted`, it stays readable so the user watches the agent work. Exited
+    /// via the floating unlock badge, the `floaty host` route, or auto-surfaced
+    /// when the agent stops for user input.
+    private(set) var isAgentGhosted = false
+    private var unlockBadge: AgentGhostBadge?
+    private var wasPinnedBeforeGhost = false
+    /// spaceChangeCount when Agent Ghost unpinned the window — release
+    /// compares it to detect that the pin is re-attaching on a different
+    /// Space than the one it left (Space identity itself isn't addressable).
+    private var spaceCountAtGhostStart = 0
+
     /// Per-window opacity override (0.1–1.0) set from the double-click header
     /// overlay. When non-nil it wins over the global focused/unfocused-dim
     /// settings for this window. Session-scoped (not persisted).
@@ -48,6 +62,15 @@ final class TerminalWindowController: NSObject, NSWindowDelegate {
     private var avatar: AvatarPanel?
     private var collapsedSnapshot: NSImage?
     private var savedFrameForExpand: NSRect = .zero
+    /// Serial number of the latest collapse/expand hero morph. An expand that
+    /// lands while a collapse morph is still animating bumps it, so the stale
+    /// morph's completion (which would resurrect the bubble over an
+    /// already-expanded window) checks it and bails.
+    private var morphGeneration = 0
+    /// Bumped on every active-Space change; captured when a collapse starts so
+    /// the deferred re-pin can tell whether the user swiped away mid-morph
+    /// (pinning then would bind the bubble to the WRONG Space).
+    private var spaceChangeCount = 0
     /// Where the cursor sat WITHIN the window when it collapsed (offset from the
     /// window's bottom-left origin). On expand we place the window so this same
     /// point — the collapse icon — returns to the bubble, preserving spatial
@@ -185,6 +208,12 @@ final class TerminalWindowController: NSObject, NSWindowDelegate {
         for v in [topBlur, contentBlur, contentArea, header, tabStrip] {
             v.translatesAutoresizingMaskIntoConstraints = false
         }
+        // Terminal views freeze their grid during a live window resize
+        // (FloatyTerminalView.setFrameSize), so mid-drag the terminal can be
+        // momentarily larger than the shrinking content area — clip it rather
+        // than let it paint over the header chrome.
+        contentArea.wantsLayer = true
+        contentArea.layer?.masksToBounds = true
         root.addSubview(contentBlur)
         root.addSubview(contentArea)
         root.addSubview(topBlur)
@@ -264,6 +293,10 @@ final class TerminalWindowController: NSObject, NSWindowDelegate {
             self, selector: #selector(frontAppChanged(_:)),
             name: NSWorkspace.didActivateApplicationNotification, object: nil
         )
+        NSWorkspace.shared.notificationCenter.addObserver(
+            self, selector: #selector(screensDidWake),
+            name: NSWorkspace.screensDidWakeNotification, object: nil
+        )
 
         setupFindBar()
         setupRecentPalette()
@@ -290,29 +323,48 @@ final class TerminalWindowController: NSObject, NSWindowDelegate {
         NSWorkspace.shared.notificationCenter.removeObserver(self)
     }
 
-    /// Active Space changed: if this window is pinned and now belongs to the
-    /// active Space, nudge the compositor to re-display it (fixes the temporary
-    /// disappearance after several fullscreen-Space swipes). The second, delayed
-    /// pass catches cases where the window server is still re-attaching the
-    /// auxiliary window when the notification fires.
+    /// Active Space changed: re-assert the live representative's floating
+    /// flags, and if this window is pinned and now belongs to the active
+    /// Space, nudge the compositor to re-display it (fixes the temporary
+    /// disappearance after several fullscreen-Space swipes). The second,
+    /// delayed pass catches cases where the window server is still
+    /// re-attaching the auxiliary window when the notification fires.
     @objc private func activeSpaceChanged() {
-        reassertIfPinnedOnActiveSpace()
+        spaceChangeCount += 1
+        reassertOnSpaceChange()
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) { [weak self] in
-            self?.reassertIfPinnedOnActiveSpace()
+            self?.reassertOnSpaceChange()
         }
     }
 
-    private func reassertIfPinnedOnActiveSpace() {
-        guard panel.isPinned else { return }
-        // When collapsed/tickered, the pinned bubble or strip (not the panel)
-        // is what's on screen; nudge whichever one is live so it doesn't drop
-        // out during swipes.
+    /// Display woke: the window server is prone to silently dropping
+    /// level / canJoinAllSpaces across sleep. show()/presentOverlay() repair
+    /// that on the next explicit reveal, but a window that just STAYS visible
+    /// (or a bubble/ticker) never gets one — so repair here, after a beat for
+    /// the server to settle.
+    @objc private func screensDidWake() {
+        reassertOnSpaceChange()
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { [weak self] in
+            self?.reassertOnSpaceChange()
+        }
+    }
+
+    private func reassertOnSpaceChange() {
+        // Re-assert flags on whatever representative is live — for roaming
+        // windows too, not just pinned ones: a continuously-visible window has
+        // no show() call to repair a silently-degraded canJoinAllSpaces, and
+        // once degraded it stops following the user across Spaces.
+        // The orderFront nudge stays pinned-only (its original purpose:
+        // pinned fullScreenAuxiliary windows dropping out during swipes).
         if isCollapsed, let av = avatar {
-            if av.isOnActiveSpace { av.orderFrontRegardless() }
+            av.reassertFloatingBehavior()
+            if panel.isPinned, av.isOnActiveSpace { av.orderFrontRegardless() }
         } else if isTicker, let t = ticker {
-            if t.isOnActiveSpace { t.orderFrontRegardless() }
-        } else if panel.isVisible, panel.isOnActiveSpace {
-            panel.orderFrontRegardless()
+            t.reassertFloatingBehavior()
+            if panel.isPinned, t.isOnActiveSpace { t.orderFrontRegardless() }
+        } else if panel.isVisible {
+            panel.reassertFloatingBehavior()
+            if panel.isPinned, panel.isOnActiveSpace { panel.orderFrontRegardless() }
         }
     }
 
@@ -443,7 +495,7 @@ final class TerminalWindowController: NSObject, NSWindowDelegate {
     /// Morphs this window into a small floating avatar bubble (hero transition).
     /// The session stays alive; double-clicking the bubble expands it back.
     func collapseToAvatar() {
-        guard !isCollapsed else { return }
+        guard !isCollapsed, !isTicker else { return }
         closeReaderIfNeeded()
         let termFrame = panel.frame
         let snapshot = HeroTransition.snapshot(of: root) ?? NSImage(size: termFrame.size)
@@ -452,27 +504,43 @@ final class TerminalWindowController: NSObject, NSWindowDelegate {
 
         // Bubble lands at the mouse cursor (where the collapse icon was clicked),
         // clamped on-screen — so the window appears to implode toward the click.
+        // A programmatic collapse (background task) can fire with the mouse on
+        // ANOTHER screen; anchoring there would strand the bubble far from the
+        // window, so fall back to the window's own collapse-control corner.
         let d = AvatarPanel.diameter
         let mouse = NSEvent.mouseLocation
-        // Remember the cursor's position within the window (the collapse icon)
+        let windowScreen = NSScreen.screens.first { $0.frame.intersects(termFrame) }
+        let mouseOnWindowScreen = windowScreen.map {
+            NSMouseInRect(mouse, $0.frame, false)
+        } ?? true
+        let anchor = mouseOnWindowScreen
+            ? mouse
+            : NSPoint(x: termFrame.maxX - 40, y: termFrame.maxY - 20)
+        // Remember the anchor's position within the window (the collapse icon)
         // so expand can return that exact point to the bubble.
-        collapseCursorOffset = NSPoint(x: mouse.x - termFrame.minX,
-                                       y: mouse.y - termFrame.minY)
+        collapseCursorOffset = NSPoint(x: anchor.x - termFrame.minX,
+                                       y: anchor.y - termFrame.minY)
         let avatarFrame = panel.clampToVisibleScreen(
-            NSRect(x: mouse.x - d / 2, y: mouse.y - d / 2, width: d, height: d))
+            NSRect(x: anchor.x - d / 2, y: anchor.y - d / 2, width: d, height: d))
 
         isCollapsed = true
         panel.orderOut(nil)
         updateViewedFlags()
 
+        morphGeneration += 1
+        let gen = morphGeneration
+        let spaceCount = spaceChangeCount
         HeroTransition.morph(snapshot: snapshot, from: termFrame, to: avatarFrame,
                              startRadius: 8, endRadius: d / 2, fadeToGlyph: true,
                              style: avatarStyle) { [weak self] in
-            self?.showAvatar(at: avatarFrame)
+            // A summon can expand the window while this morph is animating;
+            // showing the bubble then would orphan it over the expanded window.
+            guard let self, self.morphGeneration == gen, self.isCollapsed else { return }
+            self.showAvatar(at: avatarFrame, spaceCountAtCollapse: spaceCount)
         }
     }
 
-    private func showAvatar(at frame: NSRect) {
+    private func showAvatar(at frame: NSRect, spaceCountAtCollapse: Int) {
         let av = avatar ?? AvatarPanel()
         avatar = av
         av.sharingType = Settings.shared.hideFromScreenCapture ? .none : .readOnly
@@ -487,13 +555,41 @@ final class TerminalWindowController: NSObject, NSWindowDelegate {
         // Bring the bubble up as ROAMING first so it attaches to the CURRENT
         // Space — including another app's fullscreen Space. A brand-new managed
         // window ordered onto a foreign fullscreen Space won't attach (it lands
-        // on the desktop). So for a linked window we pin on the next runloop
-        // tick, once the bubble is actually displayed here — mirroring how the
-        // window itself got pinned (it was already shown on this Space).
+        // on the desktop). For a linked window, re-pin only once the server
+        // has verifiably attached it here.
         av.setPinned(false)
         av.orderFrontRegardless()
         if panel.isPinned {
-            DispatchQueue.main.async { [weak av] in av?.setPinned(true) }
+            pinOnceAttached(av, spaceCountAtCollapse: spaceCountAtCollapse) {
+                [weak av] in av?.setPinned($0)
+            }
+        }
+    }
+
+    /// Pins a collapsed representative (bubble / ticker strip) to the Space
+    /// it is displayed on — but only after the window server has actually
+    /// attached it there. Pinning on the next runloop tick (the old approach)
+    /// raced that attachment: when the pin won, the brand-new `.managed`
+    /// window was re-parented to the desktop Space and vanished from the
+    /// fullscreen Space the user was looking at. The delay mirrors the ~0.15s
+    /// server latency the activeSpaceChanged double-pass already accounts
+    /// for. If the user swiped Spaces since the collapse began, pinning now
+    /// would bind the bubble to the WRONG Space — leave it roaming instead
+    /// (visible-but-roaming beats bound-and-lost).
+    private func pinOnceAttached(_ rep: NSPanel, spaceCountAtCollapse: Int,
+                                 attempt: Int = 0,
+                                 setPinned: @escaping (Bool) -> Void) {
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.18) { [weak self, weak rep] in
+            guard let self, let rep, rep.isVisible, self.panel.isPinned,
+                  self.spaceChangeCount == spaceCountAtCollapse else { return }
+            if rep.isOnActiveSpace {
+                setPinned(true)
+            } else if attempt == 0 {
+                // Server still attaching — nudge and try once more.
+                rep.orderFrontRegardless()
+                self.pinOnceAttached(rep, spaceCountAtCollapse: spaceCountAtCollapse,
+                                     attempt: 1, setPinned: setPinned)
+            }
         }
     }
 
@@ -503,7 +599,27 @@ final class TerminalWindowController: NSObject, NSWindowDelegate {
     ///   pinned bubble from another Space lands at the summon grid point
     ///   instead of wherever the off-Space bubble happened to sit).
     func expandFromAvatar(to overrideTarget: NSRect? = nil) {
-        guard isCollapsed, let av = avatar else { return }
+        guard isCollapsed else { return }
+        morphGeneration += 1
+        let gen = morphGeneration
+
+        guard let av = avatar, av.isVisible else {
+            // The collapse morph is still animating (no bubble on screen yet),
+            // or the bubble is stale from an earlier cycle. Cancel the pending
+            // collapse — the bumped generation makes its completion a no-op —
+            // and bring the panel straight back. Without this, a summon during
+            // the 0.34s morph either did nothing (first collapse: avatar nil)
+            // or expanded from the stale bubble's old frame while the morph
+            // completion resurrected an orphaned bubble on top.
+            isCollapsed = false
+            let target = panel.clampToVisibleScreen(overrideTarget ?? savedFrameForExpand)
+            panel.setFrame(target, display: false)
+            panel.presentOverlay()
+            focusActiveTab()
+            updateViewedFlags()
+            return
+        }
+
         let avatarFrame = av.frame
         let size = savedFrameForExpand.size
         // Place the window so the collapse-icon point (where the cursor was) lands
@@ -520,7 +636,7 @@ final class TerminalWindowController: NSObject, NSWindowDelegate {
         HeroTransition.morph(snapshot: image, from: avatarFrame, to: target,
                              startRadius: d / 2, endRadius: 8, fadeToGlyph: false,
                              style: avatarStyle) { [weak self] in
-            guard let self else { return }
+            guard let self, self.morphGeneration == gen else { return }
             self.isCollapsed = false
             self.panel.setFrame(target, display: false)
             self.panel.presentOverlay()
@@ -540,6 +656,66 @@ final class TerminalWindowController: NSObject, NSWindowDelegate {
         panel.ignoresMouseEvents = on
         panel.alphaValue = on ? CGFloat(max(0.1, Settings.shared.ghostOpacity)) : 1.0
         if !on { panel.presentOverlay() }
+    }
+
+    // MARK: - Agent Ghost mode (drive an app through the window)
+
+    /// Enter/leave AGENT GHOST: the panel becomes click-through (`ignoresMouseEvents`)
+    /// and refuses key status (`blocksKey`) so synthetic clicks/keystrokes pass to
+    /// the app the agent is driving and can't be stolen back by a stray hover —
+    /// the root-cause fix for "typing scattered / the field wouldn't focus". The
+    /// window stays fully visible; a floating unlock badge signals the state and
+    /// is the click-to-release escape hatch (the panel itself can't be clicked).
+    func setAgentGhost(_ on: Bool) {
+        guard on != isAgentGhosted else { return }
+        isAgentGhosted = on
+        panel.blocksKey = on
+        panel.ignoresMouseEvents = on
+        panel.alphaValue = 1.0                 // stay readable — the badge is the cue
+        if on {
+            // Unpin while ghosting: a Space-pinned (managed) window is bound to one
+            // Space and fights the agent's Space switches (raise / notification-style
+            // surfacing). Drop the pin for the duration; restore it on release.
+            wasPinnedBeforeGhost = panel.isPinned
+            spaceCountAtGhostStart = spaceChangeCount
+            if panel.isPinned {
+                panel.setPinned(false)
+                header.setPinned(false)
+            }
+            // Relinquish key focus NOW. `blocksKey` only stops the panel becoming
+            // key in future; a panel that's ALREADY key keeps eating keystrokes
+            // (you could still type into the terminal). Ordering a key window out
+            // resigns it; re-show without makeKey — `blocksKey` stops it re-grabbing
+            // — so it's visible but inert. (In the agent flow the next
+            // `type --target/--pid` would re-activate the target anyway; this makes
+            // ghost-on feel right immediately and for manual use.)
+            if panel.isKeyWindow {
+                panel.orderOut(nil)
+                panel.reassertFloatingBehavior()
+                panel.orderFrontRegardless()
+            }
+            let badge = unlockBadge ?? AgentGhostBadge()
+            unlockBadge = badge
+            badge.show(over: panel.frame)
+        } else {
+            unlockBadge?.hide()
+            if wasPinnedBeforeGhost {           // restore the pre-ghost Space pin
+                panel.setPinned(true)
+                header.setPinned(true)
+                // The pin re-attaches to whatever Space is active NOW. If the
+                // agent (or the user) changed Spaces during the ghost session,
+                // that's a different Space than the one it left — there's no
+                // API to rebind to the original, so tell the user the pin
+                // moved and refresh what it's now pinned over.
+                if spaceChangeCount != spaceCountAtGhostStart {
+                    pinnedAppName = NSWorkspace.shared.frontmostApplication?.localizedName
+                    let over = pinnedAppName.map { " (over \($0))" } ?? ""
+                    flashNotice("Space pin re-attached to this Space\(over)")
+                }
+            }
+            wasPinnedBeforeGhost = false
+            panel.presentOverlay()             // reclaim interactivity + key focus
+        }
     }
 
     // MARK: - Ticker mode (one-line live strip)
@@ -565,11 +741,14 @@ final class TerminalWindowController: NSObject, NSWindowDelegate {
                          width: min(TickerPanel.defaultWidth, f.width),
                          height: TickerPanel.height)
         t.setFrame(panel.clampToVisibleScreen(raw), display: false)
-        // Same Space dance as the avatar: attach roaming first, then re-pin.
+        // Same Space dance as the avatar: attach roaming first, then re-pin
+        // once the server has verifiably attached the strip here.
         t.setPinned(false)
         t.orderFrontRegardless()
         if panel.isPinned {
-            DispatchQueue.main.async { [weak t] in t?.setPinned(true) }
+            pinOnceAttached(t, spaceCountAtCollapse: spaceChangeCount) {
+                [weak t] in t?.setPinned($0)
+            }
         }
         refreshTicker()
     }
@@ -626,6 +805,18 @@ final class TerminalWindowController: NSObject, NSWindowDelegate {
         if panel.isVisible { return panel.isOnActiveSpace }
         return nil
     }
+
+    /// Frame of the on-screen collapsed representative (bubble or ticker
+    /// strip), if any — lets the summon path detect "the bubble sits on a
+    /// different screen than the user" and route the expand elsewhere.
+    var collapsedRepresentativeFrame: NSRect? {
+        if isCollapsed { return avatar?.frame }
+        if isTicker { return ticker?.frame }
+        return nil
+    }
+
+    /// The size the window will take when expanded from its bubble / ticker.
+    var expandedSize: NSSize { savedFrameForExpand.size }
 
     /// Toggles whether this window is linked to the current Space. When linked,
     /// it stays on that Space (with its session) instead of floating over all of
@@ -912,13 +1103,16 @@ final class TerminalWindowController: NSObject, NSWindowDelegate {
 
     private func applyAppearance(focused: Bool) {
         contentBlur.isHidden = !Settings.shared.backgroundBlur
+        // Agent Ghost is intentionally non-key while the agent drives "through"
+        // it, but must stay fully readable — so treat it as focused for dimming.
+        let effectiveFocused = focused || isAgentGhosted
         // A per-window override (from the header double-click overlay) wins over
         // the global focused/unfocused-dim settings for this window.
         let alpha: Double
         if let override = opacityOverride {
             alpha = override
         } else {
-            alpha = (Settings.shared.dimWhenUnfocused && !focused)
+            alpha = (Settings.shared.dimWhenUnfocused && !effectiveFocused)
                 ? Settings.shared.unfocusedOpacity
                 : Settings.shared.focusedOpacity
         }
@@ -951,6 +1145,7 @@ final class TerminalWindowController: NSObject, NSWindowDelegate {
             self.applyAppearance(focused: self.panel.isKeyWindow)
         }
         vc.onGhost = { [weak self] in self?.setGhosted(true) }
+        vc.onAgentGhost = { [weak self] in self?.setAgentGhost(true) }
 
         let popover = NSPopover()
         popover.contentViewController = vc
@@ -1021,15 +1216,9 @@ final class TerminalWindowController: NSObject, NSWindowDelegate {
         // One-time resource notice.
         showBrowserResourceNoticeIfNeeded()
 
-        let tab = BrowserController(initialURL: initialURL)
-        tab.onTitleChanged = { [weak self] in
-            self?.refreshTabStrip()
-            self?.syncURLBar()
-        }
-        // Fires on URL / canGoBack / canGoForward changes — title KVO alone
-        // misses same-title navigations and back/forward state flips.
-        tab.onNavChanged = { [weak self] in self?.syncURLBar() }
-        insertTab(tab)
+        // Title/nav → URL-bar wiring happens in insertTab, which is the single
+        // entry for every browser tab (incl. ⌘-click child tabs from terminals).
+        insertTab(BrowserController(initialURL: initialURL))
     }
 
     /// Wires the baseline title callback (refresh the strip on rename) and
@@ -1119,6 +1308,13 @@ final class TerminalWindowController: NSObject, NSWindowDelegate {
         // for tabs joining a window (new, restored, AND adopted from another
         // window), so the chip always reports to the current host.
         if let bc = tab as? BrowserController {
+            bc.onTitleChanged = { [weak self] in
+                self?.refreshTabStrip()
+                self?.syncURLBar()
+            }
+            // Fires on URL / canGoBack / canGoForward changes — title KVO
+            // alone misses same-title navigations and back/forward flips.
+            bc.onNavChanged = { [weak self] in self?.syncURLBar() }
             bc.onSelectionChanged = { [weak self, weak bc] sel in
                 guard let self, let bc else { return }
                 self.browserSelectionChanged(bc, sel)
@@ -1422,6 +1618,51 @@ final class TerminalWindowController: NSObject, NSWindowDelegate {
         ring.layer?.add(pulse, forKey: "pulse")
         DispatchQueue.main.asyncAfter(deadline: .now() + 1.25) {
             ring.removeFromSuperview()
+        }
+    }
+
+    /// Shows a short-lived HUD pill at the top of the window — a passing
+    /// state notice ("Space pin re-attached to this Space"), quieter than an
+    /// alert, more legible than the attention ring.
+    func flashNotice(_ text: String) {
+        guard let root = panel.contentView else { return }
+        let label = NSTextField(labelWithString: text)
+        label.font = .systemFont(ofSize: 11, weight: .medium)
+        label.textColor = NSColor.white.withAlphaComponent(0.92)
+        label.translatesAutoresizingMaskIntoConstraints = false
+
+        let pill = NSVisualEffectView()
+        pill.material = .hudWindow
+        pill.blendingMode = .withinWindow
+        pill.state = .active
+        pill.wantsLayer = true
+        pill.layer?.cornerRadius = 11
+        pill.layer?.masksToBounds = true
+        pill.layer?.borderWidth = 1
+        pill.layer?.borderColor = NSColor.white.withAlphaComponent(0.14).cgColor
+        pill.translatesAutoresizingMaskIntoConstraints = false
+        pill.addSubview(label)
+        root.addSubview(pill)
+
+        NSLayoutConstraint.activate([
+            label.topAnchor.constraint(equalTo: pill.topAnchor, constant: 4),
+            label.bottomAnchor.constraint(equalTo: pill.bottomAnchor, constant: -4),
+            label.leadingAnchor.constraint(equalTo: pill.leadingAnchor, constant: 12),
+            label.trailingAnchor.constraint(equalTo: pill.trailingAnchor, constant: -12),
+            pill.centerXAnchor.constraint(equalTo: root.centerXAnchor),
+            pill.topAnchor.constraint(equalTo: root.topAnchor, constant: 44)
+        ])
+
+        pill.alphaValue = 0
+        NSAnimationContext.runAnimationGroup { ctx in
+            ctx.duration = 0.2
+            pill.animator().alphaValue = 1
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 2.6) {
+            NSAnimationContext.runAnimationGroup({ ctx in
+                ctx.duration = 0.35
+                pill.animator().alphaValue = 0
+            }, completionHandler: { pill.removeFromSuperview() })
         }
     }
 
@@ -1835,20 +2076,43 @@ final class TerminalWindowController: NSObject, NSWindowDelegate {
     /// SwiftTerm's mouse handlers aren't `open`, so selection is detected via
     /// a local event monitor: mouse-up over the active terminal with a live
     /// selection shows the bar; mouse-down anywhere else dismisses it.
+    /// Key events ride the same monitor: backspace (or ⌥⌘⌫) while the focused
+    /// terminal has a selection dismisses it — and is swallowed, so the
+    /// shell/TUI never sees that keypress.
     private var mouseMonitor: Any?
 
     private func installSelectionMonitor() {
         mouseMonitor = NSEvent.addLocalMonitorForEvents(
-            matching: [.leftMouseDown, .leftMouseUp]
+            matching: [.leftMouseDown, .leftMouseUp, .keyDown]
         ) { [weak self] event in
-            self?.handleSelectionMouse(event)
+            guard let self, event.window === self.panel else { return event }
+            if event.type == .keyDown {
+                return self.handleSelectionKey(event)
+            }
+            self.handleSelectionMouse(event)
             return event
         }
     }
 
-    private func handleSelectionMouse(_ event: NSEvent) {
-        guard event.window === panel else { return }
+    /// Backspace with an active selection dismisses the highlight instead of
+    /// reaching the shell — the keypress is consumed (returns nil); the next
+    /// backspace types normally. ⌥⌘⌫ gets the same treatment here so its
+    /// clear-scrollback meaning (handled by the terminal view) only fires
+    /// when no selection is up. Only intercepts when the terminal itself has
+    /// focus, so backspace in the find bar or URL bar is never touched.
+    private func handleSelectionKey(_ event: NSEvent) -> NSEvent? {
+        guard event.keyCode == 51 else { return event }   // ⌫
+        let flags = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
+        guard flags.isEmpty || flags == [.command, .option] else { return event }
+        guard let tv = activeTerminalView,
+              panel.firstResponder === tv,
+              tv.hasSelection else { return event }
+        tv.selectNone()
+        hideSelectionBar()
+        return nil
+    }
 
+    private func handleSelectionMouse(_ event: NSEvent) {
         if event.type == .leftMouseDown {
             // Keep the bar when the click is ON the bar (its buttons).
             let p = root.convert(event.locationInWindow, from: nil)
@@ -2216,8 +2480,13 @@ final class TerminalWindowController: NSObject, NSWindowDelegate {
         dismissWindowOptions()   // don't leave the overlay floating over an inactive window
         applyAppearance(focused: false)
     }
-    func windowDidMove(_ notification: Notification)      { scheduleFrameSave() }
-    func windowDidResize(_ notification: Notification)    { scheduleFrameSave() }
+    func windowDidMove(_ notification: Notification)      { scheduleFrameSave(); repositionAgentBadge() }
+    func windowDidResize(_ notification: Notification)    { scheduleFrameSave(); repositionAgentBadge() }
+
+    /// Keep the Agent Ghost unlock badge pinned to the window's corner as it moves.
+    private func repositionAgentBadge() {
+        if isAgentGhosted { unlockBadge?.reposition(over: panel.frame) }
+    }
 
     /// Move/resize fire continuously during a drag; coalesce into one
     /// state-record write shortly after the gesture settles. Per-window records

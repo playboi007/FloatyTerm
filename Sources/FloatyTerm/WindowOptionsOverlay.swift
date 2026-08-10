@@ -10,6 +10,9 @@ final class WindowOptionsViewController: NSViewController {
     var onResetOpacity: () -> Void = {}
     /// Ghost (click-through) the window.
     var onGhost: () -> Void = {}
+    /// Agent Ghost: click-through + non-key but still visible, for letting an
+    /// agent drive an app "through" the window without it stealing focus.
+    var onAgentGhost: () -> Void = {}
 
     /// The window's current effective opacity — the slider's starting value.
     var initialOpacity: Double = 1.0
@@ -18,7 +21,7 @@ final class WindowOptionsViewController: NSViewController {
     private let valueLabel = NSTextField(labelWithString: "")
 
     override func loadView() {
-        let root = NSView(frame: NSRect(x: 0, y: 0, width: 252, height: 116))
+        let root = NSView(frame: NSRect(x: 0, y: 0, width: 252, height: 152))
 
         let title = NSTextField(labelWithString: "Window opacity")
         title.font = .systemFont(ofSize: 12, weight: .semibold)
@@ -54,7 +57,13 @@ final class WindowOptionsViewController: NSViewController {
         ghost.bezelStyle = .rounded
         ghost.toolTip = "Make this window click-through and faded. Restore from the menu-bar icon."
 
-        let stack = NSStackView(views: [titleRow, slider, sep, ghost])
+        let agentGhost = NSButton(title: "✦  Agent Ghost (drive through)",
+                                  target: self, action: #selector(agentGhostTapped))
+        agentGhost.bezelStyle = .rounded
+        agentGhost.toolTip = "Let an agent drive the app beneath: click-through + can't steal focus, "
+            + "but stays visible. Click the badge to release (or it surfaces when the agent needs you)."
+
+        let stack = NSStackView(views: [titleRow, slider, sep, ghost, agentGhost])
         stack.orientation = .vertical
         stack.alignment = .leading
         stack.spacing = 9
@@ -68,7 +77,8 @@ final class WindowOptionsViewController: NSViewController {
             stack.leadingAnchor.constraint(equalTo: root.leadingAnchor),
             stack.trailingAnchor.constraint(equalTo: root.trailingAnchor),
             slider.widthAnchor.constraint(equalTo: stack.widthAnchor, constant: -28),
-            ghost.widthAnchor.constraint(equalTo: stack.widthAnchor, constant: -28)
+            ghost.widthAnchor.constraint(equalTo: stack.widthAnchor, constant: -28),
+            agentGhost.widthAnchor.constraint(equalTo: stack.widthAnchor, constant: -28)
         ])
 
         view = root
@@ -93,5 +103,10 @@ final class WindowOptionsViewController: NSViewController {
     @objc private func ghostTapped() {
         onGhost()
         view.window?.close()   // dismiss the popover after ghosting
+    }
+
+    @objc private func agentGhostTapped() {
+        onAgentGhost()
+        view.window?.close()
     }
 }

@@ -1,0 +1,1292 @@
+import AppKit
+import ScreenCaptureKit
+
+/// Layer C — scoped screenshot of a NAMED external window, for canvas/GPU apps
+/// (Flutter desktop builds, games) that expose neither a DOM (Layer A/CDP) nor
+/// a useful Accessibility tree (Layer A-native). This is the universal
+/// fallback: every app can be photographed.
+///
+/// This deliberately reuses ContextSnap's machinery rather than reinventing it:
+///   • ContextSnap already migrated to ScreenCaptureKit because
+///     CGWindowListCreateImage was deprecated in macOS 14 and REMOVED in 15.
+///   • ContextSnap already owns the Screen Recording permission flow
+///     (ensurePermission), the snaps directory, PNG saving, pruning, and OCR.
+/// We only add the "target a specific window by name" variant; everything else
+/// routes back through ContextSnap.
+///
+/// Difference from ContextSnap.captureBehind: that captures everything BELOW a
+/// FloatyTerm window (what the panel overlays). Here we capture a SPECIFIC
+/// external window's own pixels, found by owner-app name or window title.
+enum AgentCapture {
+
+    enum CaptureError: LocalizedError {
+        case permissionDenied
+        case windowNotFound(String)
+        case windowOffScreen(String, Int)
+        case captureFailed
+        case regionOutsideWindow
+        var errorDescription: String? {
+            switch self {
+            case .permissionDenied: return "Screen Recording permission not granted."
+            case .windowNotFound(let n): return "No on-screen window matches: \(n)"
+            case .windowOffScreen(let n, let c):
+                return "\"\(n)\" has \(c) window\(c == 1 ? "" : "s") open but off the current "
+                    + "Space/Stage (another desktop, minimized, or Stage Manager). Run "
+                    + "`floaty raise --app \"\(n)\"` to surface it (or bring it forward manually), then retry "
+                    + "— off-screen windows can't be captured. Don't just re-run this command."
+            case .captureFailed: return "ScreenCaptureKit capture failed."
+            case .regionOutsideWindow:
+                return "--region does not overlap the target window (region is GLOBAL screen "
+                    + "points: x,y,WxH — check the window bounds via `floaty list-windows`)."
+            }
+        }
+    }
+
+    // MARK: - Capture frames (the native-app loop-breaker)
+    //
+    // A capture returns, alongside the PNG, the spatial metadata to invert it:
+    // map any image-PIXEL coordinate (what a vision model reads off the PNG)
+    // back to a global screen POINT (what a click needs). FloatyTerm does that
+    // transform in `click-in-frame`, so the agent never re-perceives to correct
+    // for scale — one capture, one handoff, one click.
+
+    /// The geometry of one capture, kept so a later `click-in-frame` can invert it.
+    struct CaptureFrame {
+        let id: String
+        let windowID: CGWindowID
+        let owner: String          // owning app — raised before the click
+        let origin: CGPoint        // captured region's top-left, global screen POINTS
+        let size: CGSize           // captured region, POINTS
+        let scale: CGFloat         // backing scale at capture time
+        let imageWidth: Int        // PNG dimensions, PIXELS
+        let imageHeight: Int
+        let capturedAt: Date
+        /// The WINDOW's bounds at capture time — the staleness reference. For a
+        /// full-window capture this equals (origin, size); for a `--region` crop
+        /// the region stays valid as long as the window itself hasn't moved.
+        var windowBounds: CGRect = .zero
+    }
+
+    struct CaptureResult {
+        let imagePath: String
+        let textPath: String?
+        /// nil only when `unchanged` — no new frame was minted; the previous
+        /// capture's frame is still valid (the screen didn't change).
+        let frame: CaptureFrame?
+        /// Perceptual fingerprint of the captured pixels (see AgentPerception).
+        var screenHash: String = ""
+        /// --if-changed: the target looks identical to the previous capture,
+        /// so nothing was saved and no image path is returned.
+        var unchanged: Bool = false
+    }
+
+    enum FrameError: LocalizedError {
+        case unknownFrame
+        case windowMoved
+        var errorDescription: String? {
+            switch self {
+            case .unknownFrame: return "unknown or expired frame_id; re-capture"
+            case .windowMoved:  return "window moved or closed since capture; re-capture"
+            }
+        }
+    }
+
+    // Short-lived, bounded ring of recent frames (no need to survive restart).
+    @MainActor private static var frames: [CaptureFrame] = []
+    @MainActor private static var frameSeq = 0
+
+    @MainActor private static func remember(_ f: CaptureFrame) {
+        frames.append(f)
+        if frames.count > 16 { frames.removeFirst(frames.count - 16) }
+    }
+    @MainActor static func frame(id: String) -> CaptureFrame? {
+        frames.last { $0.id == id }
+    }
+    @MainActor private static func nextFrameID() -> String {
+        frameSeq += 1
+        return "cap_\(Int(Date().timeIntervalSince1970 * 1000))_\(frameSeq)"
+    }
+
+    /// Invert an image-pixel coordinate to a global screen point using the
+    /// stored frame. Refuses (rather than misclicking) if the frame is unknown
+    /// or the window has moved/resized/closed since capture. Returns the screen
+    /// point plus the owning app so the caller can raise it before clicking.
+    ///
+    /// Transform (stays correct even if the PNG was downscaled, because it uses
+    /// the real pixel:point ratio, not just `scale`):
+    ///     screen = origin + image_coord / (image_dim / region_dim)
+    @MainActor
+    static func resolveInFrame(frameID: String, imageX: Double, imageY: Double) throws
+        -> (point: CGPoint, owner: String?)
+    {
+        guard let f = frame(id: frameID) else { throw FrameError.unknownFrame }
+        guard f.size.width > 0, f.size.height > 0 else { throw FrameError.windowMoved }
+
+        // Staleness guard: re-read the window's current bounds; bail if it drifted.
+        // Compare against the WINDOW bounds recorded at capture (a --region crop's
+        // origin/size describe the crop, not the window).
+        guard let current = listWindows().first(where: { $0.id == f.windowID }) else {
+            throw FrameError.windowMoved
+        }
+        let wb = f.windowBounds == .zero ? CGRect(origin: f.origin, size: f.size) : f.windowBounds
+        let tol: CGFloat = 4
+        if abs(current.bounds.origin.x - wb.origin.x) > tol
+            || abs(current.bounds.origin.y - wb.origin.y) > tol
+            || abs(current.bounds.size.width - wb.size.width) > tol
+            || abs(current.bounds.size.height - wb.size.height) > tol {
+            throw FrameError.windowMoved
+        }
+
+        let pppX = Double(f.imageWidth) / Double(f.size.width)
+        let pppY = Double(f.imageHeight) / Double(f.size.height)
+        let point = CGPoint(x: f.origin.x + imageX / pppX,
+                            y: f.origin.y + imageY / pppY)
+        return (point, f.owner.isEmpty ? nil : f.owner)
+    }
+
+    // MARK: - Mark frames (Set-of-Mark: id → screen point)
+    //
+    // `floaty som` annotates a page's interactable elements with numbered boxes
+    // and returns the screenshot; the model reads a NUMBER off the image instead
+    // of guessing a pixel. We keep each mark's screen center here so
+    // `click-mark --id N` resolves N → a click — the model never emits a
+    // coordinate. Mirrors the capture-frame ring above: short-lived, bounded.
+
+    struct Mark {
+        let id: Int
+        let role: String
+        let name: String
+        let rect: CGRect
+        let center: CGPoint
+    }
+
+    /// One set-of-mark pass, kept so `click-mark` can resolve an id and refuse
+    /// (rather than misclick) if the target changed since. Two flavors:
+    ///   • `source == "cdp"` — DOM page: validated by re-reading url/scroll/origin.
+    ///   • `source == "ax"`  — native/AX window: validated by re-reading the
+    ///     window's bounds (by `windowID`), and raised by `pid` before clicking.
+    struct MarkFrame {
+        let id: String
+        let source: String          // "cdp" | "ax"
+        let marks: [Mark]
+        let capturedAt: Date
+        // CDP staleness
+        var port: UInt16 = 9222
+        var match: String? = nil
+        var viaExtension: Bool = false
+        var url: String = ""
+        var screenX: Double = 0
+        var screenY: Double = 0
+        var scrollX: Double = 0
+        var scrollY: Double = 0
+        // AX staleness / actuation
+        var pid: pid_t = 0
+        var owner: String = ""
+        var windowID: CGWindowID = 0
+        var windowBounds: CGRect = .zero
+    }
+
+    @MainActor private static var markFrames: [MarkFrame] = []
+    @MainActor private static var markSeq = 0
+
+    @MainActor static func rememberMarks(_ f: MarkFrame) {
+        markFrames.append(f)
+        if markFrames.count > 16 { markFrames.removeFirst(markFrames.count - 16) }
+    }
+    @MainActor static func markFrame(id: String) -> MarkFrame? {
+        markFrames.last { $0.id == id }
+    }
+    @MainActor static func nextMarkFrameID() -> String {
+        markSeq += 1
+        return "som_\(Int(Date().timeIntervalSince1970 * 1000))_\(markSeq)"
+    }
+
+    /// A capturable on-screen window (always someone else's — never ours).
+    struct WindowInfo {
+        let id: CGWindowID
+        let pid: pid_t            // owning process — disambiguates two same-named apps (two Chromes)
+        let owner: String
+        let title: String
+        let bounds: CGRect
+        let onScreen: Bool        // false = open but on another Space / minimized / off-stage (Stage Manager)
+        var area: CGFloat { bounds.width * bounds.height }
+    }
+
+    /// Every normal, on-screen window except FloatyTerm's own. Powers
+    /// `floaty list-windows` so an agent can see exactly what it can target
+    /// (id + owner + title + bounds) instead of guessing by name and hoping the
+    /// right window matched.
+    @MainActor
+    static func listWindows(includingOffScreen: Bool = false) -> [WindowInfo] {
+        let myPID = ProcessInfo.processInfo.processIdentifier
+        // `.optionOnScreenOnly` only sees the ACTIVE Space/stage — so a window
+        // that's open but on another Space, minimized, or off-stage under Stage
+        // Manager is invisible to it (an agent then wrongly concludes "no
+        // window"). When asked, widen to `.optionAll` and flag each window's
+        // on-screen membership so the agent can see it exists and raise it.
+        let onScreenIDs: Set<CGWindowID> = includingOffScreen
+            ? Set((CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID)
+                as? [[String: Any]] ?? [])
+                .compactMap { ($0[kCGWindowNumber as String] as? NSNumber)?.uint32Value })
+            : []
+        let option: CGWindowListOption = includingOffScreen
+            ? [.optionAll, .excludeDesktopElements]
+            : [.optionOnScreenOnly, .excludeDesktopElements]
+        guard let infoList = CGWindowListCopyWindowInfo(option, kCGNullWindowID) as? [[String: Any]]
+        else { return [] }
+        return infoList.compactMap { info -> WindowInfo? in
+            let ownerPID = (info[kCGWindowOwnerPID as String] as? Int32) ?? 0
+            if ownerPID == myPID { return nil }  // never us
+            // Layer 0 == normal app windows. Higher layers are menus, the Dock,
+            // status items, tab-drag overlays, window shadows — never content.
+            guard (info[kCGWindowLayer as String] as? NSNumber)?.intValue == 0,
+                  let id = (info[kCGWindowNumber as String] as? NSNumber)?.uint32Value
+            else { return nil }
+            let b = info[kCGWindowBounds as String] as? [String: Any] ?? [:]
+            func n(_ k: String) -> CGFloat { CGFloat((b[k] as? NSNumber)?.doubleValue ?? 0) }
+            let bounds = CGRect(x: n("X"), y: n("Y"), width: n("Width"), height: n("Height"))
+            let onScreen = includingOffScreen ? onScreenIDs.contains(id) : true
+            let title = info[kCGWindowName as String] as? String ?? ""
+            // Off-screen additions are noisy: a single Chrome window backs a dozen
+            // tab-strip/shadow sliver windows. Keep only real content windows (the
+            // ≥200² floor bestMatch uses); on-screen results are left untouched.
+            if !onScreen && (bounds.width < 200 || bounds.height < 200) { return nil }
+            // Phantom helper windows: several apps (Slack, Notes…) park a junk,
+            // TITLELESS ~500×500 window at (0,400) that's never real content and
+            // just adds noise to window selection. A real off-stage content window
+            // carries a title; drop the titleless mid-size off-screen ones.
+            if !onScreen && title.isEmpty && bounds.width <= 520 && bounds.height <= 520 { return nil }
+            return WindowInfo(
+                id: id,
+                pid: ownerPID,
+                owner: info[kCGWindowOwnerName as String] as? String ?? "",
+                title: title,
+                bounds: bounds,
+                onScreen: onScreen)
+        }
+    }
+
+    /// Best window for a name query: case-insensitive match on owner OR title,
+    /// excluding sliver/utility windows, then the LARGEST by area. The size
+    /// rule is what stops `--window "Chrome"` grabbing a full-width ~82px-tall
+    /// tab-strip overlay instead of the actual page content (the exact bug an
+    /// agent hit in the field).
+    @MainActor
+    static func bestMatch(named name: String) -> WindowInfo? {
+        listWindows()
+            .filter { $0.owner.localizedCaseInsensitiveContains(name)
+                   || $0.title.localizedCaseInsensitiveContains(name) }
+            .filter { $0.bounds.width >= 200 && $0.bounds.height >= 200 }
+            .max { $0.area < $1.area }
+    }
+
+    /// Capture a window to ~/.floatyterm/snaps (via ContextSnap.saveImage, so it
+    /// shows up in snap history and gets pruned with everything else). Always
+    /// returns the PNG path.
+    ///
+    /// Target resolution: an explicit `windowID` (from `list-windows`) wins and
+    /// is unambiguous; otherwise `name` matches owner/title and resolves to the
+    /// LARGEST such window (see `bestMatch`).
+    ///
+    /// When `ocr` is set, ALSO runs Vision OCR and returns the recognized-text
+    /// file path when text was found — best-effort: an image-heavy window (a
+    /// video, a canvas) legitimately has no text, which is NOT a failure; in
+    /// that case `textPath` is nil and the screenshot still comes back.
+    /// `region` (global screen points) crops the capture to a slice of the
+    /// window — verifying "did the dialog open" needs a 400×300 crop, not a
+    /// full Retina frame. `fullRes` skips the model-friendly downscale (see
+    /// `downscale`) when the agent genuinely needs pixel detail. `ifChanged`
+    /// compares the perceptual hash against the previous capture of the same
+    /// target and, when the pixels look identical, returns `unchanged: true`
+    /// with no saved image — "nothing changed" for one line, zero image tokens.
+    @MainActor
+    static func captureWindow(named name: String?, windowID: CGWindowID? = nil,
+                              ocr: Bool = false, region: CGRect? = nil,
+                              fullRes: Bool = false, ifChanged: Bool = false) async throws -> CaptureResult
+    {
+        // Reuse ContextSnap's permission gate (Screen Recording). Note the
+        // purpose string so the prompt is honest about why.
+        guard ContextSnap.ensurePermission(
+            purpose: "FloatyTerm captures a target window so your agent's vision model can read it."
+        ) else { throw CaptureError.permissionDenied }
+
+        // Resolve the target: explicit id, else the largest name match.
+        let targetID: CGWindowID
+        if let windowID {
+            targetID = windowID
+        } else if let name, let win = bestMatch(named: name) {
+            targetID = win.id
+        } else if let name {
+            // Distinguish "open but off-stage" from "genuinely no window" so the
+            // agent can raise it instead of declaring the window closed.
+            let off = listWindows(includingOffScreen: true).filter {
+                !$0.onScreen && ($0.owner.localizedCaseInsensitiveContains(name)
+                                 || $0.title.localizedCaseInsensitiveContains(name))
+            }
+            throw off.isEmpty ? CaptureError.windowNotFound(name)
+                              : CaptureError.windowOffScreen(name, off.count)
+        } else {
+            throw CaptureError.windowNotFound("(neither window nor window-id given)")
+        }
+
+        let shot = try await rawCapture(windowID: targetID, fallbackName: name)
+        let windowBounds = CGRect(origin: shot.origin, size: shot.size)
+
+        // Optional region crop (global screen points → image pixels). The crop
+        // becomes the frame's mapping region, so click-in-frame coordinates read
+        // off the cropped PNG still invert to the right screen point.
+        var image = shot.image
+        var origin = shot.origin
+        var size = shot.size
+        if let region {
+            let clipped = region.intersection(windowBounds)
+            guard clipped.width >= 8, clipped.height >= 8 else {
+                throw CaptureError.regionOutsideWindow
+            }
+            let pppX = Double(image.width) / Double(max(size.width, 1))
+            let pppY = Double(image.height) / Double(max(size.height, 1))
+            let px = CGRect(x: (clipped.minX - origin.x) * pppX,
+                            y: (clipped.minY - origin.y) * pppY,
+                            width: clipped.width * pppX, height: clipped.height * pppY)
+            guard let cropped = image.cropping(to: px) else { throw CaptureError.captureFailed }
+            image = cropped
+            origin = clipped.origin
+            size = clipped.size
+        }
+
+        // Perceptual fingerprint of the (cropped) pixels — always computed and
+        // remembered, so both --if-changed and a later --wait-change have a
+        // baseline. Key includes the region: a crop and the full window are
+        // different observations.
+        let hashKey = "cap:\(targetID):\(region.map { "\(Int($0.minX)),\(Int($0.minY)),\(Int($0.width))x\(Int($0.height))" } ?? "full")"
+        let hash = AgentPerception.screenHash(image)
+        let prevHash = AgentPerception.rememberHash(key: hashKey, hash: hash)
+        if ifChanged, let prevHash, AgentPerception.isUnchanged(hash, prevHash) {
+            return CaptureResult(imagePath: "", textPath: nil, frame: nil,
+                                 screenHash: hash, unchanged: true)
+        }
+
+        // OCR is additive and best-effort. Run it on the FULL-RES (cropped)
+        // image — small text survives; the downscale below is only for the
+        // model-facing PNG. recognizeText yields nil when the window has no
+        // readable text — return the screenshot anyway rather than
+        // masquerading "no text" as a capture failure.
+        var textPath: String? = nil
+        if ocr {
+            let ocrImage = image
+            let text: String? = await withCheckedContinuation { cont in
+                ContextSnap.recognizeText(in: ocrImage) { cont.resume(returning: $0) }
+            }
+            if let text, let textURL = ContextSnap.saveText(text) { textPath = textURL.path }
+        }
+
+        // Downscale to a model-friendly resolution unless full-res was asked
+        // for. Safe for click-in-frame: the frame records the FINAL pixel
+        // dimensions, and resolveInFrame uses the real pixel:point ratio.
+        if !fullRes { image = downscale(image) }
+
+        // Always save the screenshot (history + pruning come for free). A nil
+        // here is a genuine save failure, so it's the one case that throws.
+        guard let imageURL = ContextSnap.saveImage(image) else { throw CaptureError.captureFailed }
+
+        // Build + remember the frame from the EXACT region we captured and the
+        // SAVED image's pixel dimensions, so click-in-frame inverts precisely.
+        let frame = CaptureFrame(
+            id: nextFrameID(),
+            windowID: targetID,
+            owner: shot.owner,
+            origin: origin,
+            size: size,
+            scale: shot.scale,
+            imageWidth: image.width,
+            imageHeight: image.height,
+            capturedAt: Date(),
+            windowBounds: windowBounds)
+        remember(frame)
+        return CaptureResult(imagePath: imageURL.path, textPath: textPath, frame: frame,
+                             screenHash: hash)
+    }
+
+    /// Hash-only observation of a window (optionally a --region slice): SCK
+    /// capture + crop + perceptual hash, nothing saved, no frame minted. The
+    /// cheap poll step behind `capture --wait-change`.
+    @MainActor
+    static func hashWindow(windowID: CGWindowID, region: CGRect?) async throws -> String {
+        let shot = try await rawCapture(windowID: windowID, fallbackName: nil)
+        var image = shot.image
+        if let region {
+            let windowBounds = CGRect(origin: shot.origin, size: shot.size)
+            let clipped = region.intersection(windowBounds)
+            guard clipped.width >= 8, clipped.height >= 8 else {
+                throw CaptureError.regionOutsideWindow
+            }
+            let pppX = Double(image.width) / Double(max(shot.size.width, 1))
+            let pppY = Double(image.height) / Double(max(shot.size.height, 1))
+            let px = CGRect(x: (clipped.minX - shot.origin.x) * pppX,
+                            y: (clipped.minY - shot.origin.y) * pppY,
+                            width: clipped.width * pppX, height: clipped.height * pppY)
+            guard let cropped = image.cropping(to: px) else { throw CaptureError.captureFailed }
+            image = cropped
+        }
+        return AgentPerception.screenHash(image)
+    }
+
+    /// Downscale a capture to a model-friendly long edge. A Retina window shot
+    /// is ~2× the pixels a vision model needs to pick a mark or read a layout —
+    /// at full size it costs ~3–4× the image tokens and several MB of transfer.
+    /// 1440px keeps UI text legible while roughly quartering the payload;
+    /// anything already smaller passes through untouched.
+    static func downscale(_ image: CGImage, maxLongEdge: Int = 1440) -> CGImage {
+        let w = image.width, h = image.height
+        let long = max(w, h)
+        guard long > maxLongEdge else { return image }
+        let s = Double(maxLongEdge) / Double(long)
+        let nw = max(1, Int((Double(w) * s).rounded()))
+        let nh = max(1, Int((Double(h) * s).rounded()))
+        guard let ctx = CGContext(
+            data: nil, width: nw, height: nh, bitsPerComponent: 8, bytesPerRow: 0,
+            space: image.colorSpace ?? CGColorSpaceCreateDeviceRGB(),
+            bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)
+        else { return image }
+        ctx.interpolationQuality = .high
+        ctx.draw(image, in: CGRect(x: 0, y: 0, width: nw, height: nh))
+        return ctx.makeImage() ?? image
+    }
+
+    /// SCK capture of one window → its CGImage plus the geometry needed to map
+    /// image pixels ↔ screen points. Does NOT save or remember a frame — used
+    /// both by `captureWindow` (which then saves) and by the AX Set-of-Mark path
+    /// (which draws numbered boxes onto the image first).
+    @MainActor
+    static func rawCapture(windowID: CGWindowID, fallbackName: String?) async throws
+        -> (image: CGImage, origin: CGPoint, size: CGSize, scale: CGFloat, owner: String)
+    {
+        guard ContextSnap.ensurePermission(
+            purpose: "FloatyTerm captures a target window so your agent's vision model can read it."
+        ) else { throw CaptureError.permissionDenied }
+
+        let content = try await SCShareableContent.excludingDesktopWindows(
+            false, onScreenWindowsOnly: true)
+        guard let scWindow = content.windows.first(where: { $0.windowID == windowID })
+        else { throw CaptureError.windowNotFound(fallbackName ?? "window id \(windowID)") }
+
+        let filter = SCContentFilter(desktopIndependentWindow: scWindow)
+        let config = SCStreamConfiguration()
+        let scale = scWindow.frame.width > 0 ? (NSScreen.main?.backingScaleFactor ?? 2) : 2
+        config.width  = max(1, Int((scWindow.frame.width  * scale).rounded()))
+        config.height = max(1, Int((scWindow.frame.height * scale).rounded()))
+        config.showsCursor = false
+
+        let image: CGImage
+        do {
+            image = try await SCScreenshotManager.captureImage(
+                contentFilter: filter, configuration: config)
+        } catch {
+            throw CaptureError.captureFailed
+        }
+        return (image, scWindow.frame.origin, scWindow.frame.size, scale,
+                scWindow.owningApplication?.applicationName ?? (fallbackName ?? ""))
+    }
+
+    /// Draw numbered boxes onto a captured image for the AX Set-of-Mark path.
+    /// `boxes` are in IMAGE-PIXEL coords (top-left origin); we flip to AppKit's
+    /// bottom-left space for drawing. Mirrors the colors/labels the in-page DOM
+    /// overlay uses, so both `som` paths look the same to the model.
+    @MainActor
+    static func annotate(image: CGImage, boxes: [(label: Int, rect: CGRect)]) -> CGImage? {
+        let w = image.width, h = image.height
+        let palette: [NSColor] = [
+            .init(srgbRed: 0.90, green: 0.10, blue: 0.29, alpha: 1), .init(srgbRed: 0.24, green: 0.71, blue: 0.29, alpha: 1),
+            .init(srgbRed: 0.26, green: 0.39, blue: 0.85, alpha: 1), .init(srgbRed: 0.96, green: 0.51, blue: 0.19, alpha: 1),
+            .init(srgbRed: 0.57, green: 0.12, blue: 0.71, alpha: 1), .init(srgbRed: 0.26, green: 0.83, blue: 0.96, alpha: 1),
+            .init(srgbRed: 0.94, green: 0.20, blue: 0.90, alpha: 1), .init(srgbRed: 0.27, green: 0.60, blue: 0.56, alpha: 1),
+            .init(srgbRed: 0.60, green: 0.39, blue: 0.14, alpha: 1), .init(srgbRed: 0.50, green: 0.00, blue: 0.00, alpha: 1),
+        ]
+        let out = NSImage(size: NSSize(width: w, height: h))
+        out.lockFocus()
+        NSImage(cgImage: image, size: NSSize(width: w, height: h))
+            .draw(in: NSRect(x: 0, y: 0, width: w, height: h))
+        let fontSize = max(11.0, 11.0 * CGFloat(w) / 1200.0)   // scale label with image resolution
+        for box in boxes {
+            let color = palette[(box.label - 1 + palette.count) % palette.count]
+            // image px (top-left) → AppKit (bottom-left)
+            let r = NSRect(x: box.rect.minX, y: CGFloat(h) - box.rect.minY - box.rect.height,
+                           width: box.rect.width, height: box.rect.height)
+            let path = NSBezierPath(rect: r)
+            path.lineWidth = max(2, fontSize / 5)
+            color.setStroke(); path.stroke()
+            // number badge at the box's top-left (its top in AppKit space)
+            let label = String(box.label) as NSString
+            let attrs: [NSAttributedString.Key: Any] = [
+                .font: NSFont.monospacedSystemFont(ofSize: fontSize, weight: .bold),
+                .foregroundColor: NSColor.white,
+            ]
+            let textSize = label.size(withAttributes: attrs)
+            let pad: CGFloat = 2
+            let badge = NSRect(x: r.minX, y: r.maxY - (textSize.height + pad),
+                               width: textSize.width + pad * 2, height: textSize.height + pad)
+            color.setFill(); NSBezierPath(rect: badge).fill()
+            label.draw(at: NSPoint(x: badge.minX + pad, y: badge.minY), withAttributes: attrs)
+        }
+        out.unlockFocus()
+        guard let tiff = out.tiffRepresentation,
+              let rep = NSBitmapImageRep(data: tiff),
+              let cg = rep.cgImage else { return nil }
+        return cg
+    }
+}
+
+/// Layer A-native — element targeting for NATIVE apps (Notes, Finder, system
+/// dialogs) AND for live Chrome/Electron the DOM path can't reach. The macOS
+/// Accessibility tree IS the queryable element hierarchy, the native analog of
+/// `query-dom`. Two properties make it the answer to the "two Chromes / Chrome
+/// 136+ debug-port block" problem:
+///
+///   • It binds by **PID**, not app name — `AXUIElementCreateApplication(pid)`
+///     reads and presses a SPECIFIC process, so two windows both named "Google
+///     Chrome" are no longer ambiguous (CDP solved this for itself via the port;
+///     AX solves it for everything else).
+///   • It needs **no debug port** — so it drives the user's real, default-profile
+///     Chrome that Chrome 136+ refuses to expose over CDP. One Chrome, no spawn.
+///
+/// Reading the tree costs no new permission: Layer B already forces the
+/// Accessibility grant. AXPosition/AXSize are ALREADY global screen points — no
+/// transform, unlike CDP.
+@MainActor
+enum AgentAX {
+
+    enum AXError: LocalizedError {
+        case notTrusted
+        case appNotFound(String)
+        case ambiguousApp(String, [pid_t])
+        case noMatch(String)
+        case noFocusedElement
+        case stalePress(was: String, now: String)
+        var errorDescription: String? {
+            switch self {
+            case .notTrusted:
+                return "FloatyTerm needs Accessibility access — grant it under System Settings → "
+                    + "Privacy & Security → Accessibility, then relaunch."
+            case .appNotFound(let s):
+                return "No running app matches \"\(s)\". Run `floaty list-windows` for owners + pids."
+            case .ambiguousApp(let s, let pids):
+                let list = pids.map(String.init).joined(separator: ", ")
+                return "Multiple running apps match \"\(s)\" (pids: \(list)). Pass --pid to pick one "
+                    + "(see `floaty list-windows`)."
+            case .noMatch(let s):
+                return "No accessibility element matches \(s)."
+            case .noFocusedElement:
+                return "No focused element in the target — click the field first (then `floaty focused` "
+                    + "to confirm), so there's a cursor to write into."
+            case .stalePress(let was, let now):
+                return "element changed since the query: matched \"\(was)\" but the handle now points at "
+                    + "\"\(now)\" — re-query and press again. (Dynamic lists/menus recycle AX nodes; "
+                    + "this guard refused to press the wrong row.)"
+            }
+        }
+    }
+
+    /// One matched element: role + name (for the agent to read) and its global
+    /// screen rect/center (directly clickable — AX coords need no transform).
+    struct AXMatch: Sendable {
+        let role: String
+        let name: String
+        let rect: CGRect
+        let center: CGPoint
+    }
+
+    /// Resolve a target to a single pid: an explicit `pid` wins; else match
+    /// running apps by localized name / bundle id. An ambiguous NAME (two
+    /// Chromes!) throws asking for `--pid` rather than guessing.
+    static func resolvePID(app: String?, pid: pid_t?) throws -> pid_t {
+        if let pid { return pid }
+        guard let app, !app.isEmpty else { throw AXError.appNotFound("(no app or pid given)") }
+        let hits = NSWorkspace.shared.runningApplications.filter {
+            ($0.localizedName?.localizedCaseInsensitiveContains(app) ?? false)
+                || ($0.bundleIdentifier?.localizedCaseInsensitiveContains(app) ?? false)
+        }
+        // Prefer regular (Dock) apps; background-only helpers rarely have UI.
+        let regular = hits.filter { $0.activationPolicy == .regular }
+        let pool = regular.isEmpty ? hits : regular
+        if pool.isEmpty { throw AXError.appNotFound(app) }
+        if pool.count > 1 { throw AXError.ambiguousApp(app, pool.map { $0.processIdentifier }) }
+        return pool[0].processIdentifier
+    }
+
+    /// Walk a target app's AX tree, returning interactable (or role/name-filtered)
+    /// elements with screen rect + center. With `press`, AXPress the first match
+    /// instead — a targeted activation that ignores which window is frontmost
+    /// (the fix for keystrokes landing in the wrong Chrome). Bounded by node +
+    /// match caps and a per-call messaging timeout so a huge tree can't hang.
+    static func query(app: String?, pid: pid_t?, role: String?, title: String?,
+                      max: Int = 100, press: Bool = false) async throws -> (matches: [AXMatch], pressed: AXMatch?) {
+        guard AXIsProcessTrusted() else { throw AXError.notTrusted }
+        let appPID = try resolvePID(app: app, pid: pid)
+        let appEl = AXUIElementCreateApplication(appPID)
+        // Don't let a busy/hung app block the main thread indefinitely.
+        AXUIElementSetMessagingTimeout(appEl, 2.0)
+        // Nudge Chromium/Electron to switch on its renderer accessibility tree
+        // (lazily enabled only when an AT queries it). Harmless for native apps.
+        AXUIElementSetAttributeValue(appEl, "AXManualAccessibility" as CFString, kCFBooleanTrue)
+        AXUIElementSetAttributeValue(appEl, "AXEnhancedUserInterface" as CFString, kCFBooleanTrue)
+
+        let wantRole = role.map(normalizeRole)
+        let wantTitle = title?.lowercased()
+        let interactable: Set<String> = [
+            "AXButton", "AXLink", "AXTextField", "AXTextArea", "AXCheckBox",
+            "AXRadioButton", "AXPopUpButton", "AXComboBox", "AXMenuItem", "AXMenuButton",
+            "AXTab", "AXSlider", "AXSearchField", "AXDisclosureTriangle", "AXSwitch",
+        ]
+
+        func name(of el: AXUIElement) -> String {
+            for attr in [kAXTitleAttribute, kAXDescriptionAttribute, kAXValueAttribute, "AXHelp"] {
+                if let s = copyString(el, attr as CFString), !s.isEmpty { return String(s.prefix(120)) }
+            }
+            return ""
+        }
+
+        // One full tree walk. Returns the matches, the first press target, and a
+        // Flutter "Enable accessibility" toggle if one is present (semantics off).
+        func sweep() -> (matches: [AXMatch], pressTarget: AXUIElement?, pressMatch: AXMatch?, toggle: AXUIElement?) {
+            var out: [AXMatch] = []
+            var pressTarget: AXUIElement?
+            var pressMatch: AXMatch?
+            var toggle: AXUIElement?
+            var visited = 0
+            let nodeCap = 6000
+
+            func walk(_ el: AXUIElement) {
+                if visited >= nodeCap { return }
+                if out.count >= max && (!press || pressMatch != nil) { return }
+                visited += 1
+                let r = copyString(el, kAXRoleAttribute as CFString) ?? ""
+
+                // Flutter/engine canvas: a button literally named "Enable
+                // accessibility" means the semantics tree is OFF. Flag it (independent
+                // of the user's filter and of match count — browser chrome would
+                // otherwise mask an app whose own content semantics are absent).
+                if toggle == nil, r == "AXButton",
+                   name(of: el).range(of: "enable accessibility", options: .caseInsensitive) != nil {
+                    toggle = el
+                }
+
+                var isHit: Bool
+                if let wantRole { isHit = (r == wantRole) }
+                else if wantTitle == nil { isHit = interactable.contains(r) }   // default: interactables
+                else { isHit = true }                                           // title-only → any role
+                if isHit, let wantTitle { isHit = name(of: el).lowercased().contains(wantTitle) }
+
+                if isHit, let rect = rectOf(el), rect.width > 0, rect.height > 0 {
+                    let m = AXMatch(role: r, name: name(of: el), rect: rect,
+                                    center: CGPoint(x: rect.midX, y: rect.midY))
+                    if out.count < max { out.append(m) }
+                    // Resolve the press target for the FIRST match. A `--title` filter
+                    // usually lands on the visible LABEL (an AXStaticText), whose
+                    // clickable thing is its container (the row / option / button). So:
+                    // press this element if it's actionable itself, else the nearest
+                    // ancestor that actually supports AXPress. (Previously a label-only
+                    // match set no target → "press-fail" even though a click here works.)
+                    if press && pressMatch == nil {
+                        if wantRole != nil || interactable.contains(r) {
+                            pressTarget = el; pressMatch = m
+                        } else if let p = nearestPressable(el) {
+                            let prect = rectOf(p) ?? rect
+                            pressTarget = p
+                            pressMatch = AXMatch(role: copyString(p, kAXRoleAttribute as CFString) ?? r,
+                                                 name: name(of: p), rect: prect,
+                                                 center: CGPoint(x: prect.midX, y: prect.midY))
+                        }
+                    }
+                }
+                if let kids = copyChildren(el) {
+                    for k in kids {
+                        if visited >= nodeCap { break }
+                        if out.count >= max && (!press || pressMatch != nil) { break }
+                        walk(k)
+                    }
+                }
+            }
+            walk(appEl)
+            return (out, pressTarget, pressMatch, toggle)
+        }
+
+        var result = sweep()
+
+        // Chromium enables its a11y tree IN RESPONSE to the nudge above, and it
+        // takes ~1s to populate — longer than this used to wait (2×250ms), which is
+        // why a fresh Chrome/Electron query came back count:0 while `read-text`
+        // (which retries ~1.5s) saw the same tree fine. Match that patience: retry
+        // until the tree fills, ~1.6s budget. Native apps satisfy attempt 1, so they
+        // pay nothing; only a genuinely sparse/lazy tree spends the extra time.
+        var attempt = 0
+        while result.matches.count < 2 && attempt < 5 {
+            if let toggle = result.toggle {     // Flutter toggle showed up first → press it
+                AXUIElementPerformAction(toggle, kAXPressAction as CFString)
+            }
+            try await Task.sleep(nanoseconds: 320_000_000)
+            result = sweep()
+            attempt += 1
+        }
+
+        // Flutter/engine canvas: the loop above can exit "satisfied" while the app's
+        // OWN semantics are still off — browser chrome (Back/Forward/address bar)
+        // inflates the count past 2, masking empty app content. The honest signal is
+        // the "Enable accessibility" toggle itself. While it's present, press it and
+        // POLL until it's gone — Flutter builds the semantics sidecar over ~1–3s,
+        // longer than a single re-sweep waits. (It also resets to this toggle on
+        // every route change, so re-pressing each pass handles re-collapse.)
+        var flutterTries = 0
+        while result.toggle != nil && flutterTries < 6 {
+            AXUIElementPerformAction(result.toggle!, kAXPressAction as CFString)
+            try await Task.sleep(nanoseconds: 420_000_000)
+            result = sweep()
+            flutterTries += 1
+        }
+
+        if press {
+            guard let t = result.pressTarget, let m = result.pressMatch else {
+                throw AXError.noMatch(describe(role: role, title: title))
+            }
+            // Atomic-press guard. We act on the AXUIElement handle captured during
+            // the walk — but in a DYNAMIC list (quick-switcher, autocomplete/menu
+            // dropdown) the tree mutates between the walk and the press: nodes get
+            // recycled and reordered, so the handle can now point at a DIFFERENT
+            // row (this is how "press admin-flutter" opened a stranger's DM). Re-read
+            // the handle's live name and bail if it no longer matches what we matched
+            // — same contract as click-in-frame's "window moved … re-capture". Static
+            // toolbar buttons are stable, so this never trips on the common case.
+            let liveName = name(of: t)
+            if !m.name.isEmpty && liveName != m.name {
+                throw AXError.stalePress(was: m.name, now: liveName)
+            }
+            AXUIElementPerformAction(t, kAXPressAction as CFString)
+            return (result.matches, m)
+        }
+        return (result.matches, nil)
+    }
+
+    /// What the agent needs to answer "is there a text cursor here before I
+    /// type?" — the target app's currently focused element.
+    struct FocusedInfo: Sendable {
+        let hasFocus: Bool
+        let role: String
+        let name: String
+        let value: String
+        let editable: Bool      // a text-entry role → typing will land
+    }
+
+    /// Read the target app's focused UI element (AXFocusedUIElement). Pairs with
+    /// the typing fix: click → `focused` check → type, instead of click-and-pray.
+    static func focused(app: String?, pid: pid_t?) throws -> FocusedInfo {
+        guard AXIsProcessTrusted() else { throw AXError.notTrusted }
+        let appPID = try resolvePID(app: app, pid: pid)
+        let appEl = AXUIElementCreateApplication(appPID)
+        AXUIElementSetMessagingTimeout(appEl, 2.0)
+        // Chromium exposes the focused element only with a11y on — nudge it.
+        AXUIElementSetAttributeValue(appEl, "AXManualAccessibility" as CFString, kCFBooleanTrue)
+
+        var f: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(appEl, kAXFocusedUIElementAttribute as CFString, &f) == .success,
+              let f, CFGetTypeID(f) == AXUIElementGetTypeID()
+        else { return FocusedInfo(hasFocus: false, role: "", name: "", value: "", editable: false) }
+        let el = f as! AXUIElement
+        let role = copyString(el, kAXRoleAttribute as CFString) ?? ""
+        var name = ""
+        for attr in [kAXTitleAttribute, kAXDescriptionAttribute, "AXPlaceholderValue", "AXHelp"] {
+            if let s = copyString(el, attr as CFString), !s.isEmpty { name = String(s.prefix(120)); break }
+        }
+        let value = String((copyString(el, kAXValueAttribute as CFString) ?? "").prefix(300))
+        let editable = ["AXTextField", "AXTextArea", "AXComboBox", "AXSearchField"].contains(role)
+        return FocusedInfo(hasFocus: true, role: role, name: name, value: value, editable: editable)
+    }
+
+    struct SetTextResult: Sendable {
+        let landed: Bool        // re-read confirms the value is actually in the field
+        let settable: Bool      // the element advertised AXValue as writable
+        let role: String
+        let value: String       // the field's value AFTER the write (re-read)
+    }
+
+    /// Write text into the focused field by SETTING its AXValue directly, instead
+    /// of dispatching synthetic keystrokes. This is the reliable text-entry path for
+    /// Chromium/Electron (Slack, VS Code, Discord…): synthetic CGEvents route to
+    /// whatever the window server holds as first responder, which in those apps can
+    /// differ from what AX reports as focused — so `type` fires events that land in
+    /// the composer or nowhere while reporting success (it counts events sent, not
+    /// characters landed). Setting AXValue addresses the focused element itself, so
+    /// there's no routing to get wrong; we then RE-READ the value and report whether
+    /// it truly landed, rather than claiming success blindly.
+    ///
+    /// Caller is responsible for focusing the field first (click / `focused`). If the
+    /// element doesn't expose a settable AXValue (some custom web inputs don't),
+    /// `landed:false, settable:false` comes back — the signal to fall back to paste.
+    static func setText(app: String?, pid: pid_t?, text: String) async throws -> SetTextResult {
+        guard AXIsProcessTrusted() else { throw AXError.notTrusted }
+        let appPID = try resolvePID(app: app, pid: pid)
+        let appEl = AXUIElementCreateApplication(appPID)
+        AXUIElementSetMessagingTimeout(appEl, 2.0)
+        AXUIElementSetAttributeValue(appEl, "AXManualAccessibility" as CFString, kCFBooleanTrue)
+        AXUIElementSetAttributeValue(appEl, "AXEnhancedUserInterface" as CFString, kCFBooleanTrue)
+
+        var f: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(appEl, kAXFocusedUIElementAttribute as CFString, &f) == .success,
+              let f, CFGetTypeID(f) == AXUIElementGetTypeID()
+        else { throw AXError.noFocusedElement }
+        let el = f as! AXUIElement
+        let role = copyString(el, kAXRoleAttribute as CFString) ?? ""
+
+        var settableRef: DarwinBoolean = false
+        AXUIElementIsAttributeSettable(el, kAXValueAttribute as CFString, &settableRef)
+        let settable = settableRef.boolValue
+
+        AXUIElementSetAttributeValue(el, kAXValueAttribute as CFString, text as CFString)
+
+        // Verify HONESTLY. The set is processed asynchronously: an immediate re-read
+        // returns the field's PRE-write value (a false negative — landed:false even
+        // though the text is in the field a moment later). And a React/Electron field
+        // may swap its AX node on the value change, so the original `el` handle can go
+        // stale — re-fetch the focused element each time and read ITS value. Poll until
+        // the value reflects the text, or give up (~1s) and report the real readback.
+        let want = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        let head = String(want.prefix(min(40, want.count)))
+        func currentValue() -> String {
+            var ff: CFTypeRef?
+            if AXUIElementCopyAttributeValue(appEl, kAXFocusedUIElementAttribute as CFString, &ff) == .success,
+               let ff, CFGetTypeID(ff) == AXUIElementGetTypeID(),
+               let s = copyString(ff as! AXUIElement, kAXValueAttribute as CFString), !s.isEmpty {
+                return s
+            }
+            return copyString(el, kAXValueAttribute as CFString) ?? ""
+        }
+        func reflects(_ v: String) -> Bool {
+            guard !want.isEmpty else { return false }
+            let a = v.trimmingCharacters(in: .whitespacesAndNewlines)
+            return a == want || a.contains(want) || (!head.isEmpty && a.contains(head))
+        }
+        var after = currentValue()
+        var landed = reflects(after)
+        var tries = 0
+        while !landed && tries < 8 {            // ~8 × 120ms ≈ 1s before conceding
+            try? await Task.sleep(nanoseconds: 120_000_000)
+            after = currentValue()
+            landed = reflects(after)
+            tries += 1
+        }
+        return SetTextResult(landed: landed, settable: settable, role: role, value: String(after.prefix(500)))
+    }
+
+    /// Bring a target app + window to the ACTIVE Space — the sanctioned twin of
+    /// clicking a notification (public activation, no private SkyLight). Activates
+    /// the process, AX-raises its main window, and marks it frontmost, so a window
+    /// parked off-stage / on another Space / inactive-full-screen surfaces and
+    /// becomes capture/click/type-able (Chrome also populates its a11y tree once
+    /// foreground). Returns whether a window is on the active Space afterward.
+    static func raise(app: String?, pid: pid_t?) async throws -> (pid: pid_t, onScreen: Bool, title: String) {
+        guard AXIsProcessTrusted() else { throw AXError.notTrusted }
+        let appPID = try resolvePID(app: app, pid: pid)
+
+        let appEl = AXUIElementCreateApplication(appPID)
+        AXUIElementSetMessagingTimeout(appEl, 2.0)
+        var title = ""
+        if let win = mainWindow(of: appEl) {
+            AXUIElementPerformAction(win, kAXRaiseAction as CFString)
+            AXUIElementSetAttributeValue(win, kAXMainAttribute as CFString, kCFBooleanTrue)
+            title = copyString(win, kAXTitleAttribute as CFString) ?? ""
+        }
+        AXUIElementSetAttributeValue(appEl, kAXFrontmostAttribute as CFString, kCFBooleanTrue)
+        NSRunningApplication(processIdentifier: appPID)?.activate()
+
+        // Let the Space switch / stage swap settle, then confirm a window is now
+        // on the active Space (capturable).
+        try await Task.sleep(nanoseconds: 450_000_000)
+        let onScreen = AgentCapture.listWindows().contains { $0.pid == appPID }
+        return (appPID, onScreen, title)
+    }
+
+    /// Extract readable text from a target via the AX tree — the structural,
+    /// lossless analog of OCR, and the right way to "read this page" on live
+    /// Chrome that Chrome 136+ won't expose over CDP. Walks the focused window
+    /// collecting static-text / heading / field values. Returns "" when the tree
+    /// carries no text, so the caller can fall back to OCR.
+    static func extractText(app: String?, pid: pid_t?, maxChars: Int = 40000) async throws -> String {
+        guard AXIsProcessTrusted() else { throw AXError.notTrusted }
+        let appPID = try resolvePID(app: app, pid: pid)
+        let appEl = AXUIElementCreateApplication(appPID)
+        AXUIElementSetMessagingTimeout(appEl, 2.0)
+        AXUIElementSetAttributeValue(appEl, "AXManualAccessibility" as CFString, kCFBooleanTrue)
+        AXUIElementSetAttributeValue(appEl, "AXEnhancedUserInterface" as CFString, kCFBooleanTrue)
+        let root = mainWindow(of: appEl) ?? appEl
+        let textRoles: Set<String> = ["AXStaticText", "AXTextArea", "AXTextField", "AXHeading"]
+
+        func sweep() -> [String] {
+            var out: [String] = []
+            var visited = 0
+            let nodeCap = 8000
+            func walk(_ el: AXUIElement) {
+                if visited >= nodeCap { return }
+                visited += 1
+                if textRoles.contains(copyString(el, kAXRoleAttribute as CFString) ?? "") {
+                    let s = copyString(el, kAXValueAttribute as CFString)
+                        ?? copyString(el, kAXTitleAttribute as CFString) ?? ""
+                    let t = s.trimmingCharacters(in: .whitespacesAndNewlines)
+                    if !t.isEmpty { out.append(t) }
+                }
+                if let kids = copyChildren(el) { for k in kids { if visited >= nodeCap { break }; walk(k) } }
+            }
+            walk(root)
+            return out
+        }
+        // Chrome enables its a11y tree lazily AND a freshly-navigated page needs a
+        // beat to populate it — so retry (to the caller's ~40-char "real content"
+        // bar, not a token 20) before giving up. ~1.5s budget catches a settling
+        // page so read-text returns lossless AX text instead of falling to OCR.
+        // Flutter/engine canvas: press the "Enable accessibility" toggle up front so
+        // the semantics sidecar builds before we read — browser chrome text can push
+        // us past the sparsity check below and mask empty app content otherwise.
+        if enableEngineSemanticsIfNeeded(appEl) { try await Task.sleep(nanoseconds: 500_000_000) }
+        var parts = sweep()
+        var attempt = 0
+        while parts.joined(separator: "\n").count < 40 && attempt < 5 {
+            enableEngineSemanticsIfNeeded(appEl)   // re-collapsed on navigation → re-enable
+            try await Task.sleep(nanoseconds: 300_000_000)
+            parts = sweep()
+            attempt += 1
+        }
+        var lines: [String] = []
+        for p in parts where lines.last != p { lines.append(p) }   // drop consecutive dupes
+        let text = lines.joined(separator: "\n")
+        return text.count > maxChars ? String(text.prefix(maxChars)) : text
+    }
+
+    struct TextSection: Sendable { let label: String; let chars: Int; let text: String }
+
+    /// `read-text`, but split into labeled regions instead of one flat blob — so a
+    /// caller can grab "the thread pane" without awk-ing a marker out of the dump.
+    /// Segmentation is by **ARIA landmark** (Chromium maps `role="main"` →
+    /// AXSubrole `AXLandmarkMain`, `complementary`/aside → `AXLandmarkComplementary`,
+    /// `navigation` → `AXLandmarkNavigation`, etc.) — a general, app-agnostic
+    /// boundary present in any landmarked web/Electron UI. Text under each landmark
+    /// is bucketed to it; anything outside one lands in "(main)". Sections come back
+    /// in document order, so a right-hand thread/detail pane (complementary) sorts
+    /// after the main list. If the app exposes no landmarks you get a single section
+    /// (no worse than the flat read).
+    static func extractSections(app: String?, pid: pid_t?, maxChars: Int = 40000) async throws -> [TextSection] {
+        guard AXIsProcessTrusted() else { throw AXError.notTrusted }
+        let appPID = try resolvePID(app: app, pid: pid)
+        let appEl = AXUIElementCreateApplication(appPID)
+        AXUIElementSetMessagingTimeout(appEl, 2.0)
+        AXUIElementSetAttributeValue(appEl, "AXManualAccessibility" as CFString, kCFBooleanTrue)
+        AXUIElementSetAttributeValue(appEl, "AXEnhancedUserInterface" as CFString, kCFBooleanTrue)
+        let root = mainWindow(of: appEl) ?? appEl
+        let textRoles: Set<String> = ["AXStaticText", "AXTextArea", "AXTextField", "AXHeading"]
+
+        func landmarkLabel(_ el: AXUIElement) -> String? {
+            let sub = copyString(el, kAXSubroleAttribute as CFString) ?? ""
+            guard sub.hasPrefix("AXLandmark") else { return nil }
+            let base: String
+            switch sub {
+            case "AXLandmarkMain":          base = "main"
+            case "AXLandmarkComplementary": base = "complementary"
+            case "AXLandmarkNavigation":    base = "navigation"
+            case "AXLandmarkBanner":        base = "banner"
+            case "AXLandmarkContentInfo":   base = "contentinfo"
+            case "AXLandmarkSearch":        base = "search"
+            case "AXLandmarkRegion":        base = "region"
+            default: base = sub.replacingOccurrences(of: "AXLandmark", with: "").lowercased()
+            }
+            // Append the landmark's accessible name when it has one (e.g. "Thread").
+            let name = (copyString(el, kAXTitleAttribute as CFString)
+                        ?? copyString(el, kAXDescriptionAttribute as CFString)
+                        ?? copyString(el, "AXRoleDescription" as CFString) ?? "")
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            return name.isEmpty || name.lowercased() == base ? base : "\(base): \(String(name.prefix(60)))"
+        }
+
+        func sweep() -> [(label: String, lines: [String])] {
+            var order: [String] = []
+            var buckets: [String: [String]] = [:]
+            var visited = 0
+            let nodeCap = 8000
+            func add(_ label: String, _ t: String) {
+                if buckets[label] == nil { buckets[label] = []; order.append(label) }
+                if buckets[label]?.last != t { buckets[label]?.append(t) }
+            }
+            func walk(_ el: AXUIElement, _ section: String) {
+                if visited >= nodeCap { return }
+                visited += 1
+                let here = landmarkLabel(el) ?? section
+                if textRoles.contains(copyString(el, kAXRoleAttribute as CFString) ?? "") {
+                    let s = (copyString(el, kAXValueAttribute as CFString)
+                             ?? copyString(el, kAXTitleAttribute as CFString) ?? "")
+                        .trimmingCharacters(in: .whitespacesAndNewlines)
+                    if !s.isEmpty { add(here, s) }
+                }
+                if let kids = copyChildren(el) { for k in kids { if visited >= nodeCap { break }; walk(k, here) } }
+            }
+            walk(root, "main")
+            return order.map { ($0, buckets[$0] ?? []) }
+        }
+
+        if enableEngineSemanticsIfNeeded(appEl) { try await Task.sleep(nanoseconds: 500_000_000) }
+        var secs = sweep()
+        var attempt = 0
+        while secs.reduce(0, { $0 + $1.lines.joined().count }) < 40 && attempt < 5 {
+            enableEngineSemanticsIfNeeded(appEl)   // re-collapsed on navigation → re-enable
+            try await Task.sleep(nanoseconds: 300_000_000)
+            secs = sweep()
+            attempt += 1
+        }
+        return secs.compactMap { sec in
+            let joined = sec.lines.joined(separator: "\n")
+            guard !joined.isEmpty else { return nil }
+            let clipped = joined.count > maxChars ? String(joined.prefix(maxChars)) : joined
+            return TextSection(label: sec.label, chars: clipped.count, text: clipped)
+        }
+    }
+
+    /// Actions an element advertises (e.g. AXPress, AXShowMenu).
+    private static func actionNames(_ el: AXUIElement) -> [String] {
+        var names: CFArray?
+        guard AXUIElementCopyActionNames(el, &names) == .success, let arr = names as? [String] else { return [] }
+        return arr
+    }
+
+    /// The nearest element — `el` itself or an ancestor within `maxHops` — that
+    /// actually supports the AXPress action. Lets `--press` activate the clickable
+    /// container (row / option / button) when a `--title` filter matched only the
+    /// static-text label inside it. Role-agnostic: it asks the element what it can
+    /// do rather than guessing from its role, so custom/Electron widgets work too.
+    private static func nearestPressable(_ el: AXUIElement, maxHops: Int = 6) -> AXUIElement? {
+        var cur: AXUIElement? = el
+        var hops = 0
+        while let c = cur, hops <= maxHops {
+            if actionNames(c).contains(kAXPressAction as String) { return c }
+            var p: CFTypeRef?
+            guard AXUIElementCopyAttributeValue(c, kAXParentAttribute as CFString, &p) == .success,
+                  let p, CFGetTypeID(p) == AXUIElementGetTypeID() else { return nil }
+            cur = (p as! AXUIElement)
+            hops += 1
+        }
+        return nil
+    }
+
+    /// Flutter (and some engine-rendered web UIs) paint to a canvas and expose NO
+    /// real AX tree until accessibility is switched on — they ship a hidden
+    /// "Enable accessibility" placeholder that, when pressed, makes the framework
+    /// build a parallel semantics tree (a sidecar DOM mirroring the widget tree)
+    /// that the browser then surfaces as AX. The tree also RESETS to that
+    /// placeholder on route changes. So: whenever a sweep comes back sparse, look
+    /// for that placeholder and press it — the canvas analog of the
+    /// AXManualAccessibility nudge we do for Chromium. Cheap because a collapsed
+    /// tree is tiny. Returns true if it pressed one (caller waits + re-sweeps).
+    @discardableResult
+    private static func enableEngineSemanticsIfNeeded(_ appEl: AXUIElement) -> Bool {
+        var visited = 0
+        let cap = 1500   // the placeholder is shallow; bound cost on already-rich trees
+        var hit: AXUIElement?
+        func walk(_ el: AXUIElement) {
+            if hit != nil || visited >= cap { return }
+            visited += 1
+            let label = (copyString(el, kAXTitleAttribute as CFString)
+                         ?? copyString(el, kAXDescriptionAttribute as CFString)
+                         ?? copyString(el, kAXValueAttribute as CFString) ?? "")
+            if label.range(of: "enable accessibility", options: .caseInsensitive) != nil {
+                hit = el; return
+            }
+            if let kids = copyChildren(el) { for k in kids { if hit != nil || visited >= cap { break }; walk(k) } }
+        }
+        walk(appEl)
+        if let hit { AXUIElementPerformAction(hit, kAXPressAction as CFString); return true }
+        return false
+    }
+
+    /// Auto-raise for `--pid` targets: if the process has no window on the active
+    /// Space but does have one off-stage (Stage Manager / another desktop — often
+    /// because a stray click shoved it there mid-task), surface it so the next
+    /// capture/som/read works without a manual `raise`. Also keeps the agent's
+    /// in-flight window in front, so the user is less likely to navigate the wrong
+    /// thing. No-op (true) when a window is already on-screen; false when the
+    /// process has no window at all (nothing to raise — don't loop).
+    @discardableResult
+    static func ensureOnScreen(pid: pid_t) async -> Bool {
+        if AgentCapture.listWindows().contains(where: { $0.pid == pid }) { return true }
+        let off = AgentCapture.listWindows(includingOffScreen: true).filter { $0.pid == pid && !$0.onScreen }
+        guard !off.isEmpty else { return false }
+        let r = try? await AgentAX.raise(app: nil, pid: pid)
+        return r?.onScreen ?? false
+    }
+
+    private static func mainWindow(of appEl: AXUIElement) -> AXUIElement? {
+        var v: CFTypeRef?
+        if AXUIElementCopyAttributeValue(appEl, kAXMainWindowAttribute as CFString, &v) == .success,
+           let v, CFGetTypeID(v) == AXUIElementGetTypeID() {
+            return (v as! AXUIElement)
+        }
+        return copyAXArray(appEl, kAXWindowsAttribute as CFString)?.first
+    }
+
+    // MARK: - AX attribute readers
+
+    private static func copyAXArray(_ el: AXUIElement, _ attr: CFString) -> [AXUIElement]? {
+        var v: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(el, attr, &v) == .success else { return nil }
+        return v as? [AXUIElement]
+    }
+
+    private static func rectOf(_ el: AXUIElement) -> CGRect? {
+        guard let p = copyPoint(el, kAXPositionAttribute as CFString),
+              let s = copySize(el, kAXSizeAttribute as CFString)
+        else { return nil }
+        return CGRect(origin: p, size: s)
+    }
+
+    private static func copyString(_ el: AXUIElement, _ attr: CFString) -> String? {
+        var v: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(el, attr, &v) == .success else { return nil }
+        if let s = v as? String { return s }
+        if let n = v as? NSNumber { return n.stringValue }
+        return nil
+    }
+
+    private static func axValue(_ el: AXUIElement, _ attr: CFString) -> AXValue? {
+        var v: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(el, attr, &v) == .success, let v,
+              CFGetTypeID(v) == AXValueGetTypeID() else { return nil }
+        return (v as! AXValue)
+    }
+    private static func copyPoint(_ el: AXUIElement, _ attr: CFString) -> CGPoint? {
+        guard let v = axValue(el, attr) else { return nil }
+        var p = CGPoint.zero
+        return AXValueGetValue(v, .cgPoint, &p) ? p : nil
+    }
+    private static func copySize(_ el: AXUIElement, _ attr: CFString) -> CGSize? {
+        guard let v = axValue(el, attr) else { return nil }
+        var s = CGSize.zero
+        return AXValueGetValue(v, .cgSize, &s) ? s : nil
+    }
+
+    private static func copyChildren(_ el: AXUIElement) -> [AXUIElement]? {
+        var v: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(el, kAXChildrenAttribute as CFString, &v) == .success
+        else { return nil }
+        return v as? [AXUIElement]
+    }
+
+    /// Friendly role → AX role ("button" → "AXButton"); passes "AX…" through.
+    private static func normalizeRole(_ r: String) -> String {
+        if r.hasPrefix("AX") { return r }
+        let map = ["button": "AXButton", "link": "AXLink", "textfield": "AXTextField",
+                   "textarea": "AXTextArea", "checkbox": "AXCheckBox", "radio": "AXRadioButton",
+                   "popup": "AXPopUpButton", "combobox": "AXComboBox", "menuitem": "AXMenuItem",
+                   "tab": "AXTab", "slider": "AXSlider", "searchfield": "AXSearchField",
+                   "switch": "AXSwitch"]
+        if let mapped = map[r.lowercased()] { return mapped }
+        return "AX" + r.prefix(1).uppercased() + r.dropFirst()
+    }
+
+    private static func describe(role: String?, title: String?) -> String {
+        var parts: [String] = []
+        if let role { parts.append("role=\(role)") }
+        if let title { parts.append("title~=\"\(title)\"") }
+        return parts.isEmpty ? "the interactable filter" : parts.joined(separator: " ")
+    }
+}
+
+/// Put an Electron app onto the reliable CDP path by relaunching it with a remote
+/// debugging port. Slack/VS Code/Cursor/Discord all speak CDP but only expose it
+/// when launched with `--remote-debugging-port=N`; once they do, `query-dom`/`eval`/
+/// `navigate` drive them exactly like a web page — sidestepping the fragile
+/// synthetic-keystroke path entirely. Browsers are explicitly refused: a personal
+/// Chrome/Edge/Safari can't be relaunched non-destructively (singleton profile lock),
+/// so those stay on the osascript/AX path.
+enum AgentElectron {
+    struct Result: Sendable {
+        let app: String
+        let pid: pid_t
+        let port: UInt16
+        let cdpUp: Bool         // a CDP endpoint answered on the port afterward
+        let relaunched: Bool    // false = it was already up on this port (idempotent)
+    }
+
+    enum ElectronError: LocalizedError {
+        case notRunning(String)
+        case isBrowser(String)
+        case launchFailed(String)
+        var errorDescription: String? {
+            switch self {
+            case .notRunning(let s):
+                return "No running app matches \"\(s)\". Open it first (so I can relaunch the same "
+                    + "bundle with a debug port), or pass its exact name. See `floaty list-windows`."
+            case .isBrowser(let s):
+                return "\"\(s)\" is a web browser — don't relaunch it for a debug port (personal profile / "
+                    + "singleton lock makes it destructive). Use `--via-extension` on tabs/eval/query-dom/"
+                    + "navigate/som (the FloatyTerm CDP extension drives the LIVE browser, no port), or "
+                    + "osascript + `read-text`/`query-ax` (see ref/cdp.md). enable-cdp is for Electron apps "
+                    + "like Slack/VS Code/Discord."
+            case .launchFailed(let s):
+                return "Couldn't relaunch \"\(s)\" with a debug port."
+            }
+        }
+    }
+
+    /// Browsers we must never relaunch (bundle ids).
+    private static let browserBundleIDs: Set<String> = [
+        "com.google.Chrome", "com.google.Chrome.canary", "com.google.Chrome.beta",
+        "com.microsoft.edgemac", "com.brave.Browser", "com.vivaldi.Vivaldi",
+        "company.thebrowser.Browser", "org.mozilla.firefox", "com.apple.Safari",
+    ]
+
+    static func enableCDP(appName: String, port: UInt16) async throws -> Result {
+        // Already up on this port? Idempotent: don't disturb the app.
+        if (try? await AgentDOM.tabs(port: port)) != nil {
+            let pid = NSWorkspace.shared.runningApplications.first {
+                $0.localizedName?.localizedCaseInsensitiveContains(appName) ?? false
+            }?.processIdentifier ?? -1
+            return Result(app: appName, pid: pid, port: port, cdpUp: true, relaunched: false)
+        }
+
+        let ws = NSWorkspace.shared
+        guard let running = ws.runningApplications.first(where: {
+            $0.activationPolicy == .regular &&
+            (($0.localizedName?.localizedCaseInsensitiveContains(appName) ?? false) ||
+             ($0.bundleURL?.deletingPathExtension().lastPathComponent
+                 .localizedCaseInsensitiveContains(appName) ?? false))
+        }), let bundleURL = running.bundleURL else {
+            throw ElectronError.notRunning(appName)
+        }
+
+        let bundleID = Bundle(url: bundleURL)?.bundleIdentifier ?? running.bundleIdentifier ?? ""
+        if browserBundleIDs.contains(bundleID) { throw ElectronError.isBrowser(running.localizedName ?? appName) }
+
+        let name = running.localizedName ?? appName
+
+        // Quit gracefully (lets it persist drafts/state), wait for the process to exit.
+        running.terminate()
+        var waited = 0
+        while !running.isTerminated && waited < 4000 {
+            try? await Task.sleep(nanoseconds: 100_000_000); waited += 100
+        }
+        if !running.isTerminated {
+            running.forceTerminate()
+            try? await Task.sleep(nanoseconds: 400_000_000)
+        }
+
+        // Relaunch a fresh instance carrying the debug-port flag, without stealing focus.
+        let cfg = NSWorkspace.OpenConfiguration()
+        cfg.arguments = ["--remote-debugging-port=\(port)"]
+        cfg.createsNewApplicationInstance = true
+        cfg.activates = false
+        let app: NSRunningApplication
+        do { app = try await ws.openApplication(at: bundleURL, configuration: cfg) }
+        catch { throw ElectronError.launchFailed(name) }
+
+        // Poll for the CDP endpoint to come up (launch + port bind take a moment).
+        var cdpUp = false
+        waited = 0
+        while waited < 9000 {
+            try? await Task.sleep(nanoseconds: 500_000_000); waited += 500
+            if (try? await AgentDOM.tabs(port: port)) != nil { cdpUp = true; break }
+        }
+        return Result(app: name, pid: app.processIdentifier, port: port, cdpUp: cdpUp, relaunched: true)
+    }
+}

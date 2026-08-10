@@ -58,6 +58,10 @@ final class TickerPanel: NSPanel {
     func setPinned(_ pinned: Bool) {
         isPinned = pinned
         reassertFloatingBehavior()
+        // Re-order front so the new Space binding takes effect on the active
+        // Space (same as FloatingPanel.setPinned) — flipping collectionBehavior
+        // alone can leave the window server holding the old attachment.
+        if isVisible { orderFrontRegardless() }
     }
 }
 
