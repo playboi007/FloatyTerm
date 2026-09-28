@@ -1,0 +1,221 @@
+<!DOCTYPE html>
+<html lang="en"><head>
+<meta charset="utf-8">
+<title>Dock Test</title>
+<link rel="stylesheet" href="../fonts.css">
+<link rel="stylesheet" href="../skim.css">
+<link rel="stylesheet" href="../chat.css">
+</head><body>
+<script src="../vendor/marked.min.js"></script>
+<script src="../vendor/purify.min.js"></script>
+<script src="../vendor/highlight.min.js"></script>
+<script src="../skim-classify.js"></script>
+<script src="../skim-render.js"></script>
+<script src="../chat.js"></script>
+<script src="dock-sample.js"></script>
+<script src="change-sample.js"></script>
+<script>
+  // Scripted checks of the dock: slash suggestions, argument choices, menus, keys.
+  //   swift Resources/SkimRender/dev/snapshot.swift Resources/SkimRender/dev/dock-test.html /tmp/dock.png 700 8 420
+  // Failures print as JS errors; the last line says how many checks passed.
+  const posts = [];
+  window.webkit = { messageHandlers: { skim: { postMessage: m => { if (m.type === 'action') posts.push(m.action); return Promise.resolve(); } } } };
+  ClaudeChat.boot({ cwd: '/tmp/demo', home: '' });
+  ClaudeChat.receive([{ type: 'sdk', msg: { type: 'system', subtype: 'init', model: 'claude-opus-5-5[1m]', permissionMode: 'default', session_id: 's1', cwd: '/tmp/demo', terminal_slash_commands: ['color'] } }]);
+  ClaudeChat.receive(window.DOCK_SAMPLE);
+
+  const $ = s => document.querySelector(s);
+  const inp = $('.ck-input');
+  const type = v => { inp.focus(); inp.value = v; inp.setSelectionRange(v.length, v.length); inp.dispatchEvent(new Event('input')); };
+  const key = (k, o = {}) => (o.target || inp).dispatchEvent(new KeyboardEvent('keydown', { key: k, bubbles: true, cancelable: true, ...o }));
+  const items = () => [...document.querySelectorAll('.ck-pop-item .ck-pop-title')].map(e => e.textContent.trim());
+  const sel = () => { const e = $('.ck-pop-item.is-sel .ck-pop-title'); return e && e.textContent.trim(); };
+  const popOpen = () => !$('.ck-pop').hidden;
+  const lastPost = t => posts.filter(p => p.type === t).pop();
+  let pass = 0;
+  const check = (name, ok, got) => { if (ok) pass++; else console.error('FAIL ' + name + (got !== undefined ? ' — got ' + JSON.stringify(got) : '')); };
+
+  // 1 · name suggestions
+  type('/con');
+  check('slash opens', popOpen() && $('.ck-pop').dataset.kind === 'slash');
+  check('closest name first', items()[0].startsWith('/config'), items().slice(0, 3));
+  check('terminal-only command hidden', !items().some(t => t.startsWith('/color')));
+  type('/cost');
+  check('alias finds /usage', items()[0].startsWith('/usage'), items()[0]);
+  type('/con');
+  key('ArrowDown');
+  check('arrow moves selection', sel() && sel().startsWith('/context'), sel());
+  key('Tab');
+  check('Tab completes', inp.value === '/context ', inp.value);
+  check('no hint, no choices: closed', !popOpen());
+
+  // 2 · argument choices
+  type('/effort ');
+  check('effort choices', items().join(',') === 'low,medium,high,xhigh,max,auto', items());
+  type('/effort h');
+  check('choices filter by prefix', items().join(',') === 'high', items());
+  key('Enter');
+  check('Enter picks a choice', inp.value === '/effort high ', inp.value);
+  key('Enter');
+  check('/effort runs here', lastPost('setEffort') && lastPost('setEffort').effort === 'high', lastPost('setEffort'));
+  check('no turn sent for /effort', !lastPost('send'));
+  check('chip shows effort', $('.ck-model').textContent.includes('high'), $('.ck-model').textContent);
+  type('/code-review --fix ');
+  check('used flag not offered again', !items().includes('--fix') && items().includes('low'), items());
+
+  // 3 · Return on a command without arguments sends it
+  type('/cont');
+  key('Enter');
+  check('Enter on /context sends it', lastPost('send') && lastPost('send').text === '/context', lastPost('send'));
+  check('composer cleared', inp.value === '');
+
+  // 4 · Escape closes suggestions first
+  type('/');
+  key('Escape');
+  check('Esc closes suggestions', !popOpen());
+  check('Esc did not interrupt', !lastPost('interrupt'));
+
+  // 5 · model menu
+  $('.ck-model').click();
+  check('model menu opens', popOpen() && $('.ck-pop').dataset.kind === 'model');
+  check('current model checked', $('.ck-pop-item.is-current .ck-pop-title').textContent.startsWith('Default'));
+  key('ArrowRight', { target: document.body });
+  check('→ raises effort', lastPost('setEffort').effort === 'xhigh', lastPost('setEffort'));
+  const sends = posts.filter(p => p.type === 'send').length;
+  inp.focus(); inp.value = 'draft';
+  key('ArrowDown'); key('Enter');
+  check('Enter in the composer picks from the open menu', lastPost('setModel') && lastPost('setModel').model === 'opus[1m]', lastPost('setModel'));
+  check('…and does not send the draft', posts.filter(p => p.type === 'send').length === sends && inp.value === 'draft');
+  inp.value = '';
+  $('.ck-model').click();
+  [...document.querySelectorAll('.ck-pop-item')].find(e => e.textContent.startsWith('Sonnet')).click();
+  check('pick posts setModel', lastPost('setModel') && lastPost('setModel').model === 'sonnet', lastPost('setModel'));
+  check('chip shows Sonnet', $('.ck-model').textContent.startsWith('Sonnet 5'), $('.ck-model').textContent);
+  check('menu closed', !popOpen());
+
+  // 6 · permission modes
+  key('Tab', { shiftKey: true });
+  check('⇧Tab cycles to Accept edits', lastPost('setPermissionMode').mode === 'acceptEdits', lastPost('setPermissionMode'));
+  $('.ck-mode').click();
+  check('mode menu lists Auto', items().some(t => t.includes('Auto')), items());
+  [...document.querySelectorAll('.ck-pop-item')].find(e => e.textContent.includes('Auto')).click();
+  check('pick Auto', lastPost('setPermissionMode').mode === 'auto' && $('.ck-mode').dataset.mode === 'auto');
+  ClaudeChat.receive([{ type: 'mode', mode: 'default' }]);
+  check('a failed change falls back', $('.ck-mode').dataset.mode === 'default');
+
+  // 7 · usage panel
+  $('.ck-usage').click();
+  check('usage panel opens', !$('.ck-usage-panel').hidden);
+  check('asks for plan limits', lastPost('usage') && lastPost('usage').plan === true, lastPost('usage'));
+  check('shows the limits', $('.ck-usage-panel').textContent.includes('74%'));
+  key('Escape');
+  check('Esc closes the panel', $('.ck-usage-panel').hidden);
+
+  // 8 · references from a reply
+  (async () => {
+    const tick = () => new Promise(r => setTimeout(r, 30));
+    ClaudeChat.showUser('Plan the cache change');
+    ClaudeChat.receive([
+      { type: 'sdk', msg: { type: 'assistant', parent_tool_use_id: null, message: { id: 'm1', model: 'claude-opus-5-5', content: [{ type: 'text', text: 'Use a write-through cache.\n\nKeep the TTL at 5 minutes, because the feed updates hourly.' }] } } },
+      { type: 'sdk', msg: { type: 'result', subtype: 'success', duration_ms: 1000, num_turns: 1, total_cost_usd: 0.01 } }]);
+    const paras = [...document.querySelectorAll('.ck-turn:last-child .ck-text p')];
+    const select = (a, b) => { const r = document.createRange(); r.setStart(a, 0); r.setEnd(b, b.childNodes.length); const s = getSelection(); s.removeAllRanges(); s.addRange(r); document.dispatchEvent(new MouseEvent('mouseup')); };
+    select(paras[1], paras[1]);
+    await tick();
+    const btn = $('.ck-refbtn');
+    check('button shows on a reply selection', !btn.hidden);
+    const b = btn.getBoundingClientRect(), p = paras[1].getBoundingClientRect();
+    check('button sits by the selection', Math.abs(b.top - p.bottom) < 60 || Math.abs(b.bottom - p.top) < 60, [b.top, p.bottom]);
+    btn.click();
+    check('chip in the composer', document.querySelectorAll('.ck-refs .ck-ref').length === 1 && !$('.ck-refs').hidden);
+    check('chip is a preview', $('.ck-refs .ck-ref-text').textContent.startsWith('Keep the TTL'));
+    check('selection cleared, button hidden', getSelection().isCollapsed && btn.hidden);
+    // a selection in the user's own message is not offered
+    select($('.ck-turn:last-child .ck-user-text'), $('.ck-turn:last-child .ck-user-text'));
+    await tick();
+    check('no button on a user message', btn.hidden);
+    getSelection().removeAllRanges();
+    // two passages, then remove one with the ×, then Backspace removes the other
+    select(paras[0], paras[0]); await tick(); btn.click();
+    check('second reference', document.querySelectorAll('.ck-refs .ck-ref').length === 2);
+    $('.ck-refs .ck-ref-x').click();
+    check('× removes it', document.querySelectorAll('.ck-refs .ck-ref').length === 1 && $('.ck-refs .ck-ref-text').textContent.startsWith('Use a write'));
+    inp.value = ''; key('Backspace');
+    check('⌫ in an empty composer removes the last', $('.ck-refs').hidden);
+    // send one with a message
+    select(paras[1], paras[1]); await tick(); btn.click();
+    type('Make it 10 minutes instead');
+    key('Enter');
+    const sent = lastPost('send').text;
+    check('sent text carries the note', sent.startsWith('The user selected the passage(s) below from your earlier replies in this conversation and referenced them in this message.\n\n<referenced_text'), sent.slice(0, 160));
+    check('sent text carries the passage and its origin', sent.includes('<referenced_text from_reply_to="Plan the cache change">\nKeep the TTL at 5 minutes') , sent);
+    check('message comes last', sent.endsWith('Make it 10 minutes instead'));
+    const u = $('.ck-turn:last-child .ck-user');
+    check('turn shows chip + message, not the note', u.querySelector('.ck-ref') && u.textContent.includes('Make it 10') && !u.textContent.includes('The user selected'), u.textContent);
+    check('composer chips cleared', $('.ck-refs').hidden);
+
+    // 9 · scrolling: typing never moves the view; the down button does
+    ClaudeChat.receive([{ type: 'sdk', msg: { type: 'assistant', parent_tool_use_id: null, message: { id: 'm2', model: 'claude-opus-5-5',
+      content: [{ type: 'text', text: Array.from({ length: 40 }, (_, i) => `Paragraph ${i + 1} of a long reply.`).join('\n\n') }] } } }]);
+    await tick(); await tick();
+    window.scrollTo(0, 0); window.dispatchEvent(new Event('scroll'));
+    await tick();
+    const down = $('.ck-down');
+    check('down button shows away from the bottom', !down.hidden);
+    type('I am typing a long draft'); await tick(); await tick();
+    check('typing does not scroll', window.scrollY === 0, window.scrollY);
+    ClaudeChat.receive([{ type: 'sdk', msg: { type: 'assistant', parent_tool_use_id: null, message: { id: 'm3', model: 'claude-opus-5-5', content: [{ type: 'text', text: 'More output.' }] } } }]);
+    await tick(); await tick();
+    check('new output does not scroll either', window.scrollY === 0, window.scrollY);
+    check('…and dots the down button', down.dataset.fresh === '1');
+    down.click();
+    await new Promise(r => setTimeout(r, 900));
+    check('down button goes to the bottom', window.innerHeight + window.scrollY >= document.documentElement.scrollHeight - 2, [window.scrollY, document.documentElement.scrollHeight]);
+    check('…and hides, dot cleared', down.hidden && !down.dataset.fresh);
+    check('draft kept', inp.value === 'I am typing a long draft');
+
+    // 10 · file changes: Now first, Diff on request, Expand when it does not fit
+    ClaudeChat.showUser('Raise the TTL');
+    ClaudeChat.receive([
+      { type: 'sdk', msg: { type: 'assistant', parent_tool_use_id: null, message: { id: 'm4', model: 'claude-opus-5-5', content: [{ type: 'tool_use', id: 'tu-e', name: 'Edit', input: CHANGE_SAMPLE.edit }] } } },
+      { type: 'permission_request', id: 'p-e', toolName: 'Edit', input: CHANGE_SAMPLE.edit, toolUseID: 'tu-e', suggestions: [] }]);
+    await tick();
+    const card = [...document.querySelectorAll('.ck-card')].pop();
+    const chg = card.querySelector('.ck-chg');
+    check('card has the change view', !!chg);
+    check('stats from the line diff', chg.querySelector('.ck-chg-stat').textContent === '+5−1', chg.querySelector('.ck-chg-stat').textContent);
+    check('Now is the default', chg.querySelector('.ck-seg-b.is-on').dataset.m === 'now');
+    check('Now shows no removed line, one fold', !chg.querySelector('.ck-ln.is-del') && chg.querySelectorAll('.ck-ln-gap.is-del').length === 1);
+    check('Now shows the new version', chg.querySelector('.ck-chg-body').textContent.includes('10 * 60e3') && !chg.querySelector('.ck-chg-body').textContent.includes('5 * 60e3'));
+    chg.querySelector('.ck-ln-gap.is-del').click();
+    check('the fold opens the removed line', chg.querySelector('.ck-ln.is-del').textContent.includes('5 * 60e3'));
+    chg.querySelector('.ck-seg-b[data-m="diff"]').click();
+    check('Diff shows old and new', chg.querySelectorAll('.ck-ln.is-del').length === 1 && chg.querySelectorAll('.ck-ln.is-add').length === 5);
+    check('Diff folds a long unchanged run', !!chg.querySelector('.ck-ln-gap.is-eq'));
+    const exp = chg.querySelector('.ck-chg-exp');
+    check('Expand shows for a change that does not fit', !exp.hidden);
+    exp.click();
+    check('Expand makes it big (and the card wide)', chg.classList.contains('is-big') && card.classList.contains('is-wide'));
+    check('big body is taller', chg.querySelector('.ck-chg-body').clientHeight > 230, chg.querySelector('.ck-chg-body').clientHeight);
+    exp.click();
+    check('Collapse restores it', !chg.classList.contains('is-big') && !card.classList.contains('is-wide'));
+    // the tool row has the same view (edits can run with no card)
+    const rowLine = [...document.querySelectorAll('.ck-row')].pop();
+    const rowDetail = rowLine.nextElementSibling;
+    check('row detail holds the change view', rowDetail.classList.contains('is-change') && !!rowDetail.querySelector('.ck-chg'));
+    ClaudeChat.receive([{ type: 'sdk', msg: { type: 'user', parent_tool_use_id: null, message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'tu-e', content: 'The file has been updated.' }] } } }]);
+    check('row meta from the line diff', rowLine.querySelector('.ck-meta').textContent === '+5 −1', rowLine.querySelector('.ck-meta').textContent);
+    check('success keeps the view, no result text', !rowDetail.querySelector('.ck-out') && !!rowDetail.querySelector('.ck-chg'));
+    rowLine.click(); await tick();
+    check('row opens to the view', !rowDetail.hidden);
+    // a failed edit shows the error above its change
+    ClaudeChat.receive([
+      { type: 'sdk', msg: { type: 'assistant', parent_tool_use_id: null, message: { id: 'm5', model: 'claude-opus-5-5', content: [{ type: 'tool_use', id: 'tu-w', name: 'Write', input: CHANGE_SAMPLE.write }] } } },
+      { type: 'sdk', msg: { type: 'user', parent_tool_use_id: null, message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'tu-w', is_error: true, content: 'Permission denied' }] } } }]);
+    const wDetail = [...document.querySelectorAll('.ck-row')].pop().nextElementSibling;
+    check('failed write: error first, then the change', wDetail.firstChild.classList.contains('ck-out') && wDetail.firstChild.textContent === 'Permission denied' && !!wDetail.querySelector('.ck-chg'));
+    check('write view is numbered, no Now/Diff', !!wDetail.querySelector('.ck-ln-no') && !wDetail.querySelector('.ck-chg-seg'));
+    console.error(`dock-test: ${pass} passed`);
+  })();
+</script>
+</body></html>

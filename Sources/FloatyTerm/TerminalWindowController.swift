@@ -1028,6 +1028,9 @@ final class TerminalWindowController: NSObject, NSWindowDelegate {
     /// Public entry for the menu bar's "New Note".
     func openNewNote() { addNoteTab() }
 
+    /// Public entry for the menu bar's "New Claude Tab".
+    func openNewClaudeTab() { addClaudeTab() }
+
     /// Public entry for the menu bar's "Mirror a Window…".
     func openNewMirror() { addMirrorTab() }
 
@@ -1104,6 +1107,10 @@ final class TerminalWindowController: NSObject, NSWindowDelegate {
             }
             if chars.lowercased() == "m" {   // ⇧⌘M — Mirror a Window…
                 addMirrorTab()
+                return true
+            }
+            if chars.lowercased() == "a" {   // ⇧⌘A — New Claude Tab
+                addClaudeTab()
                 return true
             }
         }
@@ -1291,6 +1298,43 @@ final class TerminalWindowController: NSObject, NSWindowDelegate {
     private func installSimpleTab(_ tab: any TabContent) {
         tab.onTitleChanged = { [weak self] in self?.refreshTabStrip() }
         insertTab(tab)
+    }
+
+    /// Opens a Claude tab (Claude Code without its TUI) in the active
+    /// terminal's directory — the folder the user is working in, whatever the
+    /// "inherit working directory" setting says, since a session is tied to it.
+    func addClaudeTab() {
+        guard ClaudeChatController.isAvailable else {
+            let alert = NSAlert()
+            alert.messageText = "The Claude tab is not available"
+            alert.informativeText = "Its renderer files (Resources/SkimRender) are missing from this build. Rebuild FloatyTerm with ./build.sh."
+            alert.runModal()
+            return
+        }
+        let active = tabs.indices.contains(activeIndex) ? tabs[activeIndex] : nil
+        let cwd = (active as? TerminalController)?.currentWorkingDirectory
+            ?? (active as? ClaudeChatController)?.cwd
+            ?? NSHomeDirectory()
+        let tab = ClaudeChatController(cwd: cwd)
+        tab.onOpenTUI = { [weak self] dir, sessionID in self?.openClaudeTUI(in: dir, sessionID: sessionID) }
+        installSimpleTab(tab)
+    }
+
+    /// A terminal tab that continues a Claude tab's session in the TUI.
+    private func openClaudeTUI(in dir: String, sessionID: String) {
+        let tab = TerminalController(startDirectory: dir)
+        tab.onTerminated = { [weak self, weak tab] in
+            guard let self, let tab,
+                  let idx = self.tabs.firstIndex(where: { $0 === tab }) else { return }
+            self.closeTab(idx)
+        }
+        tab.onTitleChanged = { [weak self] in self?.refreshTabStrip() }
+        insertTab(tab)
+        // The pty buffers input, but give the shell a beat to print its prompt.
+        let safeID = sessionID.filter { $0.isHexDigit || $0 == "-" }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) { [weak tab] in
+            tab?.run(command: "claude --resume \(safeID)")
+        }
     }
 
     /// Opens a new markdown note tab, backed by a fresh scratch file in the
@@ -1595,8 +1639,10 @@ final class TerminalWindowController: NSObject, NSWindowDelegate {
     /// (needs-input wins over unseen output wins over running).
     func status(of tab: any TabContent) -> SessionStatus {
         if let tc = tab as? TerminalController, tc.awaitingInput { return .needsInput }
+        if let cc = tab as? ClaudeChatController, cc.awaitingApproval { return .needsInput }
         if tab.hasUnseenOutput { return .unseenOutput }
         if let tc = tab as? TerminalController, tc.hasRunningForegroundJob { return .running }
+        if let cc = tab as? ClaudeChatController, cc.isBusy { return .running }
         return .idle
     }
 

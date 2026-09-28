@@ -1534,6 +1534,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         statusItem.onNewTab        = { [weak self] in self?.newTerminalTabInCurrentWindow() }
         statusItem.onNewBrowserTab = { [weak self] in self?.newBrowserTabInCurrentWindow() }
         statusItem.onNewNote       = { [weak self] in self?.newNoteTabInCurrentWindow() }
+        statusItem.onNewClaudeTab  = { [weak self] in self?.newClaudeTabInCurrentWindow() }
         statusItem.onMirrorWindow  = { [weak self] in self?.newMirrorTabInCurrentWindow() }
         statusItem.onCompareFiles  = { [weak self] in self?.compareFilesInCurrentWindow() }
         statusItem.onShowRuler     = { [weak self] in self?.ruler.toggle() }
@@ -1892,6 +1893,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             // No window yet — make one (starts with a terminal tab), then add browser.
             let wc = makeWindow()
             wc.openNewBrowserTab()
+        }
+    }
+
+    private func newClaudeTabInCurrentWindow() {
+        if let wc = currentWindow() {
+            wc.openNewClaudeTab()
+            wc.show()
+        } else {
+            let wc = makeWindow()
+            wc.openNewClaudeTab()
         }
     }
 

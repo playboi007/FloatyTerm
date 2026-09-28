@@ -1,0 +1,91 @@
+<!DOCTYPE html>
+<html lang="en"><head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Claude Tab Replay</title>
+<link rel="stylesheet" href="../fonts.css">
+<link rel="stylesheet" href="../skim.css">
+<link rel="stylesheet" href="../chat.css">
+</head><body>
+<script src="../vendor/marked.min.js"></script>
+<script src="../vendor/purify.min.js"></script>
+<script src="../vendor/highlight.min.js"></script>
+<script src="../vendor/hljs-dart.min.js"></script>
+<script src="../skim-classify.js"></script>
+<script src="../skim-render.js"></script>
+<script src="../chat.js"></script>
+<script src="session-sample.js"></script>
+<script src="dock-sample.js"></script>
+<script src="change-sample.js"></script>
+<script>
+  // Replays a recorded sidecar session into the Claude tab page.
+  //   ?stop=permission   stop right after the first approval request (pending card)
+  //   ?speed=4           timed replay at 4× (default: instant)
+  //   ?pop=model|mode|usage|slash|slash-arg   open a dock menu (instant replay only)
+  //   ?change=edit|write|multi (&diff=1, &big=1)  an approval card with a file change
+  //   ?ref=select|chips  a selected reply passage, or two referenced ones in the composer
+  const q = new URLSearchParams(location.search);
+  const events = window.SESSION_SAMPLE;
+  const init = events.find(e => e.type === 'sdk' && e.msg.subtype === 'init');
+  ClaudeChat.boot({ cwd: init ? init.msg.cwd : '', home: '' });
+  ClaudeChat.showUser('Do these in order: 1) Read README.md. 2) Run ls -la. 3) Write notes.txt. Then summarize with a table and a "Things to know" list.');
+  const stopAt = q.get('stop') === 'permission' ? events.findIndex(e => e.type === 'permission_request') : events.length - 1;
+  const speed = Number(q.get('speed') || 0);
+  if (!speed) {
+    ClaudeChat.receive(events.slice(0, stopAt + 1));
+    // Reset times relative to now, so the sample does not go stale.
+    for (const e of window.DOCK_SAMPLE || []) if (e.plan) e.plan.limits.forEach((l, i) => { l.resets_at = new Date(Date.now() + [2.4 * 3600e3, 5.2 * 86400e3][i % 2]).toISOString(); });
+    ClaudeChat.receive(window.DOCK_SAMPLE || []);
+    const pop = q.get('pop');
+    const inp = document.querySelector('.ck-input');
+    const type = v => { inp.focus(); inp.value = v; inp.setSelectionRange(v.length, v.length); inp.dispatchEvent(new Event('input')); };
+    if (pop === 'model') document.querySelector('.ck-model').click();
+    if (pop === 'mode') document.querySelector('.ck-mode').click();
+    if (pop === 'usage') document.querySelector('.ck-usage').click();
+    if (pop === 'slash') type(q.get('q') != null ? '/' + q.get('q') : '/');
+    if (pop === 'slash-arg') type(q.get('q') || '/code-review ');
+    // ?change=edit|write|multi: an approval card for that file change (&big=1 expands it, &diff=1 shows Diff)
+    const change = q.get('change');
+    if (change) {
+      const toolName = { edit: 'Edit', write: 'Write', multi: 'MultiEdit' }[change];
+      ClaudeChat.showUser('Raise the TTL and cap the cache size');
+      ClaudeChat.receive([{ type: 'permission_request', id: 'p-demo', toolName, input: CHANGE_SAMPLE[change], toolUseID: 'tu-demo', suggestions: [] }]);
+      setTimeout(() => {
+        if (q.get('diff')) document.querySelector('.ck-card:last-of-type .ck-seg-b[data-m="diff"]').click();
+        if (q.get('big')) document.querySelector('.ck-card:last-of-type .ck-chg-exp').click();
+        window.__keepScroll = true;
+        document.querySelector('.ck-card:last-of-type').scrollIntoView({ block: q.get('big') ? 'start' : 'center' });
+      }, 150);
+    }
+    // ?up=1: read higher up while new output arrives (the down button shows, with its dot)
+    if (q.get('up')) {
+      window.__keepScroll = true;
+      setTimeout(() => {
+        window.scrollTo(0, document.documentElement.scrollHeight - innerHeight - 260);
+        window.dispatchEvent(new Event('scroll'));
+        ClaudeChat.receive([{ type: 'host', kind: 'info', message: 'New output while you read.' }]);
+        type('A draft I am still writing');
+      }, 300);
+    }
+    // ?ref=select: a reply passage selected (the button shows) · ?ref=chips: two passages referenced
+    const ref = q.get('ref');
+    if (ref) {
+      const items = [...document.querySelectorAll('.ck-text li')].slice(-3);
+      const pick = el => { const r = document.createRange(); r.selectNodeContents(el); getSelection().removeAllRanges(); getSelection().addRange(r); document.dispatchEvent(new MouseEvent('mouseup')); };
+      if (ref === 'chips') { pick(items[0]); setTimeout(() => { document.querySelector('.ck-refbtn').click(); pick(items[2]); setTimeout(() => { document.querySelector('.ck-refbtn').click(); type('Why did the hook refuse it?'); }, 50); }, 50); }
+      else pick(items[2]);
+    }
+  }
+  else {
+    let i = 0;
+    const next = () => {
+      if (i > stopAt) return;
+      const e = events[i++];
+      ClaudeChat.receive([e]);
+      const gap = i <= stopAt ? (events[i].t - e.t) / speed : 0;
+      setTimeout(next, Math.min(gap, 1500));
+    };
+    next();
+  }
+</script>
+</body></html>
