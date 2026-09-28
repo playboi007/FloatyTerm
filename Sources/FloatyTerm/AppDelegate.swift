@@ -15,6 +15,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var fleetSummaryTimer: Timer?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        EditMenu.install()   // ⌘Z/⌘C/⌘V/⌘A for text fields and web views
         // Loopback relay for remote devtools awareness: external pages that
         // include http://127.0.0.1:7777/floaty.js stream console/network
         // events into agent-tailable logs under App Support/FloatyTerm/Devtools.
