@@ -12,3 +12,6 @@ FloatyTerm.app/
 
 # Agent-host skill docs (in flux; not versioned yet)
 docs/floaty-ui-control/
+
+# Dart tool output
+.dart_tool/

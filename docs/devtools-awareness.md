@@ -5,6 +5,10 @@ app running in an external browser** — console, network, and structured error
 diagnoses — without that app ever living inside a FloatyTerm tab. The agent just
 tails a log file.
 
+Recording **all** traffic — including the successful calls this pipeline
+deliberately drops — is a separate feature: see
+[network-recording.md](network-recording.md).
+
 This doc covers the moving parts: the relay, the two capture paths (injected JS
 vs. an optional Dart hook), the diagnosis envelope, HTTP-status coverage, and
 the on-disk NDJSON schema.

@@ -268,6 +268,16 @@ final class FloatyTerminalView: LocalProcessTerminalView {
             // which reverts edits to the command you're currently typing.
             send([0x1F])
             return true
+        case "/":
+            // ⌘/ — open the selected text as a link or file path (same routing
+            // as ⌘-click: URLs open in a browser tab, Markdown/image paths in
+            // their viewers, bare paths in Finder or the default app).
+            if let text = selectedText?.trimmingCharacters(in: .whitespacesAndNewlines),
+               !text.isEmpty {
+                onOpenSelection?(text)
+                return true
+            }
+            return super.performKeyEquivalent(with: event)
         default:
             return super.performKeyEquivalent(with: event)
         }
@@ -292,6 +302,10 @@ final class FloatyTerminalView: LocalProcessTerminalView {
     /// Wired by TerminalController: invoked with an absolute Markdown-file path
     /// when the user picks "Open in Markdown Viewer" from the context menu.
     var onOpenMarkdownInViewer: ((String) -> Void)?
+
+    /// Wired by TerminalController: invoked with the raw selected text when the
+    /// user presses ⌘/ to open the selection as a link or file path.
+    var onOpenSelection: ((String) -> Void)?
 
     /// Resolves the current selection to an absolute filesystem path — absolute
     /// as-is, or relative to the shell's cwd — trimming surrounding quotes the
