@@ -1,0 +1,105 @@
+<!DOCTYPE html>
+<html lang="en"><head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>SkimRender Fixtures</title>
+<link rel="stylesheet" href="../fonts.css">
+<link rel="stylesheet" href="../skim.css">
+<style>
+  .fx { max-width: 1280px; margin: 0 auto; padding: 32px 28px 120px; }
+  .fx h1 { font-size: 26px; font-weight: 600; letter-spacing: -.02em; margin: 0 0 6px; }
+  .fx > p { color: var(--muted); margin: 0 0 24px; }
+  .fx-bar { display: flex; gap: 8px; margin-bottom: 20px; flex-wrap: wrap; }
+  .fx-case { display: flex; flex-wrap: wrap; gap: 18px; padding: 26px 0; border-top: 1px solid var(--line); }
+  .fx-case > div { min-width: 0; display: flex; flex-direction: column; gap: 8px; }
+  .fx-raw { flex: 1 1 300px; }
+  .fx-out { flex: 1.8 1 460px; }
+  .fx-raw pre { margin: 0; padding: 14px 16px; background: var(--inset); border: 1px solid var(--line); border-radius: 10px;
+    font: 12px/1.6 var(--mono); color: var(--muted); white-space: pre-wrap; overflow-wrap: anywhere; }
+  .fx-out .sk-doc { padding: 0; max-width: none; margin: 0; }
+  .fx-head { display: flex; justify-content: space-between; gap: 10px; }
+  .fx-kinds { font: 11px var(--mono); color: var(--ghost); }
+  .fx.hide-raw .fx-raw { display: none; }
+  textarea { width: 100%; min-height: 140px; background: var(--inset); color: var(--text-3); border: 1px solid var(--line-2);
+    border-radius: 10px; padding: 12px; font: 12px/1.6 var(--mono); }
+  .fx-log { font: 12px var(--mono); color: var(--good); }
+  @media (max-width: 640px) { .fx { padding: 20px 16px 80px; } }
+</style>
+</head><body>
+<div class="fx" id="fx">
+  <h1>SkimRender fixtures</h1>
+  <p>Each sample is shown as raw Markdown beside the enhanced render. The label on the right lists the block kinds the classifier found.</p>
+  <div class="fx-bar">
+    <button class="sk-btn" id="toggleRaw">Hide raw source</button>
+    <button class="sk-btn" id="stream">Simulate streaming (options)</button>
+    <label class="sk-btn" style="display:flex;align-items:center;gap:6px"><input type="checkbox" id="interactive" checked> Interactive</label>
+  </div>
+  <div class="fx-case">
+    <div class="fx-raw"><span class="sk-label">Paste Markdown</span><textarea id="paste" placeholder="Paste a Claude reply here"></textarea></div>
+    <div class="fx-out"><div class="fx-head"><span class="sk-label">Enhanced</span><span class="fx-kinds" id="pasteKinds"></span></div><div class="sk-doc" id="pasteOut"></div></div>
+  </div>
+  <div id="cases"></div>
+</div>
+<script src="../vendor/marked.min.js"></script>
+<script src="../vendor/purify.min.js"></script>
+<script src="../vendor/highlight.min.js"></script>
+<script src="../vendor/hljs-dart.min.js"></script>
+<script src="../vendor/mermaid.min.js"></script>
+<script src="../skim-classify.js"></script>
+<script src="../skim-render.js"></script>
+<script src="samples.js"></script>
+<script>
+  const log = document.createElement('div');
+  const opts = () => ({ interactive: document.getElementById('interactive').checked,
+    onAction: a => { log.className = 'fx-log'; log.textContent = 'onAction → ' + JSON.stringify(a); } });
+  const cases = document.getElementById('cases');
+  const outs = [];
+  function draw() {
+    cases.textContent = ''; outs.length = 0;
+    const q = new URLSearchParams(location.search), only = (q.get('only') || '').toLowerCase();
+    if (q.get('raw') === '0') document.getElementById('fx').classList.add('hide-raw');
+    for (const s of SkimSamples) {
+      if (only && !only.split(',').some(o => s.name.toLowerCase().includes(o))) continue;
+      const raw = document.createElement('pre'); raw.textContent = s.md;
+      const out = document.createElement('div'); out.className = 'sk-doc';
+      const kinds = document.createElement('span'); kinds.className = 'fx-kinds';
+      const blocks = SkimRender.render(out, s.md, opts());
+      const got = blocks.map(b => b.kind).join(' · ');
+      kinds.textContent = got + (got === s.expect.join(' · ') ? '' : '  ≠ expected ' + s.expect.join(' · '));
+      if (got !== s.expect.join(' · ')) kinds.style.color = 'var(--bad)';
+      const c = document.createElement('div'); c.className = 'fx-case';
+      c.innerHTML = '<div class="fx-raw"><span class="sk-label"></span></div><div class="fx-out"><div class="fx-head"><span class="sk-label">Enhanced</span></div></div>';
+      c.querySelector('.fx-raw .sk-label').textContent = s.name;
+      c.querySelector('.fx-raw').append(raw);
+      c.querySelector('.fx-head').append(kinds);
+      c.querySelector('.fx-out').append(out);
+      cases.append(c);
+      outs.push({ s, out });
+    }
+    cases.firstChild && cases.firstChild.querySelector('.fx-out').append(log);
+  }
+  draw();
+  document.getElementById('interactive').onchange = draw;
+  document.getElementById('toggleRaw').onclick = e => {
+    const fx = document.getElementById('fx'); fx.classList.toggle('hide-raw');
+    e.target.textContent = fx.classList.contains('hide-raw') ? 'Show raw source' : 'Hide raw source';
+  };
+  const paste = document.getElementById('paste'), pasteOut = document.getElementById('pasteOut');
+  paste.oninput = () => {
+    const b = SkimRender.render(pasteOut, paste.value, opts());
+    document.getElementById('pasteKinds').textContent = b.map(x => x.kind).join(' · ');
+  };
+  document.getElementById('stream').onclick = () => {
+    const { s, out } = outs[0];
+    out.textContent = '';
+    let n = 0;
+    const tick = () => {
+      n = Math.min(s.md.length, n + 12);
+      SkimRender.render(out, s.md.slice(0, n), { ...opts(), streaming: n < s.md.length });
+      if (n < s.md.length) setTimeout(tick, 16);
+    };
+    tick();
+    out.scrollIntoView({ block: 'start' });
+  };
+</script>
+</body></html>

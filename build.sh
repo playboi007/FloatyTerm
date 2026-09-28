@@ -21,6 +21,10 @@ mkdir -p "$APP/Contents/MacOS"
 cp ".build/release/FloatyTerm" "$APP/Contents/MacOS/FloatyTerm"
 cp "Info.plist" "$APP/Contents/Info.plist"
 
+# SkimRender (the Markdown renderer's JS, CSS and fonts), minus its dev fixtures.
+mkdir -p "$APP/Contents/Resources"
+rsync -a --exclude 'dev/' "Resources/SkimRender/" "$APP/Contents/Resources/SkimRender/"
+
 IDENTITY="${FLOATY_SIGN_ID:-$(security find-identity -v -p codesigning 2>/dev/null \
     | awk -F'"' 'NR==1 {print $2}')}"
 if [[ -n "${IDENTITY:-}" ]]; then
