@@ -80,8 +80,11 @@ final class ClaudeSidecar {
 
     // MARK: - Lifecycle
 
-    func start(cwd: String, resume: String? = nil, permissionMode: String? = nil,
-               model: String? = nil, effort: String? = nil) throws {
+    /// `fork`: with `resume`, start a new session from a copy of that one's
+    /// transcript (a side chat) instead of continuing it.
+    /// `thinking`: show thinking summaries (true/false); nil follows the user's settings.
+    func start(cwd: String, resume: String? = nil, fork: Bool = false, permissionMode: String? = nil,
+               model: String? = nil, effort: String? = nil, thinking: Bool? = nil) throws {
         guard let dir = Self.directory else { throw StartError.missingSidecar }
         guard let node = Self.nodePath else { throw StartError.missingNode }
         guard let claude = Self.claudePath else { throw StartError.missingClaude }
@@ -122,9 +125,11 @@ final class ClaudeSidecar {
 
         var start: [String: Any] = ["type": "start", "cwd": cwd, "claudePath": claude]
         if let resume { start["resume"] = resume }
+        if fork { start["fork"] = true }
         if let permissionMode { start["permissionMode"] = permissionMode }
         if let model { start["model"] = model }
         if let effort { start["effort"] = effort }
+        if let thinking { start["thinking"] = thinking }
         send(start)
     }
 
