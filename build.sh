@@ -15,7 +15,7 @@ APP="FloatyTerm.app"
 echo "==> Compiling (release)…"
 swift build -c release
 
-echo "==> Assembling $APP…"
+echo "==> Assembling ${APP}…"
 rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS"
 cp ".build/release/FloatyTerm" "$APP/Contents/MacOS/FloatyTerm"
