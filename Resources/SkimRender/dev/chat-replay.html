@@ -17,17 +17,21 @@
 <script src="session-sample.js"></script>
 <script src="dock-sample.js"></script>
 <script src="change-sample.js"></script>
+<script src="history-sample.js"></script>
 <script>
   // Replays a recorded sidecar session into the Claude tab page.
   //   ?stop=permission   stop right after the first approval request (pending card)
   //   ?speed=4           timed replay at 4× (default: instant)
-  //   ?pop=model|mode|usage|slash|slash-arg   open a dock menu (instant replay only)
+  //   ?pop=model|mode|usage|more|slash|slash-arg   open a dock menu (instant replay only)
   //   ?change=edit|write|multi (&diff=1, &big=1)  an approval card with a file change
+  //   ?side=1 (&back=1)  a side chat with one exchange (or main in view, with the side's news)
+  //   ?think=live|done|open  a thinking block with summary text
+  //   ?resume=pick|done  the /resume list, or a resumed conversation
   //   ?ref=select|chips  a selected reply passage, or two referenced ones in the composer
   const q = new URLSearchParams(location.search);
   const events = window.SESSION_SAMPLE;
   const init = events.find(e => e.type === 'sdk' && e.msg.subtype === 'init');
-  ClaudeChat.boot({ cwd: init ? init.msg.cwd : '', home: '' });
+  ClaudeChat.boot({ cwd: init ? init.msg.cwd : '', home: '/Users/demo' });
   ClaudeChat.showUser('Do these in order: 1) Read README.md. 2) Run ls -la. 3) Write notes.txt. Then summarize with a table and a "Things to know" list.');
   const stopAt = q.get('stop') === 'permission' ? events.findIndex(e => e.type === 'permission_request') : events.length - 1;
   const speed = Number(q.get('speed') || 0);
@@ -42,6 +46,7 @@
     if (pop === 'model') document.querySelector('.ck-model').click();
     if (pop === 'mode') document.querySelector('.ck-mode').click();
     if (pop === 'usage') document.querySelector('.ck-usage').click();
+    if (pop === 'more') document.querySelector('.ck-more').click();
     if (pop === 'slash') type(q.get('q') != null ? '/' + q.get('q') : '/');
     if (pop === 'slash-arg') type(q.get('q') || '/code-review ');
     // ?change=edit|write|multi: an approval card for that file change (&big=1 expands it, &diff=1 shows Diff)
@@ -56,6 +61,53 @@
         window.__keepScroll = true;
         document.querySelector('.ck-card:last-of-type').scrollIntoView({ block: q.get('big') ? 'start' : 'center' });
       }, 150);
+    }
+    // ?side=1: a side chat with one exchange (&back=1: main in view, with the side's news on the switch)
+    if (q.get('side')) {
+      document.querySelector('.ck-view').click();
+      type('Which step failed, and would a retry help?');
+      inp.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true, cancelable: true }));
+      ClaudeChat.receive([
+        { type: 'sdk', msg: { type: 'system', subtype: 'init', session_id: 'side-demo', model: 'claude-opus-5-5[1m]', permissionMode: 'default', cwd: init.msg.cwd } },
+        { type: 'sdk', msg: { type: 'assistant', parent_tool_use_id: null, message: { id: 'side-a1', model: 'claude-opus-5-5', content: [{ type: 'text', text:
+          'Step 3 failed: the **Write** of `notes.txt` was blocked by a hook.\n\n**Things to know:**\n- A retry would fail the same way — the hook refuses every write in this folder.\n- To write the file, remove or relax the hook in `.claude/settings.json` first.' }] } } },
+        { type: 'sdk', msg: { type: 'result', subtype: 'success', duration_ms: 4200, num_turns: 1, total_cost_usd: 0.02 } }], 'side-1');
+      if (q.get('back')) document.querySelector('.ck-view').click();
+    }
+    // ?think=live|done|open: a thinking block with summary text (still thinking, finished, or finished and opened)
+    const think = q.get('think');
+    if (think) {
+      ClaudeChat.showUser('Is 391 prime? Check it properly.');
+      const t = Date.now() - 14000, ev = (dt, event) => ({ t: t + dt, type: 'sdk', msg: { type: 'stream_event', parent_tool_use_id: null, event } });
+      const parts = ['**Checking small primes**\n\n391 is odd, and its digits sum to 13, so 2 and 3 are out. It does not end in 0 or 5.\n\n',
+        '**Trying 7 to 19**\n\n7 × 55 = 385, remainder 6. 11 × 35 = 385, remainder 6. 13 × 30 = 390, remainder 1. ',
+        '17 × 23 = 391 — found a factor.\n\n**Conclusion**\n\n391 = 17 × 23, so it is not prime.'];
+      const evs = [ev(0, { type: 'message_start', message: { id: 'th-demo', model: 'claude-opus-5-5' } }),
+        ev(10, { type: 'content_block_start', index: 0, content_block: { type: 'thinking', thinking: '' } }),
+        ...parts.map((p, i) => ev(3000 * (i + 1), { type: 'content_block_delta', index: 0, delta: { type: 'thinking_delta', thinking: p } }))];
+      if (think !== 'live') evs.push(ev(12000, { type: 'content_block_stop', index: 0 }),
+        ev(12100, { type: 'content_block_start', index: 1, content_block: { type: 'text', text: '' } }),
+        ev(12200, { type: 'content_block_delta', index: 1, delta: { type: 'text_delta', text: 'No — **391 = 17 × 23**.' } }),
+        ev(12300, { type: 'content_block_stop', index: 1 }));
+      ClaudeChat.receive(think === 'live' ? evs.slice(0, 4) : evs);
+      if (think === 'open') document.querySelector('.ck-turn:last-of-type .ck-think-head').click();
+    }
+    // ?resume=pick|done: the /resume list, or a resumed conversation drawn from its history
+    const resume = q.get('resume');
+    if (resume) {
+      const H = { ...window.HISTORY_SAMPLE, sessionId: 'b7c1e2d4-0000-4000-8000-00000000demo' };
+      const now = Date.now();
+      type('/resume ');
+      ClaudeChat.receive([{ type: 'sessions', list: [
+        { id: init.msg.session_id, title: 'Probe project walk-through', firstPrompt: 'Do these in order', branch: null, modified: now - 40e3, size: 9e4 },
+        { id: H.sessionId, title: 'Cache TTL and eviction', firstPrompt: 'Raise the TTL and cap the cache size', branch: 'feature/cache', modified: now - 3 * 3600e3, size: 2.4e6 },
+        { id: 'c0ffee00-0000-4000-8000-000000000002', title: 'Fix the flaky Space test', firstPrompt: 'why does the window drop out of its Space', branch: 'fix/spaces', modified: now - 2 * 86400e3, size: 6.1e6 },
+        { id: 'c0ffee00-0000-4000-8000-000000000003', title: 'Network recording export', firstPrompt: 'add HAR export', branch: 'feature/net', modified: now - 17 * 86400e3, size: 1.2e6 }] }]);
+      if (resume === 'done') {
+        inp.dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowDown', bubbles: true, cancelable: true }));
+        inp.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true, cancelable: true }));
+        ClaudeChat.receive([H]);
+      }
     }
     // ?up=1: read higher up while new output arrives (the down button shows, with its dot)
     if (q.get('up')) {

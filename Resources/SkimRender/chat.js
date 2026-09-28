@@ -36,52 +36,92 @@
     for (const kid of kids.flat(Infinity)) if (kid != null && kid !== false) el.append(kid instanceof Node ? kid : document.createTextNode(String(kid)));
     return el;
   };
-  const post = action => { try { root.webkit.messageHandlers.skim.postMessage({ type: 'action', action }); } catch (e) { console.log('action', action); } };
+  // Every action names the conversation it comes from (main or a side chat).
+  const post = action => {
+    if (!('channel' in action) && S) action = { channel: S.id, ...action };
+    try { root.webkit.messageHandlers.skim.postMessage({ type: 'action', action }); } catch (e) { console.log('action', action); }
+  };
 
   // ── state ──────────────────────────────────────────────────────────────
 
-  const S = {
-    cwd: '', model: '', mode: 'default', sessionId: null, cost: 0,
-    busy: false, turn: null, turns: [],
-    rows: new Map(),        // tool_use id → row
-    texts: new Map(),       // `${messageId}:${index}` → text item
-    msgTexts: new Map(),    // messageId → [text item] in order (to match full assistant messages)
-    cards: new Map(),       // permission id → card
-    blockKind: new Map(),   // `${messageId}:${index}` → 'text' | 'tool_use' | 'thinking'
-    currentMsg: null, thinking: false, lastTool: null,
+  /** Facts of the folder and account, the same for every conversation. */
+  const SHARED = {
+    cwd: '', home: '',
     // from the sidecar's capabilities event and later changes
     models: [], commands: [], terminalCmds: new Set(), outputStyles: [],
-    modelChoice: null,      // the model menu value the user picked ('sonnet', 'default', …)
-    effort: null,           // null: the model's default
-    modelUsage: null, turns_n: 0, apiMs: 0,
-    ctx: null, plan: null, planAt: 0,
-    refs: []                // text referenced from Claude's replies, sent with the next message
+    plan: null, planAt: 0,  // plan limits (account-wide)
+    git: null,              // the sidecar's git state for the session's folder
+    info: {},               // from init: Claude Code version, MCP servers, output style
+    sessions: null          // { at, list }: the folder's conversations, for /resume
   };
+
+  /**
+   * One conversation: main, or a side chat forked from it. Unset fields read
+   * through to SHARED. Events are processed against their own conversation;
+   * only the one in view paints the dock.
+   */
+  function newConv(id, label) {
+    return Object.assign(Object.create(SHARED), {
+      id, label, log: null,
+      model: '', mode: 'default', sessionId: null, cost: 0,
+      busy: false, turn: null, turns: [],
+      rows: new Map(),        // tool_use id → row
+      texts: new Map(),       // `${messageId}:${index}` → text item
+      msgTexts: new Map(),    // messageId → [text item] in order (to match full assistant messages)
+      cards: new Map(),       // permission id → card
+      blockKind: new Map(),   // `${messageId}:${index}` → 'text' | 'tool_use' | 'thinking'
+      currentMsg: null, thinking: false, lastTool: null,
+      thinks: new Map(), msgThinks: new Map(), liveThink: null, thinkWord: null,   // thinking blocks
+      thinkingOn: null, thinkingSource: null,   // whether thinking text is shown (the sidecar reports it)
+      modelChoice: null,      // the model menu value the user picked ('sonnet', 'default', …)
+      effort: null,           // null: the model's default
+      modelUsage: null, turns_n: 0, apiMs: 0,
+      ctx: null,
+      refs: [],               // text referenced from Claude's replies, sent with the next message
+      draft: '', follow: true, scrollY: 0, unseen: false
+    });
+  }
+  const main = newConv('main', 'Main');
+  const convs = new Map([['main', main]]);
+  let S = main;          // the conversation being worked on (events, actions)
+  let active = main;     // the conversation in view
+  const inView = () => S === active;
 
   /** The time of the event being processed (sidecar stamp), else now. */
   let evT = 0;
   const clock = () => evT || Date.now();
 
-  let refsEl, refBtn, log, dock, dockIn, statusEl, statusDot, statusText, modelEl, modeBtn, costEl, usagePanel, composer, input, sendBtn, popEl;
+  let viewBtn, viewMenuBtn, grip, ctxEl, moreBtn, refsEl, refBtn, dock, dockIn, statusEl, statusDot, statusText, modelEl, modeBtn, costEl, usagePanel, composer, input, sendBtn, popEl;
 
   // ── scrolling: follow the bottom while the user is near it ────────────
 
   // Only sending a message (or the down button) moves the view: typing never
   // does, and output that arrives while you read higher up leaves you there.
   let follow = true;
-  const nearBottom = () => window.innerHeight + window.scrollY >= document.documentElement.scrollHeight - 80;
-  const stick = () => { if (follow) requestAnimationFrame(() => { window.scrollTo(0, document.documentElement.scrollHeight); paintDown(); }); };
+  const nearBottom = (slack = 80) => window.innerHeight + window.scrollY >= document.documentElement.scrollHeight - slack;
+  // A scroll up that you make stops following at once, even a few pixels, so the
+  // next streamed paint does not pull you back. Following resumes at the very bottom.
+  let upAt = 0, dragging = false, pinUntil = 0;
+  const leaveBottom = () => { follow = false; upAt = Date.now(); paintDown(); };
+  function onScroll() {
+    if (Date.now() < pinUntil) return;                         // the down button's smooth scroll
+    if (dragging || Date.now() - upAt < 300) follow = false;
+    else if (nearBottom(4)) follow = true;
+    else if (!nearBottom()) follow = false;
+  }
+  const stick = () => { if (inView() && follow) requestAnimationFrame(() => { window.scrollTo(0, document.documentElement.scrollHeight); paintDown(); }); };
 
   /** The down button in the composer: shown away from the bottom, dotted when new output came in. */
   let downBtn;
   function paintDown() {
     if (!downBtn) return;
-    const away = !nearBottom();
+    const away = follow ? !nearBottom() : !nearBottom(4);
     downBtn.hidden = !away;
     if (!away) delete downBtn.dataset.fresh;
   }
   function toBottom() {
     follow = true;
+    pinUntil = Date.now() + 700;
     window.scrollTo({ top: document.documentElement.scrollHeight, behavior: 'smooth' });
     delete downBtn.dataset.fresh;
     input.focus();
@@ -97,7 +137,7 @@
       userText ? h('span', { class: 'ck-user-text', text: userText }) : null));
     const body = h('div', { class: 'ck-body' });
     el.append(body);
-    log.append(el);
+    S.log.append(el);
     S.turn = { el, body, run: null, t0: Date.now(), footer: null };
     S.turns.push(S.turn);
     stick();
@@ -125,6 +165,84 @@
     stick();
   }
   const schedulePaint = item => { if (!item.raf) item.raf = requestAnimationFrame(() => paintText(item, true)); };
+
+  // ── thinking: a folded line while Claude thinks, the summary on request ──
+
+  const THINK_VERBS = ['Pondering', 'Noodling', 'Canoodling', 'Cogitating', 'Ruminating', 'Percolating', 'Mulling', 'Musing',
+    'Brewing', 'Simmering', 'Marinating', 'Contemplating', 'Deliberating', 'Puzzling', 'Scheming', 'Tinkering', 'Wrangling',
+    'Untangling', 'Synthesizing', 'Ideating', 'Concocting', 'Conjuring', 'Divining', 'Moseying', 'Meandering', 'Spelunking',
+    'Stewing', 'Sussing', 'Whirring', 'Wibbling', 'Finagling', 'Hatching', 'Incubating', 'Philosophising', 'Reticulating',
+    'Churning', 'Combobulating', 'Envisioning'];
+  const pickVerb = not => { let v; do v = THINK_VERBS[Math.floor(Math.random() * THINK_VERBS.length)]; while (v === not); return v; };
+  const ICON_THINK = '<svg viewBox="0 0 16 16" width="12" height="12" aria-hidden="true"><path d="M8 1.2 9.5 6.5 14.8 8 9.5 9.5 8 14.8 6.5 9.5 1.2 8 6.5 6.5Z" fill="currentColor"/></svg>';
+  const secs = ms => ms < 60e3 ? Math.max(1, Math.round(ms / 1000)) + 's' : Math.floor(ms / 60e3) + 'm ' + Math.round(ms % 60e3 / 1000) + 's';
+
+  /** The last line of the summary so far, without Markdown marks: the folded line's preview. */
+  const thinkPreview = t => (String(t).trim().split('\n').filter(l => l.trim()).pop() || '').replace(/[*_`#>]+/g, '').trim();
+
+  function newThink(key, msgId, redacted) {
+    closeRun();
+    const ic = icon(ICON_THINK);
+    ic.classList.add('ck-think-ic');
+    const verb = h('span', { class: 'ck-think-verb' });
+    const peek = h('span', { class: 'ck-think-peek' });
+    const time = h('span', { class: 'ck-think-time' });
+    const caret = h('span', { class: 'sk-caret ck-think-caret', hidden: true });
+    const head = h('button', { class: 'ck-think-head', type: 'button' }, ic, verb, peek, time, caret);
+    const body = h('div', { class: 'sk-doc ck-think-body', hidden: true });
+    const el = h('div', { class: 'ck-think is-live' }, head, body);
+    turn().body.append(el);
+    const item = { key, el, head, body, verb, peek, time, caret, text: '', redacted: !!redacted,
+      t0: clock(), t1: null, open: false, word: pickVerb(), ticks: 0, raf: 0, timer: 0, conv: S };
+    head.onclick = () => {
+      if (!item.text) return;
+      item.open = !item.open;
+      el.classList.toggle('is-open', item.open);
+      body.hidden = !item.open;
+      paintThink(item);   // the preview hides while the summary shows
+      if (item.open) paintThinkBody(item);
+    };
+    // A new word every few seconds while it thinks, like the TUI's spinner.
+    item.timer = setInterval(() => { if (++item.ticks % 3 === 0) item.word = pickVerb(item.word); paintThink(item); }, 1000);
+    S.thinks.set(key, item);
+    if (!S.msgThinks.has(msgId)) S.msgThinks.set(msgId, []);
+    S.msgThinks.get(msgId).push(item);
+    S.liveThink = item;
+    paintThink(item);
+    stick();
+    return item;
+  }
+
+  function paintThink(item) {
+    const live = !item.t1;
+    item.verb.textContent = live ? item.word + '…' : item.redacted ? 'Thought (hidden)' : 'Thought';
+    item.time.textContent = live ? secs(Date.now() - item.t0) : item.t1 - item.t0 >= 1000 ? 'for ' + secs(item.t1 - item.t0) : '';
+    item.peek.textContent = item.open ? '' : thinkPreview(item.text);
+    item.caret.hidden = !item.text;
+    item.el.classList.toggle('has-text', !!item.text);
+    item.head.title = item.text ? (item.open ? 'Hide the thinking' : 'Show the thinking') : live ? '' : 'No thinking text was sent for this block';
+    if (live && item.conv.liveThink === item) {
+      item.conv.thinkWord = item.word;
+      const prev = S; S = item.conv; updateStatus(); S = prev;   // the status line says the same word
+    }
+  }
+
+  function paintThinkBody(item) {
+    cancelAnimationFrame(item.raf);
+    item.raf = 0;
+    root.SkimRender.render(item.body, item.text, { streaming: !item.t1, interactive: false });
+    if (item.open) stick();
+  }
+
+  function endThink(item, t1) {
+    if (!item || item.t1) return;
+    item.t1 = t1 || clock();
+    clearInterval(item.timer);
+    item.el.classList.remove('is-live');
+    if (S.liveThink === item) S.liveThink = null;
+    paintThink(item);
+    if (item.open) paintThinkBody(item);
+  }
 
   // ── tool activity (design 09) ──────────────────────────────────────────
 
@@ -572,7 +690,7 @@
     if (row) { row.waitStart = clock(); setRowState(row, 'waiting'); }
     updateStatus();
     stick();
-    if (req.defaultToNo) noBtn.focus();
+    if (req.defaultToNo && inView()) noBtn.focus();
   }
 
   function resolveCard(id, outcome, always) {
@@ -648,6 +766,7 @@
   }
 
   function paintMeta() {
+    if (!inView()) return;
     // "Opus 5.5" stays; " · 1M · high" is the part a narrow panel drops.
     const [name, ...extra] = (modelLabel(S.model) || 'Model').split(' · ');
     if (S.effort) extra.push(S.effort);
@@ -681,6 +800,8 @@
     P.kind = null; P.items = []; P.build = null;
     popEl.hidden = true; popEl.replaceChildren();
     modelEl.classList.remove('is-open'); modeBtn.classList.remove('is-open');
+    if (moreBtn) moreBtn.classList.remove('is-open');
+    if (viewMenuBtn) viewMenuBtn.classList.remove('is-open');
   }
 
   function refreshPop() {
@@ -723,8 +844,13 @@
       popEl.style.bottom = (box.bottom - composer.getBoundingClientRect().top + 6) + 'px';
     } else {
       const a = P.anchor.getBoundingClientRect();
-      popEl.style.left = 'auto';
-      popEl.style.right = Math.max(box.right - a.right, 0) + 'px';
+      if (a.left - box.left < box.width / 2) {   // near the left edge: open rightwards
+        popEl.style.right = 'auto';
+        popEl.style.left = Math.max(a.left - box.left, 0) + 'px';
+      } else {
+        popEl.style.left = 'auto';
+        popEl.style.right = Math.max(box.right - a.right, 0) + 'px';
+      }
       popEl.style.bottom = (box.bottom - a.top + 6) + 'px';
     }
     const popBottom = box.bottom - parseFloat(popEl.style.bottom);   // viewport y of the popover's bottom edge
@@ -832,7 +958,7 @@
   function requestUsage(plan) {
     // Plan limits cost a network call: at most once a minute.
     const withPlan = plan && Date.now() - S.planAt > 60e3;
-    if (withPlan) S.planAt = Date.now();
+    if (withPlan) SHARED.planAt = Date.now();
     post({ type: 'usage', plan: withPlan });
   }
 
@@ -874,7 +1000,9 @@
 
   /** Commands the page runs itself (they need a menu, or leave the page). */
   const LOCAL_CMDS = [
-    { name: 'tui', description: 'Open this session in the Claude Code TUI', argumentHint: '', local: true }
+    { name: 'tui', description: 'Open this session in the Claude Code TUI', argumentHint: '', local: true },
+    { name: 'resume', aliases: ['continue'], description: 'Resume a conversation from this folder', argumentHint: '[search]', local: true },
+    { name: 'exit', aliases: ['quit'], description: 'Close this tab (in a side chat: close the side chat)', argumentHint: '', local: true }
   ];
   const HIDDEN_CMD = c => c.name.startsWith('__') || /^\((removed)\)|^Renamed to /.test(c.description || '') || S.terminalCmds.has(c.name);
 
@@ -985,6 +1113,7 @@
       };
     }
     const { cmd, query, prior, start } = st;
+    if (cmd.name === 'resume') { requestSessions(); return resumeItems([...prior, query].join(' ')); }
     const q = query.toLowerCase();
     const choices = argChoices(cmd, prior).filter(ch => !q || ch.value.toLowerCase().startsWith(q) && ch.value.toLowerCase() !== q);
     const groups = hintGroups(cmd.argumentHint);
@@ -1013,7 +1142,16 @@
     const cmd = findCmd(m[1]);
     const name = cmd ? cmd.name : m[1].toLowerCase();
     const arg = (m[2] || '').trim();
-    if (name === 'tui') { post({ type: 'openTUI' }); return true; }
+    if (name === 'tui') { post({ type: 'openTUI', busy: S.busy }); return true; }
+    if (name === 'resume') {
+      const list = SHARED.sessions ? SHARED.sessions.list : [];
+      const hit = arg && (list.find(x => x.id === arg) || list.find(x => arg.length >= 6 && x.id.startsWith(arg)));
+      if (hit) resumeSession(hit.id, hit.title || hit.firstPrompt);
+      else if (/^[0-9a-f-]{36}$/i.test(arg)) resumeSession(arg, null);
+      else { input.value = '/resume ' + arg; input.setSelectionRange(input.value.length, input.value.length); grow(); updateSlash(); }
+      return true;
+    }
+    if (name === 'exit') { if (active !== main) closeSide(active); else post({ type: 'close' }); return true; }
     if (name === 'model' && !arg) { openModelMenu(); return true; }
     if (name === 'model') { setModel(arg); notice('info', `Model set to ${arg}.`); return true; }
     if (name === 'effort' && !arg) { openModelMenu(); return true; }
@@ -1089,10 +1227,370 @@
   }
 
   function paintRefs() {
+    if (!inView()) return;
     refsEl.replaceChildren(...S.refs.map((r, i) => refChip(r, () => { S.refs.splice(i, 1); paintRefs(); updateStatus(); input.focus(); })));
     refsEl.hidden = !S.refs.length;
     input.placeholder = S.refs.length ? 'Say what to do with it…  (⌫ removes the last one)' : 'Message Claude…  / for commands · ⇧↩ new line';
     if (P.kind) placePop();
+  }
+
+  // ── where the session runs: folder and git branch, and the ⋮ menu ─────
+
+  const ICON_BRANCH = '<svg viewBox="0 0 16 16" width="11" height="11" aria-hidden="true"><path fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" d="M5 2.5v11M5 10.5c0-3 6-2.5 6-6"/><circle cx="5" cy="13" r="1.6" fill="currentColor"/><circle cx="5" cy="3" r="1.6" fill="currentColor"/><circle cx="11" cy="4" r="1.6" fill="currentColor"/></svg>';
+  const icon = svg => { const s = h('span', { class: 'ck-ic-svg' }); s.innerHTML = svg; return s; };   // static markup only
+  const baseName = p => String(p || '').replace(/\/+$/, '').split('/').pop() || '/';
+  const tilde = p => { p = String(p || ''); return S.home && (p === S.home || p.startsWith(S.home + '/')) ? '~' + p.slice(S.home.length) : p; };
+  /** ~/Desktop/development/Hobby/FloatyTerm → ~/…/Hobby/FloatyTerm once it is too long for the menu. */
+  const shortPath = p => { const t = tilde(p), parts = t.split('/'); return t.length <= 30 || parts.length < 4 ? t : parts[0] + '/…/' + parts.slice(-2).join('/'); };
+  const plural = (n, one, many) => n + ' ' + (n === 1 ? one : (many || one + 's'));
+
+  const requestGit = () => post({ type: 'git' });
+
+  function paintContext() {
+    const g = S.git;
+    const kids = [h('span', { class: 'ck-ctx-dir', text: baseName(S.cwd) })];
+    if (g && g.repo && g.branch) {
+      kids.push(h('span', { class: 'ck-ctx-branch' }, icon(ICON_BRANCH), h('span', { class: 'ck-ctx-b', text: g.branch })));
+      if (g.changed) kids.push(h('span', { class: 'ck-ctx-dirty', title: plural(g.changed, 'changed file') }));
+    }
+    ctxEl.replaceChildren(...kids);
+    ctxEl.title = [tilde(S.cwd), g && g.branch ? `on ${g.branch}` + (g.changed ? ` · ${plural(g.changed, 'change')}` : '') : null].filter(Boolean).join('\n');
+    if (P.kind === 'more') refreshPop();
+  }
+
+  function infoRow(k, v, cls) { return v ? h('div', { class: 'ck-info-row' + (cls ? ' ' + cls : '') }, h('span', { class: 'ck-info-k', text: k }), h('span', { class: 'ck-info-v' }, v)) : null; }
+
+  function moreInfo() {
+    const g = S.git, i = S.info;
+    let branch = null, changes = null, commit = null;
+    if (g && g.repo) {
+      branch = h('span', { class: 'ck-info-strong', title: g.branch + (g.upstream ? ' → ' + g.upstream : ''), text: (g.branch || '?') + (g.detached ? ' (detached)' : '') });
+      changes = [g.changed ? [g.changed + ' changed', g.staged ? ` · ${g.staged} staged` : '', g.untracked ? ` · ${g.untracked} new` : ''].join('') : 'clean',
+        g.ahead ? ` · ↑${g.ahead}` : '', g.behind ? ` · ↓${g.behind}` : ''].join('');
+      if (g.last) commit = h('span', { title: `${g.last.sha} ${g.last.subject} (${g.last.when})` }, h('code', { text: g.last.sha }), ' ' + g.last.subject);
+    } else if (g) branch = h('span', { class: 'ck-info-dim', text: 'not a git repository' });
+    const mcp = (i.mcp || []);
+    const mcpBad = mcp.filter(m => m.status !== 'connected');
+    const mcpText = mcp.length ? plural(mcp.length, 'server') + (mcpBad.length ? ` · ${mcpBad.length} not connected` : ' · all connected') : null;
+    return h('div', { class: 'ck-info' },
+      infoRow('Folder', h('span', { title: S.cwd, text: shortPath(S.cwd) }), 'is-path'),
+      infoRow('Branch', branch),
+      infoRow('Changes', changes),
+      infoRow('Commit', commit),
+      infoRow('MCP', mcpText ? h('span', { title: mcp.map(m => `${m.name}: ${m.status}`).join('\n'), text: mcpText }) : null),
+      infoRow('Session', S.sessionId || i.version ? [S.sessionId ? h('code', { text: S.sessionId.slice(0, 8) }) : null,
+        i.version ? h('span', { class: 'ck-info-dim', text: (S.sessionId ? ' · ' : '') + 'Claude Code ' + i.version + (i.outputStyle && i.outputStyle !== 'default' ? ' · ' + i.outputStyle : '') }) : null] : null));
+  }
+
+  const THINK_SOURCE = { settings: 'From your settings (/config)', default: 'Claude Code default', user: 'Set in this tab' };
+
+  /** "Show thinking": a switch that stays in the menu, so you see it flip. */
+  function thinkingItem() {
+    const on = !!S.thinkingOn, known = S.thinkingOn != null;
+    return {
+      title: 'Show thinking',
+      desc: known ? THINK_SOURCE[S.thinkingSource] || null : 'Known when the session has started',
+      side: h('span', { class: 'ck-switch' + (on ? ' is-on' : '') + (known ? '' : ' is-unknown'), role: 'switch', 'aria-checked': String(on) }),
+      run: () => {
+        if (!known) return;
+        S.thinkingOn = !on; S.thinkingSource = 'user';
+        post({ type: 'setThinking', on: !on });
+        refreshPop();
+      }
+    };
+  }
+
+  function openMoreMenu() {
+    if (P.kind === 'more') { closePop(); return; }
+    moreBtn.classList.add('is-open');
+    requestGit();
+    const act = (title, desc, fn) => ({ title, desc, run: () => { closePop(); fn(); } });
+    openPop('more', moreBtn, () => ({
+      head: moreInfo(),
+      items: [
+        thinkingItem(),
+        act('Copy path', null, () => post({ type: 'copy', text: S.cwd })),
+        act('Reveal in Finder', null, () => post({ type: 'reveal', path: S.cwd })),
+        S.sessionId ? act('Copy session ID', null, () => post({ type: 'copy', text: S.sessionId })) : null,
+        act('Resume a conversation…', null, () => {
+          if (active !== main) showConv(main);
+          input.value = '/resume '; input.setSelectionRange(8, 8); input.focus(); grow(); updateSlash();
+        }),
+        act('Open in TUI', null, () => post({ type: 'openTUI', busy: S.busy })),
+        act('New side chat', null, () => newSide()),
+        active !== main ? act('Close this side chat', null, () => closeSide(active)) : null,
+        act('Compact conversation', null, () => sendUser('/compact')),
+        act('New conversation', null, () => sendUser('/clear'))
+      ].filter(Boolean)
+    }));
+  }
+
+  // ── side chats: forks of main, shown one full view at a time ──────────
+
+  const ICON_SIDE = '<svg viewBox="0 0 16 16" width="12" height="12" aria-hidden="true"><rect x="1.5" y="2.5" width="9" height="7" rx="2" fill="none" stroke="currentColor" stroke-width="1.4"/><path d="M6.5 12.5h6a2 2 0 0 0 2-2V7" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/></svg>';
+  const ICON_BACK = '<svg viewBox="0 0 16 16" width="11" height="11" aria-hidden="true"><path d="M10 3 5 8l5 5" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>';
+
+  let sideN = 0, lastSide = null;
+  const sides = () => [...convs.values()].filter(c => c !== main);
+  const convState = c => c.cards.size ? 'waiting' : c.busy ? 'busy' : c.unseen ? 'unseen' : '';
+
+  /** Opens a side chat: a fork of main as it is now, with main's model and effort (so it reads main's prompt cache) and manual approvals. */
+  function newSide() {
+    if (!main.sessionId) {
+      const prev = S;
+      S = main;
+      notice('info', 'Send the main conversation a message first: a side chat is a fork of it.');
+      S = prev;
+      return;
+    }
+    const n = ++sideN, id = 'side-' + n;
+    const conv = newConv(id, 'Side ' + n);
+    Object.assign(conv, { model: main.model, modelChoice: main.modelChoice, effort: main.effort, mode: 'default' });
+    conv.log = h('main', { class: 'ck-log is-side', hidden: true }, sideHead(conv));
+    dock.before(conv.log);
+    convs.set(id, conv);
+    // Thinking follows main's current state (null: the settings decide, as for main).
+    post({ type: 'openSide', channel: id, model: main.modelChoice || null, effort: main.effort || null,
+      thinking: main.thinkingSource === 'user' ? main.thinkingOn : null });
+    showConv(conv);
+  }
+
+  function sideHead(conv) {
+    const prompts = main.turns.map(t => t.el.querySelector('.ck-user-text')).filter(Boolean);
+    const last = prompts.length ? prompts[prompts.length - 1].textContent.trim() : null;
+    const time = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+    return h('div', { class: 'ck-side-head' },
+      h('div', { class: 'ck-side-title' }, h('span', { class: 'ck-side-badge', text: conv.label }), `A fork of main at ${time}`),
+      h('div', { class: 'ck-side-note', text: 'It has the whole conversation so far' +
+        (last ? `, up to “${last.length > 90 ? last.slice(0, 90) + '…' : last}”` : '') + '. Main does not see what happens here.' }));
+  }
+
+  /** Puts `conv` in view: its log, its draft and scroll position, its dock state. */
+  function showConv(conv) {
+    if (!conv || conv === active || !convs.has(conv.id)) return;
+    closePop();
+    if (!usagePanel.hidden) toggleUsage(false);
+    active.draft = input.value;
+    active.follow = follow;
+    active.scrollY = window.scrollY;
+    active.log.hidden = true;
+    active = S = conv;
+    if (conv !== main) lastSide = conv;
+    conv.unseen = false;
+    conv.log.hidden = false;
+    document.body.classList.toggle('is-side', conv !== main);
+    input.value = conv.draft || '';
+    grow();
+    follow = conv.follow;
+    window.scrollTo(0, follow ? document.documentElement.scrollHeight : conv.scrollY);
+    paintMeta(); paintRefs(); paintContext(); updateStatus(); paintDown();
+    input.focus();
+  }
+
+  /** The strip's switch: main ⇄ the last side chat (a new one when there is none). */
+  function toggleView() {
+    if (active !== main) showConv(main);
+    else if (lastSide && convs.has(lastSide.id)) showConv(lastSide);
+    else newSide();
+  }
+
+  function closeSide(conv) {
+    if (!conv || conv === main) return;
+    if (active === conv) showConv(main);
+    post({ type: 'closeSide', channel: conv.id });
+    conv.log.remove();
+    convs.delete(conv.id);
+    if (lastSide === conv) lastSide = sides().pop() || null;
+    postState(); paintView();
+  }
+
+  function paintView() {
+    if (!viewBtn) return;
+    const inSide = active !== main;
+    const others = [...convs.values()].filter(c => c !== active);
+    // The loudest state among the conversations out of view.
+    const states = others.map(convState);
+    viewBtn.dataset.attn = ['waiting', 'busy', 'unseen'].find(st => states.includes(st)) || '';
+    viewBtn.classList.toggle('is-side', inSide);
+    viewBtn.querySelector('.ck-view-ic').innerHTML = inSide ? ICON_BACK : ICON_SIDE;   // static markup only
+    viewBtn.querySelector('.ck-view-t').textContent = inSide ? 'Main' : lastSide && convs.has(lastSide.id) ? lastSide.label : 'Side chat';
+    viewBtn.title = inSide ? 'Back to the main conversation' : lastSide && convs.has(lastSide.id)
+      ? `Show ${lastSide.label}` : 'Open a side chat: a fork of this conversation';
+    viewMenuBtn.hidden = !sides().length;
+  }
+
+  function openViewMenu() {
+    if (P.kind === 'view') { closePop(); return; }
+    viewMenuBtn.classList.add('is-open');
+    openPop('view', viewMenuBtn, () => ({
+      head: 'Conversations',
+      items: [main, ...sides()].map(c => ({
+        title: h('span', { class: 'ck-view-row' }, h('span', { class: 'ck-view-state', 'data-state': convState(c) }), c.label),
+        desc: [modelLabel(c.model) || null, c === main ? null : plural(c.turns.length, 'turn')].filter(Boolean).join(' · ') || null,
+        current: c === active,
+        run: () => { closePop(); showConv(c); }
+      })).concat([{ title: 'New side chat', desc: 'A fork of main as it is now', run: () => { closePop(); newSide(); } }])
+    }));
+  }
+
+  // ── composer height: a grip on the left edge of the field ─────────────
+
+  /** 0: the composer grows with its text (up to 160px); otherwise the height you set. */
+  let userH = 0;
+  try { userH = +localStorage.getItem('ck.composerHeight') || 0; } catch (e) { /* storage may be blocked */ }
+
+  function setUserH(v, save) {
+    userH = v;
+    grow();
+    if (P.kind) placePop();
+    if (!save) return;
+    try { v ? localStorage.setItem('ck.composerHeight', String(v)) : localStorage.removeItem('ck.composerHeight'); } catch (e) { /* no storage */ }
+  }
+
+  function bindGrip() {
+    let drag = false, y0 = 0, h0 = 0;
+    grip.addEventListener('pointerdown', e => {
+      e.preventDefault();
+      drag = true; y0 = e.clientY; h0 = input.offsetHeight;
+      document.body.classList.add('is-resizing');
+    });
+    // On the document, so the drag keeps going when the pointer leaves the grip.
+    document.addEventListener('pointermove', e => {
+      if (!drag) return;
+      // Up makes it taller; at most 60% of the window.
+      setUserH(Math.round(Math.min(Math.max(h0 + (y0 - e.clientY), 34), window.innerHeight * 0.6)), false);
+    });
+    document.addEventListener('pointerup', () => {
+      if (!drag) return;
+      drag = false;
+      document.body.classList.remove('is-resizing');
+      setUserH(userH, true);
+      input.focus();
+    });
+    grip.addEventListener('dblclick', () => { setUserH(0, true); input.focus(); });
+  }
+
+  // ── /resume: continue another conversation of this folder ─────────────
+
+  const ago = ms => {
+    const s = (Date.now() - ms) / 1000;
+    if (s < 90) return 'just now';
+    if (s < 3600) return Math.round(s / 60) + ' min ago';
+    if (s < 86400) return Math.round(s / 3600) + ' h ago';
+    if (s < 86400 * 14) return Math.round(s / 86400) + ' d ago';
+    return new Date(ms).toLocaleDateString([], { day: 'numeric', month: 'short' });
+  };
+  const fmtSize = b => b >= 1e6 ? (b / 1e6).toFixed(1) + ' MB' : Math.max(1, Math.round(b / 1e3)) + ' kB';
+
+  function requestSessions() {
+    // Fresh enough for a minute; the list is cheap to read again after that.
+    if (SHARED.sessions && Date.now() - SHARED.sessions.at < 60e3) return;
+    post({ type: 'sessions' });
+  }
+
+  /** The list for "/resume <search>": newest first; not main's own conversation, side chats marked. */
+  function resumeItems(search) {
+    const q = search.trim().toLowerCase();
+    const own = new Map([...convs.values()].filter(c => c.sessionId).map(c => [c.sessionId, c]));
+    if (!SHARED.sessions) return { head: 'Resume a conversation · this folder', items: [], empty: 'Loading conversations…' };
+    const list = SHARED.sessions.list.filter(s => s.id !== main.sessionId && (!q || [s.title, s.firstPrompt, s.branch, s.id].some(v => v && v.toLowerCase().includes(q))));
+    return {
+      head: 'Resume a conversation · this folder',
+      empty: q ? `No conversation matches “${search.trim()}”` : 'No other conversations in this folder yet.',
+      items: list.slice(0, 40).map(s => {
+        const mine = own.get(s.id);
+        const title = s.title || s.firstPrompt || s.id.slice(0, 8);
+        const tag = mine ? mine.label : Date.now() - s.modified < 120e3 ? 'active now' : null;
+        return {
+          title: mark(title.length > 90 ? title.slice(0, 90) + '…' : title, q),
+          desc: [ago(s.modified), s.branch, fmtSize(s.size), s.title && s.firstPrompt && s.firstPrompt !== s.title ? '“' + s.firstPrompt.replace(/\s+/g, ' ').slice(0, 70) + '”' : null].filter(Boolean).join(' · '),
+          side: tag ? h('span', { class: 'ck-pop-tag' + (tag === 'active now' ? ' is-warn' : ''), title: tag === 'active now' ? 'Changed in the last 2 minutes: it may be open in another tab or terminal' : null, text: tag }) : null,
+          run: () => resumeSession(s.id, title)
+        };
+      })
+    };
+  }
+
+  /** Main continues session `id`: its log clears, the sidecar restarts on it, the history is drawn. */
+  function resumeSession(id, title) {
+    closePop();
+    input.value = ''; grow();
+    if (active !== main) showConv(main);
+    if (id === main.sessionId) { notice('info', 'That is the conversation in this tab.'); return; }
+    if (main.busy || main.cards.size) { notice('info', 'Claude is still working. Stop it (Esc) or answer it first, then resume.'); return; }
+    resetConv(main);
+    main.sessionId = id;
+    main.resumeTitle = title || null;
+    const prev = S; S = main;
+    notice('info', `Resuming “${title || id.slice(0, 8)}”…`);
+    S = prev;
+    SHARED.sessions = null;   // the list changes once this one moves on
+    post({ type: 'resume', channel: 'main', sessionId: id });
+    updateStatus(); paintMeta(); paintRefs();
+  }
+
+  /** Clears a conversation's log and state (its model, mode and effort stay). */
+  function resetConv(conv) {
+    for (const t of conv.turns) if (t.run) clearInterval(t.run.timer);
+    for (const th of conv.thinks.values()) clearInterval(th.timer);
+    const keep = { model: conv.model, modelChoice: conv.modelChoice, mode: conv.mode, effort: conv.effort, thinkingOn: conv.thinkingOn, thinkingSource: conv.thinkingSource };
+    const fresh = newConv(conv.id, conv.label);
+    for (const k of Object.keys(fresh)) if (k !== 'log') conv[k] = fresh[k];
+    Object.assign(conv, keep);
+    conv.log.replaceChildren();
+    if (conv === active) follow = true;
+  }
+
+  /** What a stored user message was: a prompt, a command, its output, or noise to skip. */
+  function userView(text) {
+    text = String(text || '').replace(/<system-reminder>[\s\S]*?<\/system-reminder>/g, '').trim();
+    if (!text) return null;
+    if (/^This session is being continued from a previous conversation/.test(text)) return { kind: 'compacted' };
+    if (/^<local-command-caveat>/.test(text)) return null;
+    if (/^\[Request interrupted by user/.test(text)) return { kind: 'note', text: 'Interrupted' };
+    const cmd = text.match(/<command-name>([\s\S]*?)<\/command-name>/);
+    if (cmd) {
+      const args = (text.match(/<command-args>([\s\S]*?)<\/command-args>/) || [])[1] || '';
+      return { kind: 'prompt', text: (cmd[1].trim().startsWith('/') ? '' : '/') + cmd[1].trim() + (args.trim() ? ' ' + args.trim() : '') };
+    }
+    const out = text.match(/^<local-command-std(?:out|err)>([\s\S]*?)<\/local-command-std(?:out|err)>$/);
+    if (out) { const t = out[1].replace(/\x1b\[[0-9;]*m/g, '').trim(); return t ? { kind: 'output', text: t } : null; }
+    // A message sent with references: chips again, and the user's own words.
+    if (text.startsWith(REF_NOTE)) {
+      const refs = [...text.matchAll(/<referenced_text(?: from_reply_to="([^"]*)")?>\n([\s\S]*?)\n<\/referenced_text>/g)].map(m => ({ text: m[2], from: m[1] || null }));
+      const rest = text.slice(text.lastIndexOf('</referenced_text>') + '</referenced_text>'.length).trim();
+      return { kind: 'prompt', text: rest === '(The user sent only the referenced text.)' ? '' : rest, refs };
+    }
+    return { kind: 'prompt', text };
+  }
+
+  /** Draws a resumed conversation from its stored messages (in S, the conversation it belongs to). */
+  function loadHistory(e) {
+    if (e.sessionId !== S.sessionId) return;
+    if (e.omitted) notice('info', `${e.omitted} earlier messages are not shown here. The whole history is in the TUI (⋮ → Open in TUI).`);
+    for (const m of e.messages) {
+      evT = Date.parse(m.timestamp) || 0;
+      const c = m.message && m.message.content;
+      if (m.type === 'assistant') { onAssistant({ message: m.message, parent_tool_use_id: m.parent_tool_use_id }); continue; }
+      if (Array.isArray(c) && c.some(x => x.type === 'tool_result')) { onUser({ message: m.message }); continue; }
+      if (m.parent_tool_use_id) continue;   // a subagent's prompt
+      const text = typeof c === 'string' ? c : Array.isArray(c) ? c.filter(x => x.type === 'text').map(x => x.text).join('\n') : '';
+      const v = userView(text);
+      if (!v) continue;
+      if (v.kind === 'compacted') notice('info', 'The conversation before this point was compacted.');
+      else if (v.kind === 'note') notice('info', v.text);
+      else if (v.kind === 'output') localOutput(v.text);
+      else newTurn(v.text, v.refs);
+    }
+    evT = 0;
+    closeRun();
+    for (const th of S.thinks.values()) endThink(th);
+    S.busy = false; S.thinking = false;
+    const done = h('div', { class: 'ck-resumed', text: `Resumed${S.resumeTitle ? ' “' + S.resumeTitle + '”' : ''} · you can continue below` });
+    S.log.append(done);
+    S.turn = null;
+    updateStatus(); paintMeta();
+    if (inView()) { follow = true; stick(); }
   }
 
   // ── status line + composer ─────────────────────────────────────────────
@@ -1104,14 +1602,26 @@
     else if (S.busy) {
       state = 'busy';
       const live = S.lastTool && (S.lastTool.state === 'running' || S.lastTool.state === 'preparing') ? S.lastTool : null;
-      text = live ? `${shortName(live.name)} ${live.argEl.textContent}`.trim() : S.thinking ? 'Thinking' : 'Working';
+      text = live ? `${shortName(live.name)} ${live.argEl.textContent}`.trim() : S.thinking ? (S.thinkWord || 'Thinking') + '…' : 'Working';
     }
+    postState();
+    if (!inView()) { paintView(); return; }
     statusText.textContent = text;
     statusDot.dataset.state = state;
     dock.dataset.state = state;
     sendBtn.dataset.mode = S.busy && !input.value.trim() && !S.refs.length ? 'stop' : 'send';
     sendBtn.title = sendBtn.dataset.mode === 'stop' ? 'Stop (Esc)' : 'Send (Return)';
-    if (S._lastPosted !== state) { S._lastPosted = state; post({ type: 'state', busy: S.busy, waiting }); }
+    paintView();
+  }
+
+  /** The tab's attention dot covers every conversation, main and side. */
+  let lastState = '';
+  function postState() {
+    const all = [...convs.values()];
+    const busy = all.some(c => c.busy), waiting = all.some(c => c.cards.size > 0);
+    if (lastState === busy + '/' + waiting) return;
+    lastState = busy + '/' + waiting;
+    post({ type: 'state', channel: 'main', busy, waiting });
   }
 
   function sendUser(text, refs) {
@@ -1129,7 +1639,12 @@
     follow = true; stick();
   }
 
-  const grow = () => { input.style.height = 'auto'; input.style.height = Math.min(input.scrollHeight, 160) + 'px'; };
+  const grow = () => {
+    if (userH) { input.style.maxHeight = 'none'; input.style.height = userH + 'px'; return; }
+    input.style.maxHeight = '';
+    input.style.height = 'auto';
+    input.style.height = Math.min(input.scrollHeight, 160) + 'px';
+  };
   function submit() {
     if (sendBtn.dataset.mode === 'stop') { post({ type: 'interrupt' }); return; }
     const text = input.value;
@@ -1143,13 +1658,17 @@
 
   function buildShell() {
     document.body.classList.add('ck');
-    log = h('main', { class: 'ck-log', id: 'ck-log' });
+    main.log = h('main', { class: 'ck-log', id: 'ck-log' });
     statusDot = h('span', { class: 'ck-dot' });
     statusText = h('span', { class: 'ck-status-text', text: 'Starting…' });
     modelEl = chip('ck-model', 'Model and effort (⌥P)');
     modeBtn = chip('ck-mode', 'Permission mode (⇧Tab cycles)');
     costEl = chip('ck-usage', 'Usage');
-    const tui = h('button', { class: 'ck-chip ck-tui', type: 'button', title: 'Open this session in the Claude Code TUI', text: 'TUI' });
+    viewBtn = h('button', { class: 'ck-chip ck-view', type: 'button' }, h('span', { class: 'ck-view-ic' }), h('span', { class: 'ck-view-t' }), h('span', { class: 'ck-view-dot' }));
+    viewMenuBtn = h('button', { class: 'ck-chip ck-view-more', type: 'button', title: 'All conversations', hidden: true }, h('span', { class: 'sk-caret ck-chip-caret' }));
+    grip = h('div', { class: 'ck-grip', title: 'Drag to resize · double-click to reset' }, h('span', { class: 'ck-grip-ic' }));
+    ctxEl = h('button', { class: 'ck-ctx', type: 'button' });
+    moreBtn = h('button', { class: 'ck-chip ck-more', type: 'button', title: 'More: folder, git, session, actions' }, h('span', { class: 'ck-more-ic' }));
     usagePanel = h('div', { class: 'ck-usage-panel', hidden: true });
     input = h('textarea', { class: 'ck-input', rows: '1', placeholder: 'Message Claude…  / for commands · ⇧↩ new line' });
     sendBtn = h('button', { class: 'ck-send', type: 'button' }, h('span', { class: 'ck-send-ic' }));
@@ -1157,17 +1676,17 @@
     downBtn = h('button', { class: 'ck-down', type: 'button', title: 'Scroll to the bottom', hidden: true }, h('span', { class: 'ck-down-ic' }));
     downBtn.onmousedown = e => e.preventDefault();
     downBtn.onclick = toBottom;
-    composer = h('div', { class: 'ck-composer' }, h('div', { class: 'ck-field' }, refsEl, input, downBtn), sendBtn);
+    composer = h('div', { class: 'ck-composer' }, h('div', { class: 'ck-field' }, grip, refsEl, input, downBtn), sendBtn);
     refBtn = h('button', { class: 'ck-refbtn', type: 'button', hidden: true, title: 'Add the selected text to your next message (⌘L)' },
       h('span', { class: 'ck-refbtn-ic' }), 'Reference to Agent', h('kbd', { text: '⌘L' }));
     refBtn.onmousedown = e => e.preventDefault();   // keep the selection
     refBtn.onclick = () => referenceSelection();
     document.body.append(refBtn);
-    statusEl = h('div', { class: 'ck-status' }, statusDot, statusText, h('span', { class: 'ck-spacer' }), modelEl, modeBtn, costEl, tui);
+    statusEl = h('div', { class: 'ck-status' }, viewBtn, viewMenuBtn, statusDot, statusText, h('span', { class: 'ck-spacer' }), ctxEl, modelEl, modeBtn, costEl, moreBtn);
     popEl = h('div', { class: 'ck-pop', hidden: true });
     dockIn = h('div', { class: 'ck-dock-in' }, usagePanel, statusEl, composer, popEl);
     dock = h('div', { class: 'ck-dock' }, dockIn);
-    document.body.append(log, dock);
+    document.body.append(main.log, dock);
 
     input.addEventListener('input', () => { grow(); updateStatus(); updateSlash(); });
     input.addEventListener('click', updateSlash);
@@ -1188,15 +1707,28 @@
     modelEl.onclick = openModelMenu;
     modeBtn.onclick = openModeMenu;
     costEl.onclick = () => toggleUsage();
-    for (const b of [modelEl, modeBtn, costEl, tui]) b.onmousedown = e => e.preventDefault();
-    tui.onclick = () => post({ type: 'openTUI' });
-    window.addEventListener('scroll', () => { follow = nearBottom(); paintDown(); if (P.kind) placePop(); if (!refBtn.hidden) placeRefBtn(); }, { passive: true });
+    for (const b of [viewBtn, viewMenuBtn, ctxEl, modelEl, modeBtn, costEl, moreBtn]) b.onmousedown = e => e.preventDefault();
+    viewBtn.onclick = toggleView;
+    viewMenuBtn.onclick = openViewMenu;
+    bindGrip();
+    ctxEl.onclick = openMoreMenu;
+    moreBtn.onclick = openMoreMenu;
+    window.addEventListener('wheel', e => { if (e.deltaY < 0) leaveBottom(); }, { passive: true });
+    document.addEventListener('keydown', e => {
+      const t = e.target;
+      if (P.kind || (t && (t.tagName === 'TEXTAREA' || t.tagName === 'INPUT'))) return;
+      if (e.key === 'ArrowUp' || e.key === 'PageUp' || e.key === 'Home' || (e.key === ' ' && e.shiftKey)) leaveBottom();
+    });
+    // Dragging the scrollbar (a press right of the page's content box) also stops following.
+    document.addEventListener('pointerdown', e => { if (e.clientX >= document.documentElement.clientWidth) { dragging = true; follow = false; } });
+    document.addEventListener('pointerup', () => { if (dragging) { dragging = false; onScroll(); paintDown(); } });
+    window.addEventListener('scroll', () => { onScroll(); paintDown(); if (P.kind) placePop(); if (!refBtn.hidden) placeRefBtn(); }, { passive: true });
     document.addEventListener('mouseup', () => setTimeout(placeRefBtn, 0));
     document.addEventListener('keyup', e => { if (e.shiftKey || e.key === 'Shift') placeRefBtn(); });
     document.addEventListener('selectionchange', () => { if (!refBtn.hidden && !selectionRef()) refBtn.hidden = true; });
     window.addEventListener('resize', () => { if (P.kind) placePop(); });
     document.addEventListener('mousedown', e => {
-      if (P.kind && P.kind !== 'slash' && !popEl.contains(e.target) && !(P.anchor && P.anchor.contains(e.target))) closePop();
+      if (P.kind && P.kind !== 'slash' && !popEl.contains(e.target) && !(P.anchor && P.anchor.contains(e.target)) && !(P.kind === 'more' && ctxEl.contains(e.target))) closePop();
     });
     document.addEventListener('keydown', e => {
       if (P.kind && P.kind !== 'slash' && popKey(e)) { e.preventDefault(); return; }
@@ -1205,13 +1737,13 @@
       if (e.key === 'Escape' && !usagePanel.hidden && document.activeElement !== input) { toggleUsage(false); return; }
       if (e.key === 'Escape' && S.busy && !S.cards.size && document.activeElement !== input) post({ type: 'interrupt' });
     });
-    updateStatus(); paintMeta();
+    updateStatus(); paintMeta(); paintContext(); paintView(); grow();
     input.focus();
   }
 
   function notice(kind, text) {
     const el = h('div', { class: 'ck-notice', 'data-kind': kind, text });
-    (S.turn ? S.turn.body : log).append(el);
+    (S.turn ? S.turn.body : S.log).append(el);
     stick();
   }
 
@@ -1235,19 +1767,27 @@
         S.blockKind.set(key, b.type);
         if (b.type === 'text') newText(key, S.currentMsg);
         else if (b.type === 'tool_use') addRow(b.id, b.name, null);
-        else if (b.type === 'thinking' || b.type === 'redacted_thinking') { S.thinking = true; updateStatus(); }
+        else if (b.type === 'thinking' || b.type === 'redacted_thinking') { S.thinking = true; newThink(key, S.currentMsg, b.type === 'redacted_thinking'); updateStatus(); }
         break;
       }
       case 'content_block_delta': {
         const key = S.currentMsg + ':' + ev.index;
         if (ev.delta.type === 'text_delta') { const it = S.texts.get(key); if (it) { it.text += ev.delta.text; schedulePaint(it); } }
+        else if (ev.delta.type === 'thinking_delta' && ev.delta.thinking) {
+          const th = S.thinks.get(key);
+          if (th) {
+            th.text += ev.delta.thinking;
+            paintThink(th);
+            if (th.open && !th.raf) th.raf = requestAnimationFrame(() => paintThinkBody(th));
+          }
+        }
         break;
       }
       case 'content_block_stop': {
         const key = S.currentMsg + ':' + ev.index;
         const it = S.texts.get(key);
         if (it) { it.final = true; paintText(it, false); }
-        if (S.blockKind.get(key) === 'thinking') { S.thinking = false; updateStatus(); }
+        if (S.blockKind.get(key) === 'thinking' || S.blockKind.get(key) === 'redacted_thinking') { endThink(S.thinks.get(key)); S.thinking = false; updateStatus(); }
         break;
       }
     }
@@ -1263,6 +1803,13 @@
         if (!it) it = newText(m.id + ':full' + items.length, m.id);
         it.confirmed = true;
         if (it.text !== c.text || !it.final) { it.text = c.text; it.final = true; paintText(it, false); }
+      } else if ((c.type === 'thinking' || c.type === 'redacted_thinking') && !sub) {
+        // The full block is authoritative too (and the only copy when nothing streamed).
+        const items = S.msgThinks.get(m.id) || [];
+        let th = items.find(x => !x.confirmed);
+        if (!th) { th = newThink(m.id + ':fullthink' + items.length, m.id, c.type === 'redacted_thinking'); endThink(th); }
+        th.confirmed = true;
+        if (c.type === 'thinking' && c.thinking && c.thinking !== th.text) { th.text = c.thinking; paintThink(th); if (th.open) paintThinkBody(th); }
       } else if (c.type === 'tool_use') {
         const row = addRow(c.id, c.name, sub);
         setRowInput(row, c.input);
@@ -1296,6 +1843,8 @@
   }
 
   function onResult(msg) {
+    // A turn that ended mid-thought (interrupted) leaves no block open.
+    for (const th of S.thinks.values()) endThink(th);
     closeRun();
     if (S.turn && !S.turn.footer) {
       const bits = [];
@@ -1312,6 +1861,7 @@
     S.busy = false; S.thinking = false;
     paintMeta(); updateStatus(); stick();
     requestUsage(!usagePanel.hidden);   // context use after this turn (and plan limits, when the panel is open)
+    requestGit();                       // the turn may have changed files or the branch
   }
 
   function receiveOne(e) {
@@ -1325,25 +1875,30 @@
         else if (m.type === 'system' && m.subtype === 'init') {
           // Sent at the start of every turn; a new session ID means /clear started a new conversation.
           if (S.sessionId && m.session_id && m.session_id !== S.sessionId) { notice('info', 'New conversation'); S.cost = 0; S.modelUsage = null; S.turns_n = 0; S.apiMs = 0; }
-          S.model = m.model || S.model; S.mode = m.permissionMode || S.mode; S.sessionId = m.session_id; S.cwd = m.cwd || S.cwd;
-          S.terminalCmds = new Set(m.terminal_slash_commands || []);
-          paintMeta();
+          S.model = m.model || S.model; S.mode = m.permissionMode || S.mode; S.sessionId = m.session_id; SHARED.cwd = m.cwd || SHARED.cwd;
+          SHARED.terminalCmds = new Set(m.terminal_slash_commands || []);
+          SHARED.info = { version: m.claude_code_version, mcp: (m.mcp_servers || []).map(x => ({ name: x.name, status: x.status })), outputStyle: m.output_style };
+          paintMeta(); paintContext();
         } else if (m.type === 'system' && m.subtype === 'status' && m.permissionMode) { S.mode = m.permissionMode; paintMeta(); }
-        else if (m.type === 'system' && m.subtype === 'commands_changed') { S.commands = m.commands || []; if (P.kind === 'slash') refreshPop(); }
+        else if (m.type === 'system' && m.subtype === 'commands_changed') { SHARED.commands = m.commands || []; if (P.kind === 'slash') refreshPop(); }
         else if (m.type === 'system' && m.subtype === 'local_command_output') localOutput(m.content);
         else if (m.type === 'system' && m.subtype === 'compact_boundary') notice('info', 'Conversation compacted');
         break;
       }
       case 'capabilities':
-        S.commands = e.commands || []; S.models = e.models || []; S.outputStyles = e.outputStyles || [];
+        SHARED.commands = e.commands || []; SHARED.models = e.models || []; SHARED.outputStyles = e.outputStyles || [];
         if (e.mode) S.mode = e.mode;
         paintMeta(); if (P.kind) refreshPop();
-        requestUsage(false);
+        requestUsage(false); requestGit();
         break;
       case 'model': if (e.model) { const r = S.models.find(x => x.value === e.model); S.modelChoice = e.model; S.model = r ? (r.resolvedModel || r.value) : e.model; paintMeta(); } break;
       case 'mode': S.mode = e.mode || S.mode; paintMeta(); break;
       case 'effort': S.effort = e.effort || null; paintMeta(); break;
-      case 'usage': if (e.context) S.ctx = e.context; if (e.plan) S.plan = e.plan; paintMeta(); break;
+      case 'git': SHARED.git = e; paintContext(); break;
+      case 'sessions': SHARED.sessions = { at: Date.now(), list: e.list || [] }; if (P.kind === 'slash') refreshPop(); break;
+      case 'history': loadHistory(e); break;
+      case 'thinking': S.thinkingOn = !!e.on; S.thinkingSource = e.source || null; if (inView() && P.kind === 'more') refreshPop(); break;
+      case 'usage': if (e.context) S.ctx = e.context; if (e.plan) SHARED.plan = e.plan; paintMeta(); break;
       case 'permission_request': addCard(e); break;
       case 'permission_cancelled': resolveCard(e.id, 'cancelled'); break;
       case 'error': notice('error', e.message); S.busy = false; updateStatus(); break;
@@ -1356,20 +1911,28 @@
 
   const ClaudeChat = {
     boot(cfg) {
-      S.cwd = cfg.cwd || ''; S.home = cfg.home || '';
+      SHARED.cwd = cfg.cwd || ''; SHARED.home = cfg.home || '';
       if (cfg.model) S.model = cfg.model;
       buildShell();
       statusText.textContent = 'Ready';
       if (cfg.intro) notice('info', cfg.intro);
     },
-    receive(batch) {
-      for (const e of batch) {
-        evT = e.t || 0;
-        try { receiveOne(e); } catch (err) { console.error('ClaudeChat', e.type, err); }
-      }
-      evT = 0;
+    /** `channel`: the conversation the events belong to ('main' when omitted). */
+    receive(batch, channel) {
+      const conv = convs.get(channel || 'main');
+      if (!conv) return;
+      const prev = S;
+      S = conv;
+      try {
+        for (const e of batch) {
+          evT = e.t || 0;
+          try { receiveOne(e); } catch (err) { console.error('ClaudeChat', e.type, err); }
+        }
+      } finally { evT = 0; S = prev; }
+      if (!batch.some(e => e.type === 'sdk' || e.type === 'permission_request' || e.type === 'host')) return;
+      if (conv !== active) { conv.unseen = true; paintView(); }
       // Output arrived while you read higher up: the down button says so.
-      if (!follow && downBtn && batch.some(e => e.type !== 'usage' && e.type !== 'capabilities')) { downBtn.dataset.fresh = '1'; paintDown(); }
+      else if (!follow && downBtn) { downBtn.dataset.fresh = '1'; paintDown(); }
     },
     /** Draws a user turn without sending it (replays, resumed history). */
     showUser(text) { newTurn(text); S.busy = true; updateStatus(); },

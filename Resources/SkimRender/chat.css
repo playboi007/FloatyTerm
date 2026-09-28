@@ -12,6 +12,28 @@ body.ck { min-height: 100vh; display: flex; flex-direction: column; }
 .ck-user-text { padding: 7px 12px; border-left: 2px solid var(--accent); background: var(--surface); border-radius: 0 8px 8px 0;
   color: var(--text); font-size: 13.5px; white-space: pre-wrap; overflow-wrap: anywhere; max-width: 100%; }
 
+/* ── thinking: one folded line, the summary on request ──────────────── */
+.ck-think { display: flex; flex-direction: column; min-width: 0; }
+.ck-think-head { display: flex; align-items: center; gap: 7px; min-width: 0; width: fit-content; max-width: 100%; padding: 2px 6px 2px 2px; margin-left: -2px;
+  border: 0; border-radius: 6px; background: none; color: var(--faint); font: 12.5px var(--sans); text-align: left; cursor: default; }
+.ck-think.has-text .ck-think-head { cursor: pointer; }
+.ck-think.has-text .ck-think-head:hover { background: var(--surface); color: var(--muted); }
+.ck-think-ic { color: var(--accent); opacity: .75; }
+.ck-think.is-live .ck-think-ic { animation: ck-think-spin 2.4s linear infinite, ck-pulse 1.2s ease-in-out infinite; opacity: 1; }
+@keyframes ck-think-spin { to { transform: rotate(360deg); } }
+.ck-think-verb { flex: none; color: var(--muted); }
+/* the TUI's shimmer, on the live word */
+.ck-think.is-live .ck-think-verb { background: linear-gradient(90deg, var(--muted) 0%, var(--text) 45%, var(--muted) 90%); background-size: 200% 100%;
+  -webkit-background-clip: text; background-clip: text; color: transparent; animation: ck-shimmer 2s linear infinite; }
+@keyframes ck-shimmer { from { background-position: 100% 0; } to { background-position: -100% 0; } }
+.ck-think-peek { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--ghost); font-style: italic; }
+.ck-think-time { flex: none; font: 11px var(--mono); color: var(--ghost); }
+.ck-think-caret { flex: none; color: var(--ghost); transform: rotate(-90deg); }
+.ck-think.is-open .ck-think-caret { transform: none; }
+.ck-think-body.sk-doc { margin: 4px 0 4px 7px; padding: 2px 0 2px 13px; border-left: 2px solid var(--line-3); gap: 8px; max-height: 340px; overflow-y: auto;
+  font-size: 13px; color: var(--muted); }
+.ck-think-body.sk-doc strong { color: var(--text-3); }
+
 /* ── tool activity (design 09) ─────────────────────────────────────────── */
 .ck-run { border: 1px solid var(--line-2); border-radius: 10px; background: var(--surface); overflow: hidden; }
 .ck-run.has-failed { border-color: rgba(236,127,114,.35); }
@@ -143,7 +165,7 @@ body.ck { min-height: 100vh; display: flex; flex-direction: column; }
 .ck-dot { flex: none; width: 7px; height: 7px; border-radius: 50%; background: var(--ghost); }
 .ck-dot[data-state="busy"] { background: var(--accent); animation: ck-pulse 1.2s ease-in-out infinite; }
 .ck-dot[data-state="waiting"] { background: var(--warn); }
-.ck-status-text { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; min-width: 0; color: var(--text-3); margin-left: 2px; }
+.ck-status-text { flex: 0 1 auto; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; min-width: 48px; color: var(--text-3); margin-left: 2px; }
 .ck-spacer { flex: 1; }
 
 /* chips: model, mode, usage, TUI */
@@ -163,6 +185,75 @@ body.ck { min-height: 100vh; display: flex; flex-direction: column; }
 .ck-mode[data-mode="default"]::before { background: transparent; box-shadow: inset 0 0 0 1.5px var(--faint); }
 .ck-usage[data-level="warn"] { color: var(--warn); }
 .ck-usage[data-level="bad"] { color: var(--bad); }
+
+/* ── side chats: the switch on the strip, the side log's header ───────── */
+body.ck { --side: #b39ddb; }
+.ck-view { gap: 5px; color: var(--text-3); padding: 0 7px 0 6px; position: relative; }
+.ck-view-ic { display: inline-flex; color: var(--side); }
+.ck-view.is-side { color: var(--side); border-color: color-mix(in srgb, var(--side) 45%, transparent); background: color-mix(in srgb, var(--side) 10%, transparent); }
+.ck-view.is-side .ck-view-ic { color: currentColor; }
+/* a conversation out of view is working, waiting for you, or has news */
+.ck-view-dot { display: none; width: 6px; height: 6px; border-radius: 50%; }
+.ck-view[data-attn="busy"] .ck-view-dot { display: block; background: var(--accent); animation: ck-pulse 1.2s ease-in-out infinite; }
+.ck-view[data-attn="waiting"] .ck-view-dot { display: block; background: var(--warn); }
+.ck-view[data-attn="unseen"] .ck-view-dot { display: block; background: var(--side); }
+.ck-view-more { width: 19px; padding: 0; justify-content: center; margin-left: -3px; }
+.ck-view-row { display: inline-flex; align-items: center; gap: 7px; }
+.ck-view-state { width: 6px; height: 6px; border-radius: 50%; background: var(--line-3); }
+.ck-view-state[data-state="busy"] { background: var(--accent); }
+.ck-view-state[data-state="waiting"] { background: var(--warn); }
+.ck-view-state[data-state="unseen"] { background: var(--side); }
+.ck-side-head { display: flex; flex-direction: column; gap: 3px; padding: 8px 12px; border: 1px dashed color-mix(in srgb, var(--side) 45%, transparent);
+  border-radius: 10px; background: color-mix(in srgb, var(--side) 6%, transparent); }
+.ck-side-title { display: flex; align-items: center; gap: 8px; font-size: 12.5px; color: var(--text-3); }
+.ck-side-badge { font: 600 10px var(--mono); letter-spacing: .05em; text-transform: uppercase; color: var(--side);
+  background: color-mix(in srgb, var(--side) 14%, transparent); border-radius: 5px; padding: 2px 6px; }
+.ck-side-note { font-size: 12px; color: var(--faint); }
+/* in a side chat, the composer carries the side colour so you know where you type */
+body.is-side .ck-field:focus-within { border-color: var(--side); }
+body.is-side .ck-user-text { border-left-color: var(--side); }
+
+/* composer height: a grip on the field's left edge */
+.ck-grip { position: absolute; left: 0; top: 0; bottom: 0; width: 12px; cursor: ns-resize; display: flex; align-items: center; justify-content: center;
+  border-radius: 8px 0 0 8px; z-index: 1; touch-action: none; }
+.ck-grip:hover { background: color-mix(in srgb, var(--accent) 8%, transparent); }
+.ck-grip-ic { width: 2px; height: 14px; border-radius: 1px; background: var(--line-3); box-shadow: 3px 0 0 var(--line-3); margin-left: -3px; }
+.ck-grip:hover .ck-grip-ic { background: var(--accent); box-shadow: 3px 0 0 var(--accent); }
+body.is-resizing, body.is-resizing * { cursor: ns-resize !important; user-select: none; }
+.ck-field .ck-refs { padding-left: 14px; }
+
+/* where the session runs: folder + branch (opens the ⋮ menu) */
+/* gives way before the live status text does */
+.ck-ctx { flex: 0 12 auto; min-width: 0; display: inline-flex; align-items: center; gap: 6px; height: 21px; padding: 0 6px; margin-right: 2px;
+  border: 0; border-radius: 6px; background: none; color: var(--faint); font: 11px var(--mono); cursor: pointer; white-space: nowrap; overflow: hidden; }
+.ck-ctx:hover { color: var(--text-3); background: var(--surface); }
+.ck-ctx-dir { flex: none; color: var(--muted); }
+.ck-ctx-branch { display: inline-flex; align-items: center; gap: 4px; min-width: 0; color: var(--faint); }
+.ck-ctx-b { overflow: hidden; text-overflow: ellipsis; max-width: 170px; }
+.ck-ic-svg { display: inline-flex; flex: none; }
+.ck-ctx-dirty { flex: none; width: 5px; height: 5px; border-radius: 50%; background: var(--warn); }
+/* ⋮ */
+.ck-more { width: 23px; padding: 0; justify-content: center; }
+.ck-more-ic { width: 3px; height: 3px; border-radius: 50%; background: currentColor; box-shadow: 0 -4.5px 0 currentColor, 0 4.5px 0 currentColor; }
+.ck-pop[data-kind="more"] { width: 330px; }
+.ck-pop[data-kind="more"] .ck-pop-head { display: block; padding: 8px 12px; text-transform: none; letter-spacing: 0; font: 11.5px var(--mono); color: var(--muted); }
+.ck-pop[data-kind="more"] .ck-pop-check { display: none; }
+.ck-pop[data-kind="more"] .ck-pop-item { padding: 4px 10px; }
+.ck-pop[data-kind="more"] .ck-pop-title { font-size: 12.5px; }
+/* a small on/off switch (Show thinking) */
+.ck-switch { position: relative; width: 26px; height: 15px; border-radius: 8px; background: var(--line-3); transition: background .15s; }
+.ck-switch::after { content: ''; position: absolute; top: 2px; left: 2px; width: 11px; height: 11px; border-radius: 50%; background: var(--text-3); transition: transform .15s; }
+.ck-switch.is-on { background: var(--accent); }
+.ck-switch.is-on::after { transform: translateX(11px); background: #fff; }
+.ck-switch.is-unknown { opacity: .4; }
+.ck-info { display: grid; grid-template-columns: auto minmax(0, 1fr); gap: 4px 12px; }
+.ck-info-row { display: contents; }
+.ck-info-k { color: var(--ghost); }
+.ck-info-v { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--text-3); }
+.ck-info-row.is-path .ck-info-v { color: var(--path); }
+.ck-info-strong { color: var(--text); }
+.ck-info-dim { color: var(--faint); }
+.ck-info code { font: 11px var(--mono); background: none; border: 0; padding: 0; color: var(--accent); }
 
 /* popover: model menu, mode menu, slash suggestions */
 .ck-pop { position: absolute; z-index: 20; min-width: 260px; max-width: min(420px, 100%); display: flex; flex-direction: column;
@@ -189,6 +280,8 @@ body.ck { min-height: 100vh; display: flex; flex-direction: column; }
 .ck-pop-side { flex: none; display: flex; }
 .ck-pop-val { font: 10.5px var(--mono); color: var(--faint); background: none; border: 0; padding: 0; }
 .ck-pop-tag { font: 10px var(--mono); color: var(--faint); border: 1px solid var(--line-2); border-radius: 4px; padding: 0 4px; }
+.ck-pop-tag.is-warn { color: var(--warn); border-color: rgba(226,189,98,.4); }
+.ck-resumed { align-self: center; font: 11px var(--mono); color: var(--faint); padding: 3px 10px; border: 1px solid var(--line-2); border-radius: 999px; }
 .ck-pop-empty { padding: 10px 12px; font-size: 12px; color: var(--faint); }
 .ck-pop-sig { display: block; text-transform: none; letter-spacing: 0; font: 11.5px var(--mono); color: var(--faint); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .ck-pop-sig .is-now { color: var(--accent); }
@@ -233,7 +326,8 @@ body.ck { min-height: 100vh; display: flex; flex-direction: column; }
 .ck-field { flex: 1; min-width: 0; display: flex; flex-direction: column; background: var(--surface); border: 1px solid var(--line-3); border-radius: 8px; }
 .ck-field:focus-within { border-color: var(--accent); }
 .ck-field { position: relative; }
-.ck-field .ck-input { width: 100%; border: 0; background: transparent; min-height: 34px; max-height: 160px; padding-right: 36px; }
+/* flex: none, so its own height (auto-grow, or the height you drag) counts in the column */
+.ck-field .ck-input { flex: none; width: 100%; border: 0; background: transparent; min-height: 34px; max-height: 160px; padding-right: 36px; padding-left: 16px; }
 
 /* scroll to the bottom: at the right end of the field, only when away from the bottom */
 .ck-down { position: absolute; right: 5px; bottom: 5px; width: 24px; height: 24px; border-radius: 6px; border: 1px solid var(--line-3);
@@ -279,7 +373,8 @@ body.ck { min-height: 100vh; display: flex; flex-direction: column; }
   .ck-row { grid-template-columns: 16px auto minmax(0, 1fr) 56px; }
   .ck-row .ck-badge, .ck-row .ck-track { display: none; }
   .ck-model-x { display: none; }
-  .ck-tui { display: none; }
+  .ck-ctx { display: none; }   /* the ⋮ menu has the same facts */
+  .ck-view-t { display: none; }  /* the icon and dot are enough at this width */
   .ck-pop[data-kind="slash"] .ck-pop-main { flex-direction: column; align-items: stretch; gap: 0; }
   .ck-pop-title.is-mono { max-width: 100%; }
 }

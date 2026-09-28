@@ -42,6 +42,47 @@ and approval requests as cards. `ClaudeChatController.swift` hosts it.
 `Resources/ClaudeSidecar/prompt-contract.md` tells Claude which shapes the page
 renders specially.
 
+**Side chats.** The switch at the left of the status line opens a side chat: a
+fork of the main session as it is at that moment (`forkSession`), in its own
+sidecar and session file, with main's model and effort (so it reads main's
+prompt cache) and manual approvals. The switch then flips the full view
+between main and the last side chat; its caret lists every conversation and
+opens more. A dot on the switch says a conversation out of view is working,
+waits for you, or has news. Each conversation keeps its own log, draft,
+scroll position, cards, model and mode. Side chats do not refresh: open a new
+one for a newer fork. Close one from the ⋮ menu.
+
+**Thinking.** Claude Code's default thinking display sends the blocks empty,
+and over the SDK it does not apply `showThinkingSummaries` itself. So the
+sidecar does: at start it follows the merged settings (what `/config` says;
+off when unset), and "Show thinking" in the ⋮ menu turns it on or off at once
+(`setMaxThinkingTokens(null, 'summarized' | 'omitted')`). The tab keeps that
+choice across a restart, and a new side chat takes main's. Each thinking block is one folded line: while it runs, a
+rotating word ("Canoodling…"), the latest line of the summary and a timer;
+when done, "Thought for 12s". Click it to read the summary. A block with no
+text shows only its time.
+
+**/resume** (also "Resume a conversation…" in the ⋮ menu) lists the other
+conversations of this folder, newest first, with age, branch and size; type
+after `/resume ` to filter, or give an ID. Picking one restarts main's sidecar
+on that session and draws its history: prompts as turns, commands and their
+output, referenced passages as chips, tool calls as rows with their real
+times. The sidecar sends at most the last 400 messages, starting at a prompt,
+with long tool output and file contents cut. A conversation changed in the
+last two minutes is tagged "active now": it may be open in another tab or
+terminal, and two writers must not share a session.
+
+**Composer height.** Drag the grip on the text field's left edge (up is
+taller, up to 60% of the window); double-click resets it to grow with the text.
+
+The status line shows the session's folder and git branch (a dot when there
+are uncommitted changes). The ⋮ button (or a click on the folder) opens a menu
+with the full path, branch, change counts and ahead/behind, the last commit,
+MCP servers, the session ID and Claude Code version, and actions: Copy path,
+Reveal in Finder, Copy session ID, Open in TUI, Compact conversation, New
+conversation. The sidecar reads git in the session's folder at start, after
+each turn and when the menu opens.
+
 The dock at the bottom has a model menu (with effort, ⌥P), a permission-mode
 menu (Ask, Accept edits, Plan, Auto; ⇧Tab cycles), a usage chip that opens a
 panel (session cost, context, plan limits) and the composer. Typing `/` in the
@@ -76,8 +117,9 @@ swift Resources/SkimRender/dev/snapshot.swift Resources/SkimRender/dev/dock-test
 ```
 
 `?change=edit|write|multi` (with `&diff=1`, `&big=1`) shows a file-change card (data: `dev/change-sample.js`).
+`?resume=pick|done` shows the /resume list or a resumed conversation (data: `dev/history-sample.js`). `?think=live|done|open` shows a thinking block. `?side=1` shows a side chat (`&back=1`: main in view).
 `?ref=select` shows a selected passage with its button, `?ref=chips` two referenced passages.
-`?pop=` takes `model`, `mode`, `usage`, `slash` (with `q=`) or `slash-arg` (with
+`?pop=` takes `model`, `mode`, `usage`, `more`, `slash` (with `q=`) or `slash-arg` (with
 `q=/code-review%20`). The menu data is in `dev/dock-sample.js`.
 
 ## Checking a change
