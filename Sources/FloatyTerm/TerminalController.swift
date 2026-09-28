@@ -792,6 +792,11 @@ final class TerminalController: NSObject, LocalProcessTerminalViewDelegate, TabC
             self?.routeLink(link)
         }
 
+        // ⌘/ — open the selected text as a link or file path.
+        terminalView.onOpenSelection = { [weak self] text in
+            self?.routeLink(text)
+        }
+
         // Restore the previous run's transcript before any shell output can
         // commit, so old history sits cleanly below the new session's lines.
         if isRestored { restoreTranscriptFromDisk() }
