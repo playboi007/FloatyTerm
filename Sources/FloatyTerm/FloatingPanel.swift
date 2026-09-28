@@ -215,7 +215,15 @@ final class FloatingPanel: NSPanel {
 
     /// Keeps a frame fully on the visible area of whichever screen it overlaps.
     func clampToVisibleScreen(_ f: NSRect) -> NSRect {
-        let screen = NSScreen.screens.first { $0.frame.intersects(f) } ?? NSScreen.main
+        // A frame that intersects nothing has no home screen to clamp against
+        // — its display was unplugged, or a stray drag shoved it off every
+        // screen. Fall back to the screen under the MOUSE (where the user is),
+        // not NSScreen.main, which tracks the key window and can itself sit on
+        // the display that just went away.
+        let mouse = NSEvent.mouseLocation
+        let screen = NSScreen.screens.first { $0.frame.intersects(f) }
+            ?? NSScreen.screens.first { NSMouseInRect(mouse, $0.frame, false) }
+            ?? NSScreen.main
         guard let vis = screen?.visibleFrame else { return f }
         var r = f
         r.size.width  = min(r.width, vis.width)

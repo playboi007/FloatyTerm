@@ -1,0 +1,11 @@
+name: floaty_net_recorder
+description: Dev-only, full-fidelity HTTP recorder that streams every request to FloatyTerm's local relay for export as JSON, HAR or Markdown.
+version: 0.1.0
+publish_to: none
+
+environment:
+  sdk: '>=3.0.0 <4.0.0'
+
+# No dependencies, deliberately. This is a package you add to a dev build of
+# someone else's app; every dependency it drags in is a version conflict it can
+# cause. Everything here is dart:io and dart:async.

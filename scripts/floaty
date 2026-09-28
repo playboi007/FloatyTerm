@@ -119,6 +119,40 @@
 #                 # next command finishes, exit code included — cross-agent coordination without polling
 #   floaty peek   --session build --since 1200           # raw transcript window from absolute line 1200
 #                 # (works without shell integration; reply carries next_since for paging)
+#
+#   NETWORK RECORDING — every request a Dart app makes, complete enough to replay
+#   floaty net start --label admin-app --vm "http://127.0.0.1:50123/TOKEN=/"
+#                 # Starts a full-fidelity recording. --vm is the VM Service URI `flutter run`
+#                 # prints; with it, dart:io traffic is captured with NO code in the app
+#                 # (same source as the DevTools Network tab). Debug/profile builds only —
+#                 # a release build has no profiler and the call fails saying so.
+#                 # Without --vm only relay collectors feed the session: the floaty_net_recorder
+#                 # Dart package, or the injected /floaty.js on web.
+#                 # UNREDACTED by design: auth headers, cookies and bodies are kept verbatim,
+#                 # so the export can rebuild the request. The file is 0600 and holds live
+#                 # credentials — treat it like one.
+#                 # [--max-body 5000000] caps each body; the event says when it truncated.
+#   floaty net start --label site --chrome app.example.com
+#                 # Records a tab in your LIVE Chrome — real profile, logged in — through the
+#                 # FloatyTerm CDP extension. --chrome <substring> picks the tab by url/title;
+#                 # bare --chrome = the active tab. Captures every request, cookies included
+#                 # (from the raw headers), redirect hops, iframes/workers, WebSocket frames, SSE.
+#                 # Chrome shows an "is debugging" banner while it runs; dismissing it ends the
+#                 # recording. --vm and --chrome can be combined in one session.
+#   floaty net stop [--label admin-app]                 # stops, detaches, reports the event count
+#   floaty net status                                   # live sessions + every recording on disk
+#   floaty net export [--record <session|path>] [--format md|json|har] [--out FILE]
+#                 # Writes into your CURRENT directory by default; newest recording when
+#                 # --record is omitted. md = summary table + per-request detail, each with a
+#                 # runnable curl. json = every field, plus replay.curl. har = HAR 1.2, which
+#                 # Chrome DevTools / Proxyman / Charles open directly.
+#                 # [--failed] only 4xx/5xx/errors · [--url /v1/orders] substring filter
+#                 # [--full] do not trim long bodies in the Markdown
+#   floaty net attach --vm <uri> | --chrome [match]     # add a collector to the live session
+#   floaty net detach [--chrome]                        # remove one without stopping
+#   floaty net attach --vm <uri> | floaty net detach    # move the VM collector without
+#                 # starting or stopping the recording (e.g. after a hot restart on a new port)
+#
 #   floaty capture --window "Flutter" [--ocr]           # returns a capture FRAME (frame_id +
 #                                                        # origin/size/scale/image dims) + PNG
 #   floaty capture --window-id 12345 [--ocr]            # exact window from list-windows
@@ -247,6 +281,21 @@ HOST
   host --ghost on|off      # make FloatyTerm click-through BEFORE driving another app
   raise --app "…" | --pid N
 
+NETWORK RECORDING — every request, exportable
+  net start --label app [--vm <VM service URI>] [--chrome [tab match]] [--max-body N]
+      Record all network activity. --vm attaches the Dart VM Service collector
+      (no code in the app, dart:io only, debug/profile builds only). --chrome
+      records a tab in your live Chrome profile via the CDP extension.
+      The recording is UNREDACTED so it can be replayed: it holds live tokens.
+  net stop [--label app]        stop, flush, report the count
+  net status                    live sessions + recordings on disk
+  net export [--record <session|path>] [--format md|json|har] [--out FILE]
+             [--failed] [--url SUBSTRING] [--full]
+      Writes to the current directory; md and json carry a runnable curl per
+      request, har opens in Chrome DevTools.
+  net attach --vm <uri> | --chrome [match]    add a collector mid-session
+  net detach [--chrome]                       remove one without stopping
+
 TERMINAL TUNNEL — read another session's command output
   sessions
       Lists every FloatyTerm terminal: id, name, status, is_agent, last_block,
@@ -274,11 +323,20 @@ args=("$@")
 # bash 3.2 that ships with macOS (a bare "${args[@]}" trips "unbound variable"
 # for argument-less commands like `list-windows`).
 routed=$(python3 - "$cmd" ${args[@]+"${args[@]}"} <<'PY'
-import sys, json
+import sys, json, os
 cmd = sys.argv[1]; toks = sys.argv[2:]
 obj = {}; i = 0
 # numeric flags → numbers; --modifiers → array; bare flags (--human/--ocr) → true.
-NUM = {"x","y","port","clicks","dx","dy","duration","from_x","from_y","to_x","to_y","window_id","id","max","pid","since","timeout","max_lines","every"}
+NUM = {"x","y","port","clicks","dx","dy","duration","from_x","from_y","to_x","to_y","window_id","id","max","pid","since","timeout","max_lines","every","poll","max_body"}
+# `net` takes a bare sub-action ("net start", "net export") before its flags.
+# The relay sees it as {"action": "..."} — one route, several verbs, because
+# they share one piece of state.
+if cmd == "net":
+    if toks and not toks[0].startswith("--"): obj["action"] = toks[0]
+    # The app has no working directory of its own, so `net export` would have
+    # nowhere sensible to put the file. Send ours.
+    obj["cwd"] = os.getcwd()
+
 while i < len(toks):
     if not toks[i].startswith("--"): i += 1; continue
     key = toks[i][2:].replace("-", "_")
@@ -305,7 +363,7 @@ paths = {"click":"/agent/click","move":"/agent/move","drag":"/agent/drag",
          "host":"/agent/host","raise":"/agent/raise",
          "read-text":"/agent/read-text",
          "sessions":"/agent/sessions","peek":"/agent/peek",
-         "run":"/agent/run"}
+         "run":"/agent/run","net":"/agent/net"}
 print(json.dumps({"path": paths.get(cmd, "/agent/"+cmd), "body": obj}))
 PY
 )

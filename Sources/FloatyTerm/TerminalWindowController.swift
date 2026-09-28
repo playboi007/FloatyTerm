@@ -806,6 +806,71 @@ final class TerminalWindowController: NSObject, NSWindowDelegate {
         return nil
     }
 
+    /// Presence MEASURED, never inferred from the pin flag. `isPinned` records
+    /// only our intent; the real Space binding is `.canJoinAllSpaces`, which
+    /// the window server silently drops across display sleep and fullscreen
+    /// transitions (see `FloatingPanel.reassertFloatingBehavior`). A roaming
+    /// window that lost the flag is bound to ONE Space while still reporting
+    /// itself unpinned — treating "unpinned" as "here" is what made summoned
+    /// sessions appear nowhere.
+    ///
+    /// When nothing is on screen there is nothing to measure: a pinned window
+    /// is bound to one Space, so unknown must not read as "here", while a
+    /// hidden roaming window lands wherever it is next shown (ordering in is
+    /// itself the cycle a refreshed flag needs, so `show()` self-heals it).
+    var isReallyOnActiveSpace: Bool {
+        presenceOnActiveSpace ?? !panel.isPinned
+    }
+
+    /// The "lost in Space" state: this window claims to roam every Space, but
+    /// the window server has it displayed on a different one. It is visible,
+    /// so no reveal path considers it hidden, yet the user cannot see it.
+    /// `recoverToActiveSpace()` is what gets it back.
+    var isStrandedOffActiveSpace: Bool {
+        !panel.isPinned && presenceOnActiveSpace == false
+    }
+
+    /// Frees a roaming representative the window server stranded on another
+    /// Space. Re-applying `.canJoinAllSpaces` alone does NOT move it: an
+    /// already ordered-in window keeps its old Space attachment, and the flag
+    /// only takes hold across an orderOut / orderFront cycle. That missing
+    /// cycle is why `reassertFloatingBehavior` on its own could never recover
+    /// a stranded window, however many times it ran.
+    func recoverToActiveSpace() {
+        guard !panel.isPinned else { return }
+        if isCollapsed, let av = avatar, av.isVisible {
+            av.orderOut(nil)
+            av.reassertFloatingBehavior()
+            av.orderFrontRegardless()
+        } else if isTicker, let t = ticker, t.isVisible {
+            t.orderOut(nil)
+            t.reassertFloatingBehavior()
+            t.orderFrontRegardless()
+        } else if panel.isVisible {
+            panel.orderOut(nil)
+            panel.presentOverlay()   // reasserts the flags, then orders back in
+        }
+    }
+
+    /// A display was unplugged or reconfigured: pull every frame this window
+    /// owns back onto a screen that still exists. Without this the window keeps
+    /// a frame in the coordinate space of a monitor that is gone — it reports
+    /// itself visible, renders nowhere, and no summon can undo that because the
+    /// reveal paths only order it front, never move it.
+    func reclampToVisibleScreens() {
+        if isCollapsed, let av = avatar {
+            av.setFrame(panel.clampToVisibleScreen(av.frame), display: false)
+        } else if isTicker, let t = ticker {
+            t.setFrame(panel.clampToVisibleScreen(t.frame), display: false)
+        }
+        // The pre-collapse frame is what an expand restores, so it needs the
+        // same treatment — otherwise expanding lands back on the dead display.
+        if isCollapsed || isTicker {
+            savedFrameForExpand = panel.clampToVisibleScreen(savedFrameForExpand)
+        }
+        panel.setFrame(panel.clampToVisibleScreen(panel.frame), display: false)
+    }
+
     /// Frame of the on-screen collapsed representative (bubble or ticker
     /// strip), if any — lets the summon path detect "the bubble sits on a
     /// different screen than the user" and route the expand elsewhere.
