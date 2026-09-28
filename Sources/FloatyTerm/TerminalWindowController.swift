@@ -1317,6 +1317,12 @@ final class TerminalWindowController: NSObject, NSWindowDelegate {
             ?? NSHomeDirectory()
         let tab = ClaudeChatController(cwd: cwd)
         tab.onOpenTUI = { [weak self] dir, sessionID in self?.openClaudeTUI(in: dir, sessionID: sessionID) }
+        // /exit or /quit in the tab closes it.
+        tab.onTerminated = { [weak self, weak tab] in
+            guard let self, let tab,
+                  let idx = self.tabs.firstIndex(where: { $0 === tab }) else { return }
+            self.closeTab(idx)
+        }
         installSimpleTab(tab)
     }
 
