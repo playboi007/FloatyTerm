@@ -15,3 +15,6 @@ docs/floaty-ui-control/
 
 # Dart tool output
 .dart_tool/
+
+# Claude sidecar dependencies (installed by build.sh from package-lock.json)
+Resources/ClaudeSidecar/node_modules/

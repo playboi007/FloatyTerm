@@ -1,0 +1,11 @@
+{
+  "name": "floatyterm-claude-sidecar",
+  "private": true,
+  "version": "0.1.0",
+  "description": "Runs a Claude Code session through the Claude Agent SDK for FloatyTerm's Claude tab.",
+  "type": "module",
+  "main": "sidecar.mjs",
+  "dependencies": {
+    "@anthropic-ai/claude-agent-sdk": "0.3.284"
+  }
+}

@@ -25,6 +25,17 @@ cp "Info.plist" "$APP/Contents/Info.plist"
 mkdir -p "$APP/Contents/Resources"
 rsync -a --exclude 'dev/' "Resources/SkimRender/" "$APP/Contents/Resources/SkimRender/"
 
+# The Claude tab's sidecar (Node + the Claude Agent SDK). The SDK's own Claude
+# Code binaries are optional dependencies and are left out: the sidecar drives
+# the user's installed `claude`.
+if command -v npm >/dev/null 2>&1; then
+    echo "==> Installing the Claude sidecar's dependencies…"
+    (cd Resources/ClaudeSidecar && npm ci --omit=optional --no-audit --no-fund --loglevel=error)
+    rsync -a "Resources/ClaudeSidecar/" "$APP/Contents/Resources/ClaudeSidecar/"
+else
+    echo "==> npm not found — skipping the Claude sidecar (the Claude tab will explain what is missing)."
+fi
+
 IDENTITY="${FLOATY_SIGN_ID:-$(security find-identity -v -p codesigning 2>/dev/null \
     | awk -F'"' 'NR==1 {print $2}')}"
 if [[ -n "${IDENTITY:-}" ]]; then
