@@ -46,6 +46,13 @@ final class Shot: NSObject, WKNavigationDelegate {
         const ce = console.error; console.error = (...a) => { __errors.push('console.error: ' + a.map(String).join(' ')); ce(...a); };
         """
         config.userContentController.addUserScript(WKUserScript(source: capture, injectionTime: .atDocumentStart, forMainFrameOnly: true))
+        // The window is offscreen, so WebKit treats the page as hidden and slows
+        // its timers more and more (and skips animation frames). Scripted checks
+        // that wait on timers would stall; turn that off (dev tool only).
+        for key in ["hiddenPageDOMTimerThrottlingEnabled", "hiddenPageDOMTimerThrottlingAutoIncreases",
+                    "pageVisibilityBasedProcessSuppressionEnabled"] {
+            config.preferences.setValue(false, forKey: key)
+        }
         #if SKIM_HOST
         if pageFile.pathExtension == "md" { SkimAssets.install(in: config) }
         #endif
@@ -53,7 +60,13 @@ final class Shot: NSObject, WKNavigationDelegate {
         window = NSWindow(contentRect: web.frame, styleMask: [.borderless], backing: .buffered, defer: false)
         super.init()
         window.contentView = web
-        window.setFrameOrigin(NSPoint(x: -20000, y: -20000))   // offscreen, but a real window so it paints
+        // On screen, 1% opaque and click-through, for the few seconds of the run. An
+        // offscreen, fully transparent or desktop-level window is "occluded", and
+        // WebKit then skips animation frames, which the pages use. The snapshot
+        // itself is WebKit's rendering, so the window's opacity does not show in it.
+        window.setFrameOrigin(NSPoint(x: 0, y: 0))
+        window.alphaValue = 0.01
+        window.ignoresMouseEvents = true
         window.orderFrontRegardless()
         web.navigationDelegate = self
         #if SKIM_HOST
