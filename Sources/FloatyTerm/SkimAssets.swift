@@ -65,6 +65,12 @@ enum SkimAssets {
     private static let skimCSS: String = read("skim.css") ?? ""
     private static let chatCSS: String = read("chat.css") ?? ""
     private static let chatScript: String? = read("chat.js")
+    private static let agentScripts: [String]? = {
+        let names = ["agent-events.js", "agent-claude.js", "agent-codex.js"]
+        let sources = names.compactMap(read)
+        return sources.count == names.count ? sources : nil
+    }()
+    static var isChatAvailable: Bool { isAvailable && chatScript != nil && agentScripts != nil }
 
     // MARK: - Web view setup
 
@@ -74,7 +80,11 @@ enum SkimAssets {
     static func install(in config: WKWebViewConfiguration, chat: Bool = false,
                         onAction: (([String: Any]) -> Void)? = nil) {
         guard var scripts = coreScripts else { return }
-        if chat, let chatScript { scripts.append(chatScript) }
+        if chat {
+            guard let agentScripts, let chatScript else { return }
+            scripts.append(contentsOf: agentScripts)
+            scripts.append(chatScript)
+        }
         let ucc = config.userContentController
         for source in scripts {
             ucc.addUserScript(WKUserScript(source: source, injectionTime: .atDocumentStart, forMainFrameOnly: true))
@@ -131,11 +141,11 @@ enum SkimAssets {
 }
 
 extension SkimAssets {
-    /// The Claude tab's page (chat.js on top of the renderer). `ClaudeChat.boot`
+    /// The shared agent page (chat.js on top of the renderer). `AgentChat.boot`
     /// runs once the document has parsed; events arrive later through
-    /// `ClaudeChat.receive`.
-    static func chatDocument(cwd: String, intro: String? = nil) -> String {
-        let cfg: [String: Any] = ["cwd": cwd, "home": NSHomeDirectory(), "intro": intro ?? ""]
+    /// `AgentChat.receive`.
+    static func chatDocument(cwd: String, intro: String? = nil, agent: String = "claude") -> String {
+        let cfg: [String: Any] = ["cwd": cwd, "home": NSHomeDirectory(), "intro": intro ?? "", "agent": agent]
         let json = (try? JSONSerialization.data(withJSONObject: cfg)).flatMap { String(data: $0, encoding: .utf8) } ?? "{}"
         return """
         <!DOCTYPE html>
@@ -145,7 +155,7 @@ extension SkimAssets {
         <style>\(skimCSS)</style>
         <style>\(chatCSS)</style>
         </head>
-        <body><script>ClaudeChat.boot(\(json.replacingOccurrences(of: "</", with: "<\\/")));</script></body></html>
+        <body><script>AgentChat.boot(\(json.replacingOccurrences(of: "</", with: "<\\/")));</script></body></html>
         """
     }
 }

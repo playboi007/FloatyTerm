@@ -1031,6 +1031,8 @@ final class TerminalWindowController: NSObject, NSWindowDelegate {
     /// Public entry for the menu bar's "New Claude Tab".
     func openNewClaudeTab() { addClaudeTab() }
 
+    func openNewCodexTab() { addClaudeTab(agent: .codex) }
+
     /// Public entry for the menu bar's "Mirror a Window…".
     func openNewMirror() { addMirrorTab() }
 
@@ -1300,13 +1302,13 @@ final class TerminalWindowController: NSObject, NSWindowDelegate {
         insertTab(tab)
     }
 
-    /// Opens a Claude tab (Claude Code without its TUI) in the active
+    /// Opens an agent chat tab in the active
     /// terminal's directory — the folder the user is working in, whatever the
     /// "inherit working directory" setting says, since a session is tied to it.
-    func addClaudeTab() {
+    func addClaudeTab(agent: ChatAgent = .claude) {
         guard ClaudeChatController.isAvailable else {
             let alert = NSAlert()
-            alert.messageText = "The Claude tab is not available"
+            alert.messageText = "The \(agent.rawValue.capitalized) tab is not available"
             alert.informativeText = "Its renderer files (Resources/SkimRender) are missing from this build. Rebuild FloatyTerm with ./build.sh."
             alert.runModal()
             return
@@ -1315,8 +1317,8 @@ final class TerminalWindowController: NSObject, NSWindowDelegate {
         let cwd = (active as? TerminalController)?.currentWorkingDirectory
             ?? (active as? ClaudeChatController)?.cwd
             ?? NSHomeDirectory()
-        let tab = ClaudeChatController(cwd: cwd)
-        tab.onOpenTUI = { [weak self] dir, sessionID in self?.openClaudeTUI(in: dir, sessionID: sessionID) }
+        let tab = ClaudeChatController(cwd: cwd, agent: agent)
+        tab.onOpenTUI = { [weak self] dir, sessionID in self?.openAgentTUI(in: dir, sessionID: sessionID, agent: agent) }
         // /exit or /quit in the tab closes it.
         tab.onTerminated = { [weak self, weak tab] in
             guard let self, let tab,
@@ -1327,7 +1329,7 @@ final class TerminalWindowController: NSObject, NSWindowDelegate {
     }
 
     /// A terminal tab that continues a Claude tab's session in the TUI.
-    private func openClaudeTUI(in dir: String, sessionID: String) {
+    private func openAgentTUI(in dir: String, sessionID: String, agent: ChatAgent) {
         let tab = TerminalController(startDirectory: dir)
         tab.onTerminated = { [weak self, weak tab] in
             guard let self, let tab,
@@ -1339,7 +1341,7 @@ final class TerminalWindowController: NSObject, NSWindowDelegate {
         // The pty buffers input, but give the shell a beat to print its prompt.
         let safeID = sessionID.filter { $0.isHexDigit || $0 == "-" }
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) { [weak tab] in
-            tab?.run(command: "claude --resume \(safeID)")
+            tab?.run(command: agent == .claude ? "claude --resume \(safeID)" : "codex resume \(safeID)")
         }
     }
 

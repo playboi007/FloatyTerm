@@ -59,7 +59,7 @@ final class ClaudeSidecar {
 
     /// Common install locations first — an app started from Finder has a bare
     /// PATH — then the user's login shell as the last resort.
-    private static func locate(_ name: String) -> String? {
+    static func locate(_ name: String) -> String? {
         let home = NSHomeDirectory()
         let candidates = ["/opt/homebrew/bin", "/usr/local/bin", "\(home)/.local/bin", "\(home)/.claude/local",
                           "\(home)/.volta/bin", "\(home)/.bun/bin", "/usr/bin"].map { "\($0)/\(name)" }

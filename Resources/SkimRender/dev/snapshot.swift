@@ -35,6 +35,7 @@ let fixedHeight = args.count > 5 ? Double(args[5]) : nil
 final class Shot: NSObject, WKNavigationDelegate {
     let web: WKWebView
     let window: NSWindow
+    var testsFailed = false
 
     override init() {
         let config = WKWebViewConfiguration()
@@ -80,7 +81,16 @@ final class Shot: NSObject, WKNavigationDelegate {
     }
 
     func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
-        DispatchQueue.main.asyncAfter(deadline: .now() + settle) { self.measure() }
+        DispatchQueue.main.asyncAfter(deadline: .now() + settle) {
+            self.web.evaluateJavaScript("window.__testResults || null") { result, _ in
+                if let checks = result as? [String: Any] {
+                    let failed = checks["failed"] as? Int ?? 0
+                    self.testsFailed = failed > 0
+                    print("DOM checks: \(checks["passed"] ?? 0) passed, \(failed) failed")
+                }
+                self.measure()
+            }
+        }
     }
 
     func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error) { fail(error) }
@@ -115,7 +125,7 @@ final class Shot: NSObject, WKNavigationDelegate {
                   let png = rep.representation(using: .png, properties: [:]) else { print("snapshot failed: \(String(describing: error))"); exit(1) }
             try? png.write(to: out)
             print("wrote \(out.path) \(Int(frame.width))x\(Int(frame.height))")
-            exit(0)
+            exit(self.testsFailed ? 1 : 0)
         }
     }
 }

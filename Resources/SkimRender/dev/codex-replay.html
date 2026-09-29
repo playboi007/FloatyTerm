@@ -1,0 +1,49 @@
+<!DOCTYPE html>
+<html lang="en"><head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Codex Tab Replay (Synthetic)</title>
+<link rel="stylesheet" href="../fonts.css">
+<link rel="stylesheet" href="../skim.css">
+<link rel="stylesheet" href="../chat.css">
+</head><body>
+<script src="../vendor/marked.min.js"></script>
+<script src="../vendor/purify.min.js"></script>
+<script src="../vendor/highlight.min.js"></script>
+<script src="../vendor/hljs-dart.min.js"></script>
+<script src="../skim-classify.js"></script>
+<script src="../skim-render.js"></script>
+<script src="../agent-events.js"></script>
+<script src="../agent-claude.js"></script>
+<script src="../agent-codex.js"></script>
+<script src="../chat.js"></script>
+<script src="codex-sample.js"></script>
+<script>
+  // Local replay only; no Codex process or provider request.
+  AgentChat.boot({ agent: 'codex', cwd: '/Users/demo/project', home: '/Users/demo' });
+  AgentChat.showUser('Inspect the top level files and summarize the project.');
+  const events = window.CODEX_SAMPLE;
+  const query = new URLSearchParams(location.search);
+  const speed = Number(query.get('speed') || 0);
+  if (!speed) {
+    AgentChat.receive(events);
+    const pop = query.get('pop');
+    if (['usage', 'model', 'mode', 'more'].includes(pop)) document.querySelector('.ck-' + pop).click();
+    if (pop === 'slash') {
+      const input = document.querySelector('.ck-input');
+      input.value = '/'; input.setSelectionRange(1, 1);
+      input.dispatchEvent(new Event('input', { bubbles: true }));
+    }
+  }
+  else {
+    let i = 0;
+    function next() {
+      if (i >= events.length) return;
+      const event = events[i++];
+      AgentChat.receive([event]);
+      if (i < events.length) setTimeout(next, Math.min((events[i].t - event.t) / speed, 1500));
+    }
+    next();
+  }
+</script>
+</body></html>

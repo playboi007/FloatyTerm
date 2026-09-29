@@ -1,6 +1,6 @@
 # SkimRender
 
-Renders Claude's Markdown replies so they are easy to skim. It follows the
+Renders agent Markdown replies so they are easy to skim. It follows the
 "Markdown, made skimmable" design: each reply is split into typed blocks, and
 each block kind gets its own layout. A block that no rule matches stays plain
 Markdown.
@@ -31,6 +31,44 @@ Markdown.
 
 The app loads these files through `Sources/FloatyTerm/SkimAssets.swift`. `build.sh`
 copies this folder, without `dev/`, to `FloatyTerm.app/Contents/Resources/SkimRender`.
+
+## Shared agent tabs
+
+`AgentChat` renders both Claude and Codex through the v1 contract in
+`agent-events.js`. `agent-claude.js` and `agent-codex.js` translate native events;
+each conversation owns its normalizer and reducer. `ClaudeChat` remains an alias
+for existing replay callers. Text snapshots replace previous text, while explicit
+deltas append; native tool IDs and per-turn Codex IDs keep activity separate.
+Unknown events appear as folded, bounded JSON details.
+
+The menu bar's **New Codex Tab** starts the installed `codex` through the
+dependency-free `Resources/CodexSidecar/sidecar.mjs`. It maintains a Codex
+`app-server --listen stdio://` connection and translates JSON-RPC notifications
+into the shared renderer contract. The existing `exec --json` normalizer remains
+available for replay fixtures. Codex retains its installed authentication and
+configured model unless a model is selected.
+
+The dock provides model/effort selection, workspace-write or read-only permissions,
+token/context usage and account limits, slash commands, and the ⋮ actions menu.
+Approvals use app-server request IDs and explicit allow/deny responses. Commands
+such as `/usage`, `/model`, `/resume`, `/fork`, `/compact`, and `/new` route through
+local controls; unknown slash commands report an error. Codex reasoning display
+uses summaries. Side chats fork native threads, and TUI handoff uses `codex resume`.
+Closing a tab stops its runner and active process group.
+
+The existing Claude SDK driver retains its controls, approvals, and side chats.
+No Headless CLI dependency is required. HTTP SSE and ACP remain future input
+adapters. See [the implementation plan](../../docs/shared-agent-renderer-plan.md).
+
+Verify the shared path without an account or model call:
+
+```sh
+node --test Resources/SkimRender/dev/agent-events.test.js Resources/SkimRender/dev/codex-events.test.js
+node --test Resources/CodexSidecar/sidecar.test.mjs
+```
+
+`dev/codex-replay.html` is a synthetic Codex fixture. `dev/chat-replay.html` uses
+the existing recorded Claude fixture. Both run through the same page renderer.
 
 ## The Claude tab
 

@@ -128,6 +128,9 @@ body.ck { min-height: 100vh; display: flex; flex-direction: column; }
 .ck-ln-hunk { padding: 5px 12px 2px 22px; font: 10.5px var(--mono); letter-spacing: .04em; text-transform: uppercase; color: var(--faint); }
 .ck-ln-hunk:not(:first-child) { margin-top: 4px; border-top: 1px solid var(--line); }
 .ck-json { padding: 8px 10px; margin-top: 0; color: var(--text-3); white-space: pre-wrap; overflow-wrap: anywhere; max-height: 160px; overflow: auto; }
+.ck-file-changes { padding: 8px 12px; }
+.ck-file-changes summary { cursor: pointer; font: 12px/1.6 var(--mono); overflow-wrap: anywhere; }
+.ck-file-changes .ck-json { margin: 6px 0; }
 .ck-why { padding: 8px 12px 0; font-size: 12.5px; color: var(--muted); }
 .ck-why-k { color: var(--faint); }
 .ck-opts { display: flex; flex-direction: column; gap: 5px; padding: 10px 12px 12px; }
@@ -365,6 +368,14 @@ body.is-resizing, body.is-resizing * { cursor: ns-resize !important; user-select
 .ck-send:hover { border-color: var(--accent); }
 .ck-send-ic { width: 0; height: 0; border-left: 9px solid var(--text); border-top: 6px solid transparent; border-bottom: 6px solid transparent; margin-left: 2px; }
 .ck-send[data-mode="stop"] .ck-send-ic { width: 10px; height: 10px; border: 0; border-radius: 2px; background: var(--bad); margin: 0; }
+
+/* The status chips use explicit display rules; keep capability-hidden controls out of layout. */
+.ck-chip[hidden], .ck-view[hidden], .ck-view-more[hidden] { display: none; }
+.ck-unknown { margin: 8px 0; border: 1px solid var(--line-2); border-radius: 6px; color: var(--text-3); font: 11px var(--mono); }
+.ck-unknown summary { padding: 6px 8px; cursor: pointer; overflow-wrap: anywhere; }
+.ck-unknown pre { max-height: 240px; overflow: auto; margin: 0; padding: 8px; border-top: 1px solid var(--line-2); white-space: pre-wrap; overflow-wrap: anywhere; }
+.ck-row[data-state="interrupted"] .ck-ic { border: 1px solid var(--line-3); background: var(--surface-3); }
+.ck-row[data-state="interrupted"] .ck-ic::after { content: '–'; color: var(--text-3); }
 
 /* a slash command the user sent reads as a command */
 .ck-user.is-cmd .ck-user-text { font: 12.5px var(--mono); color: var(--path); }

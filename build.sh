@@ -24,6 +24,7 @@ cp "Info.plist" "$APP/Contents/Info.plist"
 # SkimRender (the Markdown renderer's JS, CSS and fonts), minus its dev fixtures.
 mkdir -p "$APP/Contents/Resources"
 rsync -a --exclude 'dev/' "Resources/SkimRender/" "$APP/Contents/Resources/SkimRender/"
+rsync -a --exclude '*.test.mjs' "Resources/CodexSidecar/" "$APP/Contents/Resources/CodexSidecar/"
 
 # The Claude tab's sidecar (Node + the Claude Agent SDK). The SDK's own Claude
 # Code binaries are optional dependencies and are left out: the sidecar drives

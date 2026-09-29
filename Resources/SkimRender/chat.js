@@ -1,6 +1,5 @@
 /*
- * ClaudeChat — the Claude tab's page: a conversation drawn from the sidecar's
- * event stream (Resources/ClaudeSidecar/sidecar.mjs).
+ * AgentChat — one conversation renderer for normalized agent events.
  *
  *   ClaudeChat.receive([event, …])   host → page, in order
  *   ClaudeChat.boot({ cwd })         once, before the first event
@@ -45,6 +44,13 @@
   // ── state ──────────────────────────────────────────────────────────────
 
   /** Facts of the folder and account, the same for every conversation. */
+  const CLAUDE_FEATURES = { approvals: true, fork: true, history: true, models: true, effort: true,
+    permissionMode: true, thinking: true, usage: true, git: true, tui: true, slashCommands: true, midTurnInput: true };
+  const CODEX_FEATURES = { approvals: true, fork: true, history: true, models: true, effort: true,
+    permissionMode: true, thinking: true, usage: true, git: true, tui: true, slashCommands: true, midTurnInput: false };
+  let agent = 'claude';
+  let features = { ...CLAUDE_FEATURES };
+  const supports = name => !!features[name];
   const SHARED = {
     cwd: '', home: '',
     // from the sidecar's capabilities event and later changes
@@ -63,20 +69,20 @@
   function newConv(id, label) {
     return Object.assign(Object.create(SHARED), {
       id, label, log: null,
+      normalizer: root.AgentEvents.createNormalizer(agent), eventState: root.AgentEvents.createState(),
       model: '', mode: 'default', sessionId: null, cost: 0,
       busy: false, turn: null, turns: [],
       rows: new Map(),        // tool_use id → row
       texts: new Map(),       // `${messageId}:${index}` → text item
       msgTexts: new Map(),    // messageId → [text item] in order (to match full assistant messages)
       cards: new Map(),       // permission id → card
-      blockKind: new Map(),   // `${messageId}:${index}` → 'text' | 'tool_use' | 'thinking'
-      currentMsg: null, thinking: false, lastTool: null,
+      thinking: false, lastTool: null, unknownDetails: [],
       thinks: new Map(), msgThinks: new Map(), liveThink: null, thinkWord: null,   // thinking blocks
       thinkingOn: null, thinkingSource: null,   // whether thinking text is shown (the sidecar reports it)
       modelChoice: null,      // the model menu value the user picked ('sonnet', 'default', …)
       effort: null,           // null: the model's default
       modelUsage: null, turns_n: 0, apiMs: 0,
-      ctx: null,
+      ctx: null, tokens: null, usageUnavailable: null,
       refs: [],               // text referenced from Claude's replies, sent with the next message
       draft: '', follow: true, scrollY: 0, unseen: false
     });
@@ -303,9 +309,6 @@
     return 'done';
   }
 
-  const resultText = c => typeof c.content === 'string' ? c.content
-    : Array.isArray(c.content) ? c.content.map(x => x.type === 'text' ? x.text : '[' + x.type + ']').join('\n') : '';
-
   function ensureRun() {
     const t = turn();
     if (t.run && !t.run.closed) return t.run;
@@ -415,11 +418,11 @@
     const inp = req.input || {};
     if (req.toolName === 'Bash') {
       const cmd = String(inp.command || '');
-      if (req.suppressAlwaysAllowRule || req.defaultToNo || DESTRUCTIVE.test(cmd)) return ['high', 'Destructive'];
+      if ((agent !== 'codex' && req.suppressAlwaysAllowRule) || req.defaultToNo || DESTRUCTIVE.test(cmd)) return ['high', 'Destructive'];
       if (READ_CMD.test(cmd) || VERIFY_CMD.test(cmd)) return ['low', 'Shell · read-only'];
       return ['mid', 'Runs a command'];
     }
-    if (/^(Edit|MultiEdit|Write|NotebookEdit)$/.test(req.toolName)) return [req.defaultToNo ? 'high' : 'mid', req.toolName === 'Write' ? 'Writes a file' : 'Edits a file'];
+    if (/^(Edit|MultiEdit|Write|NotebookEdit|File changes)$/.test(req.toolName)) return [req.defaultToNo ? 'high' : 'mid', req.toolName === 'Write' ? 'Writes a file' : 'Edits a file'];
     if (req.defaultToNo || req.suppressAlwaysAllowRule) return ['high', 'Needs care'];
     return ['low', 'Reads'];
   }
@@ -555,6 +558,11 @@
    * does not fit gets Expand, which makes the box taller (and a card wider).
    */
   function changeView(name, inp) {
+    if (Array.isArray(inp?.changes) && inp.changes.length) {
+      return h('div', { class: 'ck-file-changes' }, inp.changes.map(change =>
+        h('details', null, h('summary', { text: change.path || 'File change' }),
+          h('pre', { class: 'ck-json', text: change.diff || JSON.stringify(change, null, 2) }))));
+    }
     const c = changeOf(name, inp);
     if (!c) return null;
     let mode = 'now', big = false;
@@ -645,7 +653,7 @@
         h('span', { class: 'ck-risk' }, h('span', { class: 'ck-risk-dot' }), risk),
         h('span', { class: 'ck-card-title', text: title })),
       preview(req),
-      why && h('div', { class: 'ck-why' }, h('span', { class: 'ck-why-k', text: 'Claude\'s reason · ' }), why),
+      why && h('div', { class: 'ck-why' }, h('span', { class: 'ck-why-k', text: (agent === 'codex' ? 'Codex' : 'Claude') + '\'s reason · ' }), why),
       opts);
     const choose = (decision, message) => {
       if (card.dataset.done) return;
@@ -668,11 +676,12 @@
       keys['2'] = () => choose('allowAlways');
     }
     const noKey = always ? '3' : '2';
-    const noBtn = btn(noKey, 'No, and tell Claude what to do differently', () => showNo(), 'is-no');
+    const decline = () => agent === 'codex' ? choose('deny') : showNo();
+    const noBtn = btn(noKey, agent === 'codex' ? 'No' : 'No, and tell Claude what to do differently', decline, 'is-no');
     opts.append(noBtn);
-    keys[noKey] = () => showNo();
+    keys[noKey] = decline;
     const noForm = h('div', { class: 'ck-no', hidden: true });
-    const noInput = h('textarea', { class: 'ck-no-input', rows: '2', placeholder: 'What should Claude do instead? (optional)' });
+    const noInput = h('textarea', { class: 'ck-no-input', rows: '2', placeholder: 'What should ' + (agent === 'codex' ? 'Codex' : 'Claude') + ' do instead? (optional)' });
     const noSend = h('button', { class: 'sk-btn', type: 'button', text: 'Decline' });
     noForm.append(noInput, noSend);
     opts.append(noForm);
@@ -697,7 +706,7 @@
     const c = S.cards.get(id);
     if (!c) return;
     S.cards.delete(id);
-    const labels = { allowed: 'Allowed once', always: 'Allowed · rule added ' + (always ? always.where : ''), denied: 'Declined · Claude was told', cancelled: 'Cancelled by Claude' };
+    const labels = { allowed: 'Allowed once', always: 'Allowed · rule added ' + (always ? always.where : ''), denied: 'Declined', cancelled: 'Cancelled' };
     c.opts.replaceWith(h('div', { class: 'ck-outcome', 'data-outcome': outcome },
       h('span', { class: 'ck-outcome-dot' }), labels[outcome] || outcome,
       outcome === 'always' && always && always.rules.length ? h('code', { text: always.rules.join(', ') }) : null));
@@ -725,6 +734,10 @@
     { mode: 'auto', label: 'Auto', desc: 'A classifier approves safe actions and asks about risky ones' }
   ];
   const MODE_LABEL = { default: 'Ask', acceptEdits: 'Accept edits', plan: 'Plan', auto: 'Auto', bypassPermissions: 'Bypass', dontAsk: "Don't ask" };
+  const CODEX_MODES = [
+    { mode: 'default', label: 'Workspace write', desc: 'Work inside the sandbox; ask before actions that need additional permission' },
+    { mode: 'plan', label: 'Read only', desc: 'Use a read-only sandbox; ask before actions that need additional permission' }
+  ];
 
   /** claude-opus-5-5[1m] → "Opus 5.5 · 1M"; anything unexpected stays as-is. */
   function modelLabel(id) {
@@ -740,6 +753,7 @@
     return S.models.find(m => m.resolvedModel === S.model || m.value === S.model) || null;
   }
   const modes = () => {
+    if (agent === 'codex') return CODEX_MODES;
     const row = currentModelRow();
     return MODE_INFO.filter(m => m.mode !== 'auto' || !row || row.supportsAutoMode !== false || S.mode === 'auto');
   };
@@ -767,15 +781,18 @@
 
   function paintMeta() {
     if (!inView()) return;
+    modelEl.hidden = !supports('models');
+    modeBtn.hidden = !supports('permissionMode');
+    costEl.hidden = !supports('usage');
     // "Opus 5.5" stays; " · 1M · high" is the part a narrow panel drops.
     const [name, ...extra] = (modelLabel(S.model) || 'Model').split(' · ');
     if (S.effort) extra.push(S.effort);
     modelEl.firstChild.replaceChildren(name, extra.length ? h('span', { class: 'ck-model-x', text: ' · ' + extra.join(' · ') }) : '');
-    modeBtn.firstChild.textContent = MODE_LABEL[S.mode] || S.mode;
+    modeBtn.firstChild.textContent = agent === 'codex' ? (CODEX_MODES.find(m => m.mode === S.mode)?.label || S.mode) : MODE_LABEL[S.mode] || S.mode;
     modeBtn.dataset.mode = S.mode;
     const pct = S.ctx && S.ctx.maxTokens ? Math.round(S.ctx.totalTokens / S.ctx.maxTokens * 100) : null;
-    costEl.firstChild.textContent = [S.cost ? '$' + S.cost.toFixed(2) : null, pct != null ? pct + '%' : null].filter(Boolean).join(' · ') || 'Usage';
-    costEl.title = 'Usage: session cost, context, plan limits' + (pct != null ? ` (context ${pct}% full)` : '');
+    costEl.firstChild.textContent = [agent === 'codex' ? (S.tokens ? fmtTok(S.tokens.totalTokens) + ' tokens' : null) : S.cost ? '$' + S.cost.toFixed(2) : null, pct != null ? pct + '%' : null].filter(Boolean).join(' · ') || 'Usage';
+    costEl.title = (agent === 'codex' ? 'Usage: tokens, context, account limits' : 'Usage: session cost, context, plan limits') + (pct != null ? ` (context ${pct}% full)` : '');
     costEl.dataset.level = pct == null ? '' : pct >= 80 ? 'bad' : pct >= 60 ? 'warn' : '';
     if (!usagePanel.hidden) paintUsage();
     if (P.kind === 'model' || P.kind === 'mode') refreshPop();
@@ -876,6 +893,7 @@
   }
 
   function openModelMenu() {
+    if (!supports('models')) return;
     if (P.kind === 'model') { closePop(); return; }
     modelEl.classList.add('is-open');
     openPop('model', modelEl, () => {
@@ -913,6 +931,7 @@
   }
 
   function openModeMenu() {
+    if (!supports('permissionMode')) return;
     if (P.kind === 'mode') { closePop(); return; }
     modeBtn.classList.add('is-open');
     openPop('mode', modeBtn, () => ({
@@ -925,6 +944,7 @@
   }
 
   function cycleMode() {
+    if (!supports('permissionMode')) return;
     const list = modes().map(m => m.mode);
     setMode(list[(list.indexOf(S.mode) + 1) % list.length]);
   }
@@ -947,6 +967,7 @@
     h('span', { class: 'ck-meter-fill', style: `width:${Math.min(Math.max(pct, 0), 100)}%` }));
 
   function toggleUsage(open) {
+    if (!supports('usage')) return;
     const show = open != null ? open : usagePanel.hidden;
     usagePanel.hidden = !show;
     costEl.classList.toggle('is-open', show);
@@ -956,6 +977,7 @@
   }
 
   function requestUsage(plan) {
+    if (!supports('usage')) return;
     // Plan limits cost a network call: at most once a minute.
     const withPlan = plan && Date.now() - S.planAt > 60e3;
     if (withPlan) SHARED.planAt = Date.now();
@@ -963,6 +985,7 @@
   }
 
   function paintUsage() {
+    if (agent === 'codex') { paintCodexUsage(); return; }
     const u = S.modelUsage ? Object.entries(S.modelUsage) : [];
     const sum = k => u.reduce((a, [, m]) => a + (m[k] || 0), 0);
     const session = h('div', { class: 'ck-u-col' },
@@ -996,6 +1019,23 @@
     usagePanel.replaceChildren(...[session, context, plan].filter(Boolean));
   }
 
+  function paintCodexUsage() {
+    const t = S.tokens, c = S.ctx;
+    const session = h('div', { class: 'ck-u-col' },
+      h('div', { class: 'ck-u-k', text: 'Session tokens' }),
+      h('div', { class: 'ck-u-big', text: t ? fmtTok(t.totalTokens) : '—' }),
+      h('div', { class: 'ck-u-line', text: t ? `in ${fmtTok(t.inputTokens || 0)} · out ${fmtTok(t.outputTokens || 0)}` : 'No token usage reported yet' }),
+      t ? h('div', { class: 'ck-u-line', text: `cached ${fmtTok(t.cachedInputTokens || 0)} · reasoning ${fmtTok(t.reasoningOutputTokens || 0)}` }) : null);
+    const context = h('div', { class: 'ck-u-col' }, h('div', { class: 'ck-u-k', text: 'Context' }),
+      c && c.maxTokens ? [h('div', { class: 'ck-u-big' }, fmtTok(c.totalTokens), h('span', { class: 'ck-u-of', text: ' / ' + fmtTok(c.maxTokens) })), meter(c.totalTokens / c.maxTokens * 100)] : h('div', { class: 'ck-u-line', text: 'No context usage reported yet' }));
+    const plan = h('div', { class: 'ck-u-col' }, h('div', { class: 'ck-u-k', text: 'Account limits' + (S.plan?.subscription ? ' · ' + S.plan.subscription : '') }),
+      S.plan?.available && S.plan.limits?.length ? S.plan.limits.map(l => h('div', { class: 'ck-u-limit' },
+        h('div', { class: 'ck-u-line' }, h('span', { text: l.label || LIMIT_LABEL[l.kind] || l.kind }), h('span', { text: Math.round(l.percent) + '%' })),
+        meter(l.percent), l.resets_at ? h('div', { class: 'ck-u-line', text: resetsIn(l.resets_at) }) : null))
+        : h('div', { class: 'ck-u-line', text: S.usageUnavailable || 'No account limits reported yet' }));
+    usagePanel.replaceChildren(session, context, plan);
+  }
+
   // ── slash commands ─────────────────────────────────────────────────────
 
   /** Commands the page runs itself (they need a menu, or leave the page). */
@@ -1004,11 +1044,22 @@
     { name: 'resume', aliases: ['continue'], description: 'Resume a conversation from this folder', argumentHint: '[search]', local: true },
     { name: 'exit', aliases: ['quit'], description: 'Close this tab (in a side chat: close the side chat)', argumentHint: '', local: true }
   ];
+  const CODEX_CMDS = [
+    { name: 'model', description: 'Choose the Codex model', argumentHint: '[model]' },
+    { name: 'effort', description: 'Choose reasoning effort', argumentHint: '[level]' },
+    { name: 'usage', description: 'Session tokens, context and account limits' },
+    { name: 'status', description: 'Session, model, workspace and usage' },
+    { name: 'permissions', description: 'Choose workspace-write or read-only sandboxing' },
+    { name: 'new', aliases: ['clear'], description: 'Start a new conversation' },
+    { name: 'compact', description: 'Compact this conversation' },
+    { name: 'fork', description: 'Open a side chat from this conversation' },
+    { name: 'help', description: 'Show the available commands' }
+  ].map(c => ({ ...c, local: true }));
   const HIDDEN_CMD = c => c.name.startsWith('__') || /^\((removed)\)|^Renamed to /.test(c.description || '') || S.terminalCmds.has(c.name);
 
   const commandList = () => {
     const seen = new Set(), out = [];
-    for (const c of [...LOCAL_CMDS, ...S.commands]) {
+    for (const c of [...LOCAL_CMDS.map(c => agent === 'codex' && c.name === 'tui' ? { ...c, description: 'Open this session in the Codex TUI' } : c), ...(agent === 'codex' ? CODEX_CMDS : []), ...S.commands]) {
       if (seen.has(c.name) || HIDDEN_CMD(c)) continue;
       seen.add(c.name); out.push(c);
     }
@@ -1078,6 +1129,7 @@
   }
 
   function updateSlash() {
+    if (!supports('slashCommands')) { if (P.kind === 'slash') closePop(); return; }
     const st = slashState();
     if (!st) { if (P.kind === 'slash') closePop(); return; }
     if (P.kind !== 'slash') openPop('slash', composer, buildSlash);
@@ -1137,11 +1189,24 @@
 
   /** Slash commands the page handles itself; true when `text` was one of them. */
   function runLocal(text) {
+    if (!supports('slashCommands')) return false;
     const m = text.match(/^\/(\S+)(?:\s+(.*))?$/);
     if (!m) return false;
     const cmd = findCmd(m[1]);
     const name = cmd ? cmd.name : m[1].toLowerCase();
     const arg = (m[2] || '').trim();
+    if (agent === 'codex') {
+      if (name === 'help') { localOutput(commandList().map(c => `- **/${c.name}** — ${c.description}`).join('\n')); return true; }
+      if (name === 'status') { toggleUsage(true); openMoreMenu(); return true; }
+      if (name === 'permissions') { openModeMenu(); return true; }
+      if (name === 'fork') { newSide(); return true; }
+      if (name === 'new' || name === 'compact') {
+        if (S.busy || S.cards.size) notice('info', 'Stop the current turn or answer its approval before changing the conversation.');
+        else post({ type: name === 'new' ? 'newConversation' : 'compact' });
+        return true;
+      }
+      if (!cmd) { notice('info', `Unknown command /${name}. Type /help to see available commands.`); return true; }
+    }
     if (name === 'tui') { post({ type: 'openTUI', busy: S.busy }); return true; }
     if (name === 'resume') {
       const list = SHARED.sessions ? SHARED.sessions.list : [];
@@ -1153,10 +1218,14 @@
     }
     if (name === 'exit') { if (active !== main) closeSide(active); else post({ type: 'close' }); return true; }
     if (name === 'model' && !arg) { openModelMenu(); return true; }
-    if (name === 'model') { setModel(arg); notice('info', `Model set to ${arg}.`); return true; }
+    if (name === 'model') {
+      if (agent === 'codex' && !S.models.some(m => m.value === arg)) { notice('info', `Unknown model: ${arg}. Choose one from /model.`); return true; }
+      setModel(arg); notice('info', `Model set to ${arg}.`); return true;
+    }
     if (name === 'effort' && !arg) { openModelMenu(); return true; }
-    if (name === 'effort' && [...EFFORT_ORDER, 'auto'].includes(arg)) { setEffort(arg === 'auto' ? null : arg); notice('info', `Effort set to ${arg === 'auto' ? 'the model default' : arg}.`); return true; }
+    if (name === 'effort' && [...(currentModelRow()?.supportedEffortLevels || EFFORT_ORDER), 'auto'].includes(arg)) { setEffort(arg === 'auto' ? null : arg); notice('info', `Effort set to ${arg === 'auto' ? 'the model default' : arg}.`); return true; }
     if (name === 'usage' && !arg) { toggleUsage(true); return true; }
+    if (agent === 'codex') { notice('info', `Invalid arguments for /${name}.`); return true; }
     return false;
   }
 
@@ -1230,7 +1299,7 @@
     if (!inView()) return;
     refsEl.replaceChildren(...S.refs.map((r, i) => refChip(r, () => { S.refs.splice(i, 1); paintRefs(); updateStatus(); input.focus(); })));
     refsEl.hidden = !S.refs.length;
-    input.placeholder = S.refs.length ? 'Say what to do with it…  (⌫ removes the last one)' : 'Message Claude…  / for commands · ⇧↩ new line';
+    input.placeholder = S.refs.length ? 'Say what to do with it…  (⌫ removes the last one)' : `Message ${agent === 'codex' ? 'Codex' : 'Claude'}…${supports('slashCommands') ? '  / for commands' : ''} · ⇧↩ new line`;
     if (P.kind) placePop();
   }
 
@@ -1244,7 +1313,7 @@
   const shortPath = p => { const t = tilde(p), parts = t.split('/'); return t.length <= 30 || parts.length < 4 ? t : parts[0] + '/…/' + parts.slice(-2).join('/'); };
   const plural = (n, one, many) => n + ' ' + (n === 1 ? one : (many || one + 's'));
 
-  const requestGit = () => post({ type: 'git' });
+  const requestGit = () => { if (supports('git')) post({ type: 'git' }); };
 
   function paintContext() {
     const g = S.git;
@@ -1277,9 +1346,12 @@
       infoRow('Branch', branch),
       infoRow('Changes', changes),
       infoRow('Commit', commit),
+      agent === 'codex' ? infoRow('Model', S.model || 'Connecting…') : null,
+      agent === 'codex' ? infoRow('Effort', S.effort || 'Model default') : null,
+      agent === 'codex' ? infoRow('Sandbox', CODEX_MODES.find(m => m.mode === S.mode)?.label || S.mode) : null,
       infoRow('MCP', mcpText ? h('span', { title: mcp.map(m => `${m.name}: ${m.status}`).join('\n'), text: mcpText }) : null),
       infoRow('Session', S.sessionId || i.version ? [S.sessionId ? h('code', { text: S.sessionId.slice(0, 8) }) : null,
-        i.version ? h('span', { class: 'ck-info-dim', text: (S.sessionId ? ' · ' : '') + 'Claude Code ' + i.version + (i.outputStyle && i.outputStyle !== 'default' ? ' · ' + i.outputStyle : '') }) : null] : null));
+        i.version ? h('span', { class: 'ck-info-dim', text: (S.sessionId ? ' · ' : '') + (agent === 'codex' ? 'Codex ' : 'Claude Code ') + i.version + (i.outputStyle && i.outputStyle !== 'default' ? ' · ' + i.outputStyle : '') }) : null] : null));
   }
 
   const THINK_SOURCE = { settings: 'From your settings (/config)', default: 'Claude Code default', user: 'Set in this tab' };
@@ -1308,19 +1380,22 @@
     openPop('more', moreBtn, () => ({
       head: moreInfo(),
       items: [
-        thinkingItem(),
+        supports('usage') ? act('Usage', 'Tokens, context and account limits', () => toggleUsage(true)) : null,
+        supports('models') ? act('Model and effort', null, openModelMenu) : null,
+        supports('permissionMode') ? act('Permissions', null, openModeMenu) : null,
+        supports('thinking') ? thinkingItem() : null,
         act('Copy path', null, () => post({ type: 'copy', text: S.cwd })),
         act('Reveal in Finder', null, () => post({ type: 'reveal', path: S.cwd })),
         S.sessionId ? act('Copy session ID', null, () => post({ type: 'copy', text: S.sessionId })) : null,
-        act('Resume a conversation…', null, () => {
+        supports('history') ? act('Resume a conversation…', null, () => {
           if (active !== main) showConv(main);
           input.value = '/resume '; input.setSelectionRange(8, 8); input.focus(); grow(); updateSlash();
-        }),
-        act('Open in TUI', null, () => post({ type: 'openTUI', busy: S.busy })),
-        act('New side chat', null, () => newSide()),
+        }) : null,
+        supports('tui') ? act('Open in TUI', null, () => post({ type: 'openTUI', busy: S.busy })) : null,
+        supports('fork') ? act('New side chat', null, () => newSide()) : null,
         active !== main ? act('Close this side chat', null, () => closeSide(active)) : null,
-        act('Compact conversation', null, () => sendUser('/compact')),
-        act('New conversation', null, () => sendUser('/clear'))
+        supports('slashCommands') ? act('Compact conversation', null, () => sendUser('/compact')) : null,
+        supports('slashCommands') ? act('New conversation', null, () => sendUser('/clear')) : null
       ].filter(Boolean)
     }));
   }
@@ -1336,6 +1411,7 @@
 
   /** Opens a side chat: a fork of main as it is now, with main's model and effort (so it reads main's prompt cache) and manual approvals. */
   function newSide() {
+    if (!supports('fork')) return;
     if (!main.sessionId) {
       const prev = S;
       S = main;
@@ -1389,6 +1465,7 @@
 
   /** The strip's switch: main ⇄ the last side chat (a new one when there is none). */
   function toggleView() {
+    if (!supports('fork')) return;
     if (active !== main) showConv(main);
     else if (lastSide && convs.has(lastSide.id)) showConv(lastSide);
     else newSide();
@@ -1406,6 +1483,8 @@
 
   function paintView() {
     if (!viewBtn) return;
+    viewBtn.hidden = !supports('fork');
+    if (!supports('fork')) { viewMenuBtn.hidden = true; return; }
     const inSide = active !== main;
     const others = [...convs.values()].filter(c => c !== active);
     // The loudest state among the conversations out of view.
@@ -1420,6 +1499,7 @@
   }
 
   function openViewMenu() {
+    if (!supports('fork')) return;
     if (P.kind === 'view') { closePop(); return; }
     viewMenuBtn.classList.add('is-open');
     openPop('view', viewMenuBtn, () => ({
@@ -1517,7 +1597,7 @@
     input.value = ''; grow();
     if (active !== main) showConv(main);
     if (id === main.sessionId) { notice('info', 'That is the conversation in this tab.'); return; }
-    if (main.busy || main.cards.size) { notice('info', 'Claude is still working. Stop it (Esc) or answer it first, then resume.'); return; }
+    if (main.busy || main.cards.size) { notice('info', 'The agent is still working. Stop it (Esc) or answer it first, then resume.'); return; }
     resetConv(main);
     main.sessionId = id;
     main.resumeTitle = title || null;
@@ -1571,8 +1651,10 @@
     for (const m of e.messages) {
       evT = Date.parse(m.timestamp) || 0;
       const c = m.message && m.message.content;
-      if (m.type === 'assistant') { onAssistant({ message: m.message, parent_tool_use_id: m.parent_tool_use_id }); continue; }
-      if (Array.isArray(c) && c.some(x => x.type === 'tool_result')) { onUser({ message: m.message }); continue; }
+      if (m.type === 'assistant' || (Array.isArray(c) && c.some(x => x.type === 'tool_result'))) {
+        for (const normalized of S.normalizer.normalize({ type: 'sdk', msg: m, t: evT })) receiveOne(normalized);
+        continue;
+      }
       if (m.parent_tool_use_id) continue;   // a subagent's prompt
       const text = typeof c === 'string' ? c : Array.isArray(c) ? c.filter(x => x.type === 'text').map(x => x.text).join('\n') : '';
       const v = userView(text);
@@ -1609,7 +1691,7 @@
     statusText.textContent = text;
     statusDot.dataset.state = state;
     dock.dataset.state = state;
-    sendBtn.dataset.mode = S.busy && !input.value.trim() && !S.refs.length ? 'stop' : 'send';
+    sendBtn.dataset.mode = S.busy && (!supports('midTurnInput') || !input.value.trim() && !S.refs.length) ? 'stop' : 'send';
     sendBtn.title = sendBtn.dataset.mode === 'stop' ? 'Stop (Esc)' : 'Send (Return)';
     paintView();
   }
@@ -1629,6 +1711,7 @@
     refs = refs || [];
     if (!text && !refs.length) return;
     if (text.startsWith('/') && runLocal(text)) return;
+    if (S.busy && !supports('midTurnInput')) { notice('info', `${agent === 'codex' ? 'Codex' : 'Agent'} is still working. Stop it before sending another message.`); return; }
     // A slash command must start the message, so references wait for the next one.
     if (text.startsWith('/')) refs = [];
     else if (refs.length) { S.refs = []; paintRefs(); }
@@ -1646,6 +1729,10 @@
     input.style.height = Math.min(input.scrollHeight, 160) + 'px';
   };
   function submit() {
+    if (agent === 'codex' && input.value.trim().startsWith('/')) {
+      const command = input.value.trim(); input.value = ''; grow(); closePop();
+      runLocal(command); updateStatus(); return;
+    }
     if (sendBtn.dataset.mode === 'stop') { post({ type: 'interrupt' }); return; }
     const text = input.value;
     if (!text.trim() && !S.refs.length) return;
@@ -1758,162 +1845,171 @@
 
   // ── event intake ───────────────────────────────────────────────────────
 
-  function onStream(ev, msg) {
-    if (msg.parent_tool_use_id) return;   // subagent streams: shown as rows only
-    switch (ev.type) {
-      case 'message_start': S.currentMsg = ev.message.id; break;
-      case 'content_block_start': {
-        const key = S.currentMsg + ':' + ev.index, b = ev.content_block;
-        S.blockKind.set(key, b.type);
-        if (b.type === 'text') newText(key, S.currentMsg);
-        else if (b.type === 'tool_use') addRow(b.id, b.name, null);
-        else if (b.type === 'thinking' || b.type === 'redacted_thinking') { S.thinking = true; newThink(key, S.currentMsg, b.type === 'redacted_thinking'); updateStatus(); }
-        break;
-      }
-      case 'content_block_delta': {
-        const key = S.currentMsg + ':' + ev.index;
-        if (ev.delta.type === 'text_delta') { const it = S.texts.get(key); if (it) { it.text += ev.delta.text; schedulePaint(it); } }
-        else if (ev.delta.type === 'thinking_delta' && ev.delta.thinking) {
-          const th = S.thinks.get(key);
-          if (th) {
-            th.text += ev.delta.thinking;
-            paintThink(th);
-            if (th.open && !th.raf) th.raf = requestAnimationFrame(() => paintThinkBody(th));
-          }
-        }
-        break;
-      }
-      case 'content_block_stop': {
-        const key = S.currentMsg + ':' + ev.index;
-        const it = S.texts.get(key);
-        if (it) { it.final = true; paintText(it, false); }
-        if (S.blockKind.get(key) === 'thinking' || S.blockKind.get(key) === 'redacted_thinking') { endThink(S.thinks.get(key)); S.thinking = false; updateStatus(); }
-        break;
-      }
-    }
-  }
-
-  function onAssistant(msg) {
-    const m = msg.message, sub = msg.parent_tool_use_id;
-    for (const c of m.content || []) {
-      if (c.type === 'text' && !sub) {
-        // The full block is authoritative; match it to the streamed item.
-        const items = S.msgTexts.get(m.id) || [];
-        let it = items.find(x => !x.confirmed);
-        if (!it) it = newText(m.id + ':full' + items.length, m.id);
-        it.confirmed = true;
-        if (it.text !== c.text || !it.final) { it.text = c.text; it.final = true; paintText(it, false); }
-      } else if ((c.type === 'thinking' || c.type === 'redacted_thinking') && !sub) {
-        // The full block is authoritative too (and the only copy when nothing streamed).
-        const items = S.msgThinks.get(m.id) || [];
-        let th = items.find(x => !x.confirmed);
-        if (!th) { th = newThink(m.id + ':fullthink' + items.length, m.id, c.type === 'redacted_thinking'); endThink(th); }
-        th.confirmed = true;
-        if (c.type === 'thinking' && c.thinking && c.thinking !== th.text) { th.text = c.thinking; paintThink(th); if (th.open) paintThinkBody(th); }
-      } else if (c.type === 'tool_use') {
-        const row = addRow(c.id, c.name, sub);
-        setRowInput(row, c.input);
-      }
-    }
-    if (m.model && !sub && !S.model) { S.model = m.model; paintMeta(); }   // init's id (with [1m]) wins
-  }
-
-  function onUser(msg) {
-    const content = msg.message && msg.message.content;
-    if (!Array.isArray(content)) return;
-    for (const c of content) {
-      if (c.type !== 'tool_result') continue;
-      const row = S.rows.get(c.tool_use_id);
-      if (!row) continue;
-      const text = resultText(c);
-      row.t1 = clock();
-      // A card still open for this call was answered some other way: settle it from the result.
-      for (const [cardId, card] of S.cards) {
-        if (card.req.toolUseID === row.id) resolveCard(cardId, c.is_error ? 'denied' : 'allowed');
-      }
-      if (row.waitStart) { row.waitMs += row.t1 - row.waitStart; row.waitStart = 0; }
-      row.metaEl.textContent = metaOf(row, text, c.is_error);
-      const out = h('pre', { class: 'ck-out', text: text.length > 4000 ? text.slice(0, 4000) + '\n…' : text });
-      // A change keeps its view; only a failure adds the tool's message above it.
-      if (!row.change) row.detail.replaceChildren(out);
-      else if (c.is_error) row.detail.replaceChildren(out, row.change);
-      setRowState(row, c.is_error ? 'error' : 'done');
-      if (row.run) paintRun(row.run);
-    }
-  }
-
-  function onResult(msg) {
-    // A turn that ended mid-thought (interrupted) leaves no block open.
+  function settleLive(status) {
+    for (const item of S.texts.values()) if (!item.final) { item.final = true; paintText(item, false); }
     for (const th of S.thinks.values()) endThink(th);
+    for (const row of S.rows.values()) {
+      if (row.state === 'running' || row.state === 'preparing' || row.state === 'waiting') {
+        row.t1 = clock();
+        if (row.waitStart) { row.waitMs += row.t1 - row.waitStart; row.waitStart = 0; }
+        row.metaEl.textContent = status === 'success' ? 'interrupted' : status;
+        setRowState(row, 'interrupted');
+      }
+    }
+    for (const id of [...S.cards.keys()]) resolveCard(id, 'cancelled');
     closeRun();
+    S.busy = false; S.thinking = false;
+    updateStatus();
+  }
+
+  function paintContent(e) {
+    const key = e.id;
+    if (!key) return;
+    if (e.kind === 'thinking') {
+      let th = S.thinks.get(key);
+      if (!th) th = newThink(key, e.messageId || key, e.redacted);
+      const block = S.eventState.blocks.get(key);
+      if (block) th.text = block.text;
+      if (e.type === 'content.end' || e.final) endThink(th);
+      paintThink(th);
+      if (th.open) {
+        if (th.t1) paintThinkBody(th);
+        else if (!th.raf) th.raf = requestAnimationFrame(() => paintThinkBody(th));
+      }
+      S.thinking = [...S.thinks.values()].some(item => !item.t1);
+      updateStatus();
+      return;
+    }
+    let it = S.texts.get(key);
+    if (!it) it = newText(key, e.messageId || key);
+    const block = S.eventState.blocks.get(key);
+    if (block) it.text = block.text;
+    if (e.type === 'content.end' || e.final) { it.final = true; paintText(it, false); }
+    else schedulePaint(it);
+  }
+
+  function paintTool(e) {
+    if (!e.id) return;
+    const row = addRow(e.id, e.name || 'Tool', e.parentId);
+    if (e.type === 'tool.input') { setRowInput(row, e.input); return; }
+    if (e.type === 'tool.start') { if (e.input !== undefined) setRowInput(row, e.input); else setRowState(row, 'running'); return; }
+    const output = String(e.output == null ? '' : e.output);
+    row.t1 = clock();
+    for (const [cardId, card] of S.cards) if (card.req.toolUseID === row.id) resolveCard(cardId, e.isError ? 'denied' : 'allowed');
+    if (row.waitStart) { row.waitMs += row.t1 - row.waitStart; row.waitStart = 0; }
+    row.metaEl.textContent = metaOf(row, output, e.isError);
+    const out = h('pre', { class: 'ck-out', text: output.length > 4000 ? output.slice(0, 4000) + '\n…' : output });
+    if (!row.change) row.detail.replaceChildren(out);
+    else if (e.isError) row.detail.replaceChildren(out, row.change);
+    setRowState(row, e.isError ? 'error' : 'done');
+    if (row.run) paintRun(row.run);
+  }
+
+  function onTurnEnd(e) {
+    settleLive(e.status);
     if (S.turn && !S.turn.footer) {
       const bits = [];
-      if (msg.duration_ms) bits.push((msg.duration_ms / 1000).toFixed(1) + 's');
-      if (msg.num_turns > 1) bits.push(msg.num_turns + ' steps');
-      if (msg.total_cost_usd) S.cost = msg.total_cost_usd;
-      if (msg.modelUsage) S.modelUsage = msg.modelUsage;
-      S.turns_n++; S.apiMs += msg.duration_api_ms || 0;
-      if (msg.subtype !== 'success') bits.push(msg.subtype.replace(/_/g, ' '));
+      if (e.durationMs) bits.push((e.durationMs / 1000).toFixed(1) + 's');
+      if (e.steps > 1) bits.push(e.steps + ' steps');
+      if (e.cost != null) S.cost = e.cost;
+      if (e.modelUsage) S.modelUsage = e.modelUsage;
+      S.turns_n++; S.apiMs += e.apiMs || 0;
+      if (e.status !== 'success') bits.push(String(e.label || e.status).replace(/_/g, ' '));
       S.turn.footer = h('div', { class: 'ck-foot', text: bits.join(' · ') });
       S.turn.body.append(S.turn.footer);
     }
-    if (msg.is_error && msg.result) notice('error', msg.result);
-    S.busy = false; S.thinking = false;
-    paintMeta(); updateStatus(); stick();
-    requestUsage(!usagePanel.hidden);   // context use after this turn (and plan limits, when the panel is open)
-    requestGit();                       // the turn may have changed files or the branch
+    if (e.status === 'error' && e.message) notice('error', e.message);
+    paintMeta(); stick();
+    if (!S.replaying) { requestUsage(!usagePanel.hidden); requestGit(); }
+  }
+
+  function showUnknown(e) {
+    const detail = h('details', { class: 'ck-unknown' },
+      h('summary', { text: 'Unrecognized event: ' + String(e.name || e.raw?.type || e.type).slice(0, 100) }),
+      h('pre', { text: (() => { try { return JSON.stringify(e.raw ?? e, null, 2).slice(0, 8000); } catch (_) { return '[unserializable event]'; } })() }));
+    (S.turn ? S.turn.body : S.log).append(detail);
+    S.unknownDetails.push(detail);
+    if (S.unknownDetails.length > 100) S.unknownDetails.shift().remove();
+    stick();
   }
 
   function receiveOne(e) {
+    root.AgentEvents.reduce(S.eventState, e);
     switch (e.type) {
-      case 'sdk': {
-        const m = e.msg;
-        if (m.type === 'stream_event') onStream(m.event, m);
-        else if (m.type === 'assistant') { S.busy = true; onAssistant(m); }
-        else if (m.type === 'user') onUser(m);
-        else if (m.type === 'result') onResult(m);
-        else if (m.type === 'system' && m.subtype === 'init') {
-          // Sent at the start of every turn; a new session ID means /clear started a new conversation.
-          if (S.sessionId && m.session_id && m.session_id !== S.sessionId) { notice('info', 'New conversation'); S.cost = 0; S.modelUsage = null; S.turns_n = 0; S.apiMs = 0; }
-          S.model = m.model || S.model; S.mode = m.permissionMode || S.mode; S.sessionId = m.session_id; SHARED.cwd = m.cwd || SHARED.cwd;
-          SHARED.terminalCmds = new Set(m.terminal_slash_commands || []);
-          SHARED.info = { version: m.claude_code_version, mcp: (m.mcp_servers || []).map(x => ({ name: x.name, status: x.status })), outputStyle: m.output_style };
-          paintMeta(); paintContext();
-        } else if (m.type === 'system' && m.subtype === 'status' && m.permissionMode) { S.mode = m.permissionMode; paintMeta(); }
-        else if (m.type === 'system' && m.subtype === 'commands_changed') { SHARED.commands = m.commands || []; if (P.kind === 'slash') refreshPop(); }
-        else if (m.type === 'system' && m.subtype === 'local_command_output') localOutput(m.content);
-        else if (m.type === 'system' && m.subtype === 'compact_boundary') notice('info', 'Conversation compacted');
-        break;
+      case 'session': {
+        if (agent === 'codex' && S.sessionId && e.sessionId && S.sessionId !== e.sessionId) resetConv(S);
+        if (S.sessionId && e.sessionId && e.sessionId !== S.sessionId) { notice('info', 'New conversation'); S.cost = 0; S.modelUsage = null; S.turns_n = 0; S.apiMs = 0; }
+        S.sessionId = e.sessionId || S.sessionId;
+        S.model = e.model || S.model; S.mode = e.mode || S.mode;
+        SHARED.cwd = e.cwd || SHARED.cwd;
+        if (e.info) SHARED.info = e.info;
+        if (e.terminalCommands) SHARED.terminalCmds = new Set(e.terminalCommands);
+        paintMeta(); paintContext(); break;
       }
+      case 'turn.start': S.busy = true; updateStatus(); break;
+      case 'turn.end':
+        if (e.local) { settleLive(e.status); paintMeta(); }
+        else onTurnEnd(e);
+        break;
+      case 'content.start': case 'content.delta': case 'content.snapshot': case 'content.end':
+        S.busy = true; paintContent(e); updateStatus(); break;
+      case 'tool.start': case 'tool.input': case 'tool.result':
+        S.busy = e.type === 'tool.result' ? S.busy : true; paintTool(e); updateStatus(); break;
+      case 'commands': SHARED.commands = e.commands || []; if (P.kind === 'slash') refreshPop(); break;
+      case 'approval.request': if (supports('approvals')) addCard(e.request); else showUnknown(e); break;
+      case 'approval.cancel': resolveCard(e.id, 'cancelled'); break;
+      case 'notice':
+        notice(e.kind || 'info', e.message || 'Session ended');
+        if (e.terminal) settleLive(e.kind === 'error' ? 'error' : 'cancelled');
+        break;
+      case 'unknown': showUnknown(e); break;
+      case 'local.output': localOutput(e.content ?? e.text); break;
       case 'capabilities':
         SHARED.commands = e.commands || []; SHARED.models = e.models || []; SHARED.outputStyles = e.outputStyles || [];
+        if (e.features) features = { ...features, ...e.features };
         if (e.mode) S.mode = e.mode;
-        paintMeta(); if (P.kind) refreshPop();
-        requestUsage(false); requestGit();
-        break;
+        if (!supports('slashCommands') && P.kind === 'slash') closePop();
+        paintMeta(); paintView(); paintRefs(); if (P.kind) refreshPop();
+        requestUsage(false); requestGit(); break;
       case 'model': if (e.model) { const r = S.models.find(x => x.value === e.model); S.modelChoice = e.model; S.model = r ? (r.resolvedModel || r.value) : e.model; paintMeta(); } break;
       case 'mode': S.mode = e.mode || S.mode; paintMeta(); break;
       case 'effort': S.effort = e.effort || null; paintMeta(); break;
       case 'git': SHARED.git = e; paintContext(); break;
       case 'sessions': SHARED.sessions = { at: Date.now(), list: e.list || [] }; if (P.kind === 'slash') refreshPop(); break;
       case 'history': loadHistory(e); break;
-      case 'thinking': S.thinkingOn = !!e.on; S.thinkingSource = e.source || null; if (inView() && P.kind === 'more') refreshPop(); break;
-      case 'usage': if (e.context) S.ctx = e.context; if (e.plan) SHARED.plan = e.plan; paintMeta(); break;
-      case 'permission_request': addCard(e); break;
-      case 'permission_cancelled': resolveCard(e.id, 'cancelled'); break;
-      case 'error': notice('error', e.message); S.busy = false; updateStatus(); break;
-      case 'end': notice('info', 'Session ended'); S.busy = false; updateStatus(); break;
-      case 'host': // messages from FloatyTerm itself (e.g. the sidecar could not start)
-        notice(e.kind || 'info', e.message); if (e.kind === 'error') { S.busy = false; updateStatus(); }
+      case 'history.replay':
+        if (e.sessionId !== S.sessionId) break;
+        S.replaying = true;
+        try {
+          for (const recorded of e.turns || []) {
+            newTurn(recorded.userText ?? null);
+            for (const event of recorded.events || []) { evT = event.t || 0; receiveOne(event); }
+          }
+        } finally { S.replaying = false; }
+        evT = 0; settleLive('success'); S.turn = null;
+        S.log.append(h('div', { class: 'ck-resumed', text: 'Resumed · you can continue below' }));
         break;
+      case 'thinking': S.thinkingOn = !!e.on; S.thinkingSource = e.source || null; if (inView() && P.kind === 'more') refreshPop(); break;
+      case 'usage':
+        if (e.context !== undefined) S.ctx = e.context;
+        if (e.tokens !== undefined) S.tokens = e.tokens;
+        if (e.plan) SHARED.plan = e.plan;
+        if (e.unavailable !== undefined) S.usageUnavailable = e.unavailable;
+        paintMeta(); break;
+      default: showUnknown(e);
     }
   }
 
-  const ClaudeChat = {
+  const AgentChat = {
     boot(cfg) {
+      agent = cfg.agent || 'claude';
+      features = { ...(agent === 'claude' ? CLAUDE_FEATURES : CODEX_FEATURES) };
+      main.normalizer = root.AgentEvents.createNormalizer(agent);
+      main.eventState = root.AgentEvents.createState();
       SHARED.cwd = cfg.cwd || ''; SHARED.home = cfg.home || '';
       if (cfg.model) S.model = cfg.model;
       buildShell();
+      paintMeta(); paintView(); paintRefs();
       statusText.textContent = 'Ready';
       if (cfg.intro) notice('info', cfg.intro);
     },
@@ -1924,12 +2020,14 @@
       const prev = S;
       S = conv;
       try {
-        for (const e of batch) {
-          evT = e.t || 0;
-          try { receiveOne(e); } catch (err) { console.error('ClaudeChat', e.type, err); }
+        for (const raw of batch) {
+          evT = raw.t || 0;
+          try {
+            for (const e of conv.normalizer.normalize(raw)) { evT = e.t || 0; receiveOne(e); }
+          } catch (err) { console.error('AgentChat', raw.type, err); }
         }
       } finally { evT = 0; S = prev; }
-      if (!batch.some(e => e.type === 'sdk' || e.type === 'permission_request' || e.type === 'host')) return;
+      if (!batch.some(e => e.type === 'sdk' || e.type === 'native' || e.type === 'permission_request' || e.type === 'host' || e.v === 1)) return;
       if (conv !== active) { conv.unseen = true; paintView(); }
       // Output arrived while you read higher up: the down button says so.
       else if (!follow && downBtn) { downBtn.dataset.fresh = '1'; paintDown(); }
@@ -1938,5 +2036,6 @@
     showUser(text) { newTurn(text); S.busy = true; updateStatus(); },
     focus() { input && input.focus(); }
   };
-  root.ClaudeChat = ClaudeChat;
+  root.AgentChat = AgentChat;
+  root.ClaudeChat = AgentChat;
 })(typeof self !== 'undefined' ? self : this);

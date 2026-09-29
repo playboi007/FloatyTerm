@@ -1,15 +1,13 @@
 import AppKit
 import WebKit
 
-/// A tab that runs Claude Code without its TUI: replies render as skimmable
+/// A tab that runs an agent without its TUI: replies render as skimmable
 /// Markdown, tool calls as a live timeline, and approvals as cards (the
 /// "Markdown, made skimmable" design, `Resources/SkimRender/chat.js`).
 ///
-/// The session runs in a `ClaudeSidecar` (Node + the Claude Agent SDK) that
-/// drives the user's own `claude`, so it has the TUI's login, settings, CLAUDE.md
-/// files, skills and hooks. The page and the sidecar never talk directly:
-/// sidecar lines go to `ClaudeChat.receive`, page actions come back over the
-/// `skim` bridge.
+/// `ChatAgent` selects the existing Claude SDK driver or the Codex exec driver.
+/// Both use the user's installed CLI. Native events are normalized before the
+/// shared page renders them; page actions return over the `skim` bridge.
 ///
 /// "Open in TUI" hands the session to a terminal tab running `claude --resume`,
 /// and this tab stops its sidecar — two processes must not append to one
@@ -20,6 +18,7 @@ import WebKit
 final class ClaudeChatController: NSObject, TabContent, WKNavigationDelegate {
 
     let cwd: String
+    let agent: ChatAgent
     private let container = NSView()
     private let webView: WKWebView
 
@@ -27,7 +26,7 @@ final class ClaudeChatController: NSObject, TabContent, WKNavigationDelegate {
     /// forked from main. Each has its own session file, so they can run at once.
     private final class Channel {
         let id: String
-        var sidecar = ClaudeSidecar()
+        var sidecar: any AgentSidecar
         var sessionID: String?
         /// A side chat's source: the main session it forks on its first start.
         var forkOf: String?
@@ -38,10 +37,10 @@ final class ClaudeChatController: NSObject, TabContent, WKNavigationDelegate {
         /// Thinking summaries on/off, once the user has chosen here; nil follows the settings.
         var thinking: Bool?
         var handedOff = false
-        init(id: String) { self.id = id }
+        init(id: String, agent: ChatAgent) { self.id = id; sidecar = agent.runner() }
     }
     private var channels: [String: Channel] = [:]
-    private let main = Channel(id: "main")
+    private let main: Channel
 
     private var pageReady = false
     private var queued: [(channel: String, line: String)] = []
@@ -53,8 +52,10 @@ final class ClaudeChatController: NSObject, TabContent, WKNavigationDelegate {
     /// Opens `claude --resume <sessionID>` in a terminal tab in `cwd`.
     var onOpenTUI: ((_ cwd: String, _ sessionID: String) -> Void)?
 
-    init(cwd: String) {
+    init(cwd: String, agent: ChatAgent = .claude) {
         self.cwd = cwd
+        self.agent = agent
+        main = Channel(id: "main", agent: agent)
         let config = WKWebViewConfiguration()
         webView = WKWebView(frame: .zero, configuration: config)
         super.init()
@@ -70,25 +71,25 @@ final class ClaudeChatController: NSObject, TabContent, WKNavigationDelegate {
             webView.leadingAnchor.constraint(equalTo: container.leadingAnchor),
             webView.trailingAnchor.constraint(equalTo: container.trailingAnchor)
         ])
-        webView.loadHTMLString(SkimAssets.chatDocument(cwd: cwd), baseURL: URL(fileURLWithPath: cwd, isDirectory: true))
+        webView.loadHTMLString(SkimAssets.chatDocument(cwd: cwd, agent: agent.rawValue), baseURL: URL(fileURLWithPath: cwd, isDirectory: true))
         start(main, resume: nil)
     }
 
-    static var isAvailable: Bool { SkimAssets.isAvailable }
+    static var isAvailable: Bool { SkimAssets.isChatAvailable }
 
     // MARK: - Sidecars
 
     private func start(_ ch: Channel, resume: String?, fork: Bool = false) {
-        let s = ClaudeSidecar()
-        s.onLines = { [weak self, weak ch] lines in
-            guard let self, let ch else { return }
+        let s = agent.runner()
+        s.onLines = { [weak self, weak s, weak ch] lines in
+            guard let self, let s, let ch, s === ch.sidecar else { return }
             self.receive(lines, on: ch)
         }
         s.onExit = { [weak self, weak s, weak ch] status, stderr in
             guard let self, let s, let ch, s === ch.sidecar, !ch.handedOff else { return }
             let detail = stderr.split(separator: "\n").suffix(3).joined(separator: " · ")
             self.hostNotice(ch.id, status == 0 ? "info" : "error",
-                            status == 0 ? "Session ended." : "The Claude session stopped (exit \(status)). \(detail)")
+                            status == 0 ? "Session ended." : "The \(self.agent.rawValue.capitalized) session stopped (exit \(status)). \(detail)")
         }
         ch.sidecar = s
         do {
@@ -99,14 +100,19 @@ final class ClaudeChatController: NSObject, TabContent, WKNavigationDelegate {
     private func receive(_ lines: [String], on ch: Channel) {
         // Every turn starts with an init; /clear changes its session ID, and a
         // fork's first init carries the new session's ID.
-        for line in lines where line.contains("\"init\"") {
+        for line in lines {
             if let data = line.data(using: .utf8),
-               let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-               let msg = obj["msg"] as? [String: Any], msg["subtype"] as? String == "init" {
-                ch.sessionID = msg["session_id"] as? String
+               let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+                if obj["type"] as? String == "session", let sessionID = obj["sessionId"] as? String {
+                    ch.sessionID = sessionID
+                } else if let msg = obj["msg"] as? [String: Any], msg["subtype"] as? String == "init" {
+                    ch.sessionID = msg["session_id"] as? String
+                } else if let event = obj["event"] as? [String: Any], event["type"] as? String == "thread.started" {
+                    ch.sessionID = event["thread_id"] as? String
+                }
             }
         }
-        if !isCurrentlyViewed, lines.contains(where: { $0.contains("\"type\":\"result\"") }) {
+        if !isCurrentlyViewed, lines.contains(where: { $0.contains("\"type\":\"result\"") || $0.contains("turn.completed") || $0.contains("turn.end") }) {
             hasUnseenOutput = true
             onTitleChanged?()
         }
@@ -117,7 +123,7 @@ final class ClaudeChatController: NSObject, TabContent, WKNavigationDelegate {
     private func deliver(_ lines: [String], to channel: String) {
         guard pageReady else { queued.append(contentsOf: lines.map { (channel, $0) }); return }
         // Each line is one JSON object, so the joined list is a JS array literal.
-        webView.evaluateJavaScript("ClaudeChat.receive([\(lines.joined(separator: ","))], \"\(channel)\")", completionHandler: nil)
+        webView.evaluateJavaScript("AgentChat.receive([\(lines.joined(separator: ","))], \"\(channel)\")", completionHandler: nil)
     }
 
     private func hostNotice(_ channel: String, _ kind: String, _ message: String) {
@@ -182,6 +188,9 @@ final class ClaudeChatController: NSObject, TabContent, WKNavigationDelegate {
             main.forkOf = nil
             start(main, resume: sid)
             main.sidecar.send(["type": "history", "sessionId": sid])
+        case "newConversation", "compact":
+            guard agent == .codex else { return }
+            ch.sidecar.send(["type": type])
         case "closeSide":
             guard ch !== main else { return }
             ch.sidecar.onExit = nil
@@ -196,7 +205,7 @@ final class ClaudeChatController: NSObject, TabContent, WKNavigationDelegate {
             NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: path)])
         case "openTUI":
             guard let sid = ch.sessionID else { hostNotice(id, "info", "The session has no ID yet. Send a message first."); return }
-            if action["busy"] as? Bool ?? isBusy { hostNotice(id, "info", "Claude is still working. Wait for it to finish, or stop it (Esc), then open the TUI."); return }
+            if action["busy"] as? Bool ?? isBusy { hostNotice(id, "info", "The agent is still working. Wait for it to finish, or stop it (Esc), then open the TUI."); return }
             ch.handedOff = true
             ch.sidecar.stop()
             hostNotice(id, "info", "This session now continues in the TUI tab. Send a message here to take it back.")
@@ -221,7 +230,7 @@ final class ClaudeChatController: NSObject, TabContent, WKNavigationDelegate {
             hostNotice(id, "error", "The main conversation has no session yet. Send it a message first; a side chat forks it.")
             return
         }
-        let ch = Channel(id: id)
+        let ch = Channel(id: id, agent: agent)
         ch.forkOf = source
         ch.model = action["model"] as? String ?? main.model
         ch.effort = action["effort"] as? String ?? main.effort
@@ -257,7 +266,7 @@ final class ClaudeChatController: NSObject, TabContent, WKNavigationDelegate {
     // MARK: - TabContent
 
     var view: NSView { container }
-    var title: String { "Claude · " + (cwd as NSString).lastPathComponent }
+    var title: String { agent.rawValue.capitalized + " · " + (cwd as NSString).lastPathComponent }
     var customName: String?
     var displayName: String { customName ?? title }
 
@@ -273,7 +282,7 @@ final class ClaudeChatController: NSObject, TabContent, WKNavigationDelegate {
 
     func focus(in panel: NSWindow) {
         panel.makeFirstResponder(webView)
-        webView.evaluateJavaScript("window.ClaudeChat && ClaudeChat.focus()", completionHandler: nil)
+        webView.evaluateJavaScript("window.AgentChat && AgentChat.focus()", completionHandler: nil)
     }
 
     func cleanup() {
