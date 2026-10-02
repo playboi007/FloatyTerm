@@ -258,8 +258,17 @@
     check('the status item opens the same menu; Reveal posts', lastPost('reveal') && lastPost('reveal').path === '/tmp/demo');
     $('.ck-more').click(); pick('Open in TUI');
     check('Open in TUI', !!lastPost('openTUI'));
-    $('.ck-more').click(); pick('New conversation');
-    check('New conversation sends /clear', lastPost('send').text === '/clear');
+    const pickNew = () => [...document.querySelectorAll('.ck-pop-item')].find(e => e.textContent.startsWith('New…')).click();
+    $('.ck-more').click();
+    check('the "New…" options are one folded item', items().includes('New…') && !items().includes('New conversation') && !items().includes('New side chat'), items());
+    pickNew();
+    check('…which opens in place, the menu still open', popOpen() && items().includes('New side chat') && items().includes('New conversation')
+      && $('.ck-pop-item.is-group').getAttribute('aria-expanded') === 'true' && document.querySelectorAll('.ck-pop-item.is-child').length === 2, items());
+    pickNew();
+    check('…and folds again', popOpen() && !items().includes('New conversation'));
+    pickNew();
+    pick('New conversation');
+    check('New conversation sends /clear', lastPost('send').text === '/clear' && !popOpen());
     ClaudeChat.receive([{ type: 'git', repo: null }]);
     check('outside a repository: no branch', ctx.textContent === 'demo');
     $('.ck-more').click();
@@ -804,7 +813,7 @@
     ClaudeChat.receive([sdkl({ type: 'assistant', parent_tool_use_id: 'sub-1', message: { id: 'sub-td', content: [{ type: 'tool_use', id: 'tu-sub-td', name: 'TodoWrite', input: { todos: [{ content: 'Sub task', activeForm: 'Sub tasking', status: 'pending' }] } }] } })]);
     check('a subagent\'s todos are ignored', $('.ck-tasks-k').textContent === 'Tasks 2/5');
     // a side chat has its own list: TaskCreate, the id from the result, TaskUpdate
-    $('.ck-more').click(); popPick('New side chat');
+    $('.ck-more').click(); popPick('New…'); popPick('New side chat');
     const sc = lastPost('openSide').channel;
     check('the side chat starts with no panel', tasksEl.hidden);
     const tc = (id, subject, active, result) => ClaudeChat.receive(toolLines(id, 'TaskCreate', { subject, description: subject + '.', ...(active ? { activeForm: active } : {}) }, result), sc);

@@ -61,7 +61,8 @@
     if (pop === 'model') document.querySelector('.ck-model').click();
     if (pop === 'mode') document.querySelector('.ck-mode').click();
     if (pop === 'usage') document.querySelector('.ck-usage').click();
-    if (pop === 'more') { ClaudeChat.receive([{ type: 'title', title: 'Fix the parser crash', custom: true }]); document.querySelector('.ck-more').click(); }
+    if (pop === 'more') { ClaudeChat.receive([{ type: 'title', title: 'Fix the parser crash', custom: true }]); document.querySelector('.ck-more').click();
+      if (q.get('new')) { [...document.querySelectorAll('.ck-pop-item')].find(e => e.textContent.startsWith('New…')).click(); document.querySelector('.ck-pop-list').scrollTop = 1e4; } }
     if (q.get('subagent')) {
       const sm = (uuid, content) => ({ type: 'sdk', msg: { type: 'assistant', uuid, parent_tool_use_id: 'tu-ag', message: { id: 'sm-' + uuid, content } } });
       const sr = (id, content) => ({ type: 'sdk', msg: { type: 'user', parent_tool_use_id: 'tu-ag', message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: id, content }] } } });

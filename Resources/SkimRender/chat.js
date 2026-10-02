@@ -1331,7 +1331,8 @@
     if (P.sel < 0 || P.sel >= items.length) P.sel = Math.max(0, items.findIndex(i => i.current));
     if (!items.length) P.sel = -1;
     const list = h('div', { class: 'ck-pop-list', role: 'listbox' }, items.map((it, i) => {
-      const el = h('div', { class: 'ck-pop-item' + (i === P.sel ? ' is-sel' : '') + (it.current ? ' is-current' : ''), role: 'option' },
+      const el = h('div', { class: 'ck-pop-item' + (i === P.sel ? ' is-sel' : '') + (it.current ? ' is-current' : '') + (it.child ? ' is-child' : '') + (it.group ? ' is-group' : ''),
+        role: 'option', ...(it.group ? { 'aria-expanded': String(!!it.side && it.side.classList.contains('is-open')) } : {}) },
         h('span', { class: 'ck-pop-check' }),
         h('span', { class: 'ck-pop-main' },
           h('span', { class: 'ck-pop-title' + (it.mono ? ' is-mono' : '') }, it.title),
@@ -2112,13 +2113,23 @@
     grow(); updateSlash();
   }
 
+  let moreNewOpen = false;   // the ⋮ menu's "New…" group, folded each time the menu opens
+
   function openMoreMenu() {
     if (P.kind === 'more') { closePop(); return; }
+    moreNewOpen = false;
     moreBtn.classList.add('is-open');
     requestGit();
     if (supports('rename') && S.sessionId) post({ type: 'title' });
     const act = (title, desc, fn) => ({ title, desc, run: () => { closePop(); fn(); } });
-    openPop('more', moreBtn, () => ({
+    openPop('more', moreBtn, () => {
+      const news = [supports('fork') ? act('New side chat', null, () => newSide()) : null,
+        supports('slashCommands') ? act('New conversation', null, () => sendUser('/clear')) : null].filter(Boolean);
+      // The "New…" options under one item that opens in place (the menu stays open).
+      const newGroup = news.length ? [{ title: 'New…', desc: news.map(n => n.title.replace(/^New /, '')).join(' · '), group: true,
+        side: h('span', { class: 'sk-caret ck-pop-caret' + (moreNewOpen ? ' is-open' : '') }),
+        run: () => { moreNewOpen = !moreNewOpen; refreshPop(); } }, ...(moreNewOpen ? news.map(n => ({ ...n, child: true })) : [])] : [];
+      return {
       head: moreInfo(),
       items: [
         supports('usage') ? act('Usage', 'Tokens, context and account limits', () => toggleUsage(true)) : null,
@@ -2136,12 +2147,12 @@
         }) : null,
         supports('credentials') ? act('Check Codex account', null, () => post({ type: 'surfaceAction', action: 'accountRead' })) : null,
         supports('tui') ? act('Open in TUI', null, () => post({ type: 'openTUI', busy: S.busy })) : null,
-        supports('fork') ? act('New side chat', null, () => newSide()) : null,
+        ...newGroup,
         active !== main ? act('Close this side chat', null, () => closeSide(active)) : null,
-        supports('slashCommands') ? act('Compact conversation', null, () => sendUser('/compact')) : null,
-        supports('slashCommands') ? act('New conversation', null, () => sendUser('/clear')) : null
+        supports('slashCommands') ? act('Compact conversation', null, () => sendUser('/compact')) : null
       ].filter(Boolean)
-    }));
+      };
+    });
   }
 
   // ── side chats: forks of main, shown one full view at a time ──────────
@@ -3300,7 +3311,7 @@
       h('span', { class: 'ck-sub-state', 'data-state': state, text: state }),
       h('span', { class: 'ck-sub-stats', text: stats }),
       h('button', { class: 'ck-sub-btn ck-sub-x', type: 'button', title: 'Close (Esc)', onclick: closeSub }));
-    // Only the head is redrawn on each change; the transcript is the subagent's own log, which grows by itself.
+    // Head redrawn; transcript grows by itself (subagent's own log).
     if (!sc) {
       let prompt = null;
       if (inp.prompt) {

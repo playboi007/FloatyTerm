@@ -725,3 +725,10 @@ body.tools-inline .ck-tray, body.tools-inline .ck-run-mark { display: none; }
 .ck-voice-start[aria-pressed="true"] { color: #e19c87; border-color: currentColor; }
 .ck-integration-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 8px; }
 .ck-integration-actions button:disabled { opacity: .5; cursor: wait; }
+
+/* ── the ⋮ menu's "New…" group: a caret item whose options open in place ── */
+.ck-pop-caret { color: var(--faint); transform: rotate(-90deg); transition: transform var(--m-fast, 120ms) var(--m-ease, ease); }
+.ck-pop-caret.is-open { transform: none; }
+.ck-pop .ck-pop-item.is-child { padding-left: 26px; }
+.ck-pop-item.is-child .ck-pop-title { color: var(--text-2); }
+@media (prefers-reduced-motion: reduce) { .ck-pop-caret { transition: none; } }
