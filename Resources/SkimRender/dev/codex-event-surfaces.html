@@ -1,0 +1,67 @@
+<!doctype html><html lang="en" class="no-motion"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Codex events · actual renderer</title>
+<link rel="stylesheet" href="../fonts.css"><link rel="stylesheet" href="../skim.css"><link rel="stylesheet" href="../chat.css">
+<style>:root{--sk-top:90px}.event-controls{position:fixed;top:0;left:0;right:0;z-index:20;background:var(--bg);padding:12px;border-bottom:1px solid var(--line-2);display:flex;flex-wrap:wrap;gap:8px;align-items:center;font-size:12px}.event-controls button,.event-controls select{background:var(--surface);color:var(--text);border:1px solid var(--line-3);border-radius:5px;padding:5px 9px}.event-controls a{margin-left:auto}#feedback{width:100%;color:var(--muted)}@media(max-width:500px){:root{--sk-top:125px}}</style></head><body>
+<header class="event-controls"><span>Actual renderer · synthetic events</span><button id="output">Append output</button><button id="finish">Finish tool</button><select id="request" aria-label="Request preview"><option value="questions">Questions</option><option value="permissions">Permissions</option><option value="elicitation">MCP input</option><option value="approval">Command approval</option></select><button id="show-request">Show request</button><button onclick="location.reload()">Reset</button><a href="codex-ui-preview/">Component lab ↗</a><span id="feedback" role="status">Local preview. Buttons send no provider requests.</span></header>
+<script src="../vendor/marked.min.js"></script><script src="../vendor/purify.min.js"></script><script src="../vendor/highlight.min.js"></script><script src="../skim-classify.js"></script><script src="../skim-render.js"></script><script src="../agent-events.js"></script><script src="../agent-claude.js"></script><script src="../agent-codex.js"></script><script src="../chat.js"></script>
+<script>
+const feedback=document.getElementById('feedback');
+window.webkit={messageHandlers:{skim:{postMessage:message=>{const action=message.action&&typeof message.action==='object'?message.action:message;if(action.type==='state'||action.type==='usage'||action.type==='git')return;feedback.textContent='Local action: '+action.type+(typeof action.action==='string'?' · '+action.action:'')+(action.decision?' · '+action.decision:'');}}}};
+const event=(type,fields={})=>({v:1,agent:'codex',type,t:Date.now(),raw:{synthetic:true},threadId:'preview-thread',turnId:'preview-turn',...fields});
+const feed=(...events)=>AgentChat.receive(events);
+const surface=(id,surface,title,method,data,extra={})=>event('surface.snapshot',{id,surface,title,method,data,...extra});
+AgentChat.boot({agent:'codex',cwd:'/workspace/floatyterm',home:'/workspace'});
+feed(event('session',{sessionId:'preview-thread'}));AgentChat.showUser('Show the remaining Codex event surfaces.');
+feed(event('turn.start'),event('content.snapshot',{id:'reply',kind:'text',text:'The following panels use the production renderer with synthetic events. Expand details to inspect results and metadata.',final:true}),
+ event('plan.snapshot',{explanation:'Normalize events, render owned components, then connect native responses.',plan:[{step:'Map event destinations',status:'completed'},{step:'Render remaining surfaces',status:'inProgress'},{step:'Connect host capabilities',status:'pending'}]}),
+ event('tool.start',{id:'command',name:'Bash',input:{command:'node build.mjs',cwd:'/workspace/floatyterm'}}),
+ event('tool.output.delta',{id:'command',name:'Bash',stream:'stdout',text:'Preparing assets…\n',processHandle:'preview-process'}),
+ event('tool.output.delta',{id:'command',name:'Bash',stream:'stderr',text:'Warning: synthetic output\n'}),
+ event('tool.start',{id:'mcp',name:'MCP: docs/search',input:{query:'event protocol'}}),event('tool.progress',{id:'mcp',message:'Searching documentation…'}),
+ surface('mcp-details','mcp','MCP result','mcpToolCall',{result:{content:[{type:'text',text:'Documentation result'},{type:'resource_link',name:'Protocol guide',uri:'https://example.com/protocol'}],structuredContent:{matches:3}}},{ownerId:'mcp'}),
+ event('tool.result',{id:'mcp',name:'MCP: docs/search',output:'Found 3 matches.'}),
+ event('tool.start',{id:'agent',name:'Agent',input:{subagent_type:'explorer',description:'Inspect event handling',prompt:'Find event destinations',model:'synthetic-model'}}),
+ event('turn.start',{parentId:'agent',threadId:'child-thread',turnId:'child-turn'}),event('content.snapshot',{id:'child-answer',parentId:'agent',threadId:'child-thread',turnId:'child-turn',kind:'text',text:'Child activity appears in its own transcript.',final:true}),event('turn.end',{parentId:'agent',threadId:'child-thread',turnId:'child-turn',status:'success'}),
+ event('tool.result',{id:'agent',name:'Agent',output:'Event destinations documented.'}),
+ event('tool.start',{id:'image',name:'Generate image',input:{prompt:'Synthetic amber diagram'}}),event('tool.result',{id:'image',output:'Image generated'}),
+ event('media.snapshot',{id:'image',caption:'Small synthetic image',url:'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jB1sAAAAASUVORK5CYII='}),
+ surface('goal','goal','Goal progress','thread/goal/updated',{goal:{objective:'Give every event a visible destination',status:'active',tokensUsed:1250,tokenBudget:10000,timeUsedSeconds:31}},{placement:'session'}),
+ surface('queue','queue','Queued messages','thread/queue/changed',{data:[{id:'queued-1',input:[{type:'text',text:'Explain the routing decisions.'}]}]},{placement:'session'}));
+const samples=[
+ ['status','Status / buffering','thread/status/changed',{status:{type:'active'}}],
+ ['session','Thread / project details','thread/attachment/updated',{attachments:[{id:'attachment-1',path:'docs/events.md'}],project:{name:'FloatyTerm'}}],
+ ['account','Account / usage / auth','account/updated',{authMode:'chatgpt',planType:'synthetic',status:'connected'}],
+ ['environment','Environment / remote control','thread/environment/disconnected',{status:'disconnected',message:'Remote environment is not connected.'}],
+ ['integrations','Integrations / MCP progress','mcpServer/status/updated',{server:'docs',status:'ready',tools:3}],
+ ['realtime','Realtime voice','thread/realtime/outputAudio/delta',{audio:{sampleRate:24000,playback:'Audio transport is not connected in this host.'}}],
+ ['hooks','Hook runs','hook/completed',{run:{id:'hook-1',eventName:'postToolUse',status:'completed',durationMs:15,entries:[{kind:'feedback',text:'Synthetic hook finished.'}]}}],
+ ['review','Review mode','enteredReviewMode',{review:'Reviewing the current working tree.'}],
+ ['search','File search results','fuzzyFileSearch/sessionUpdated',{files:[{path:'Resources/SkimRender/chat.js',score:98}]}],
+ ['notice','Notices / recovery','modelProvider/tokenRefreshCompleted',{status:'completed',message:'Provider credential refresh completed.'}],
+ ['mcp-ui','MCP UI resources','mcpToolCall',{resource:{uri:'ui://docs/search',mimeType:'text/html'},availability:'Embedded provider applications are not connected in this host.'}],
+ ['diagnostics','Protocol diagnostics','currentTime/read',{status:'completed',message:'Host time supplied.'}],
+ ['citation','Message details','agentMessage',{memoryCitation:{entries:[{path:'notes/events.md',startLine:4,endLine:8}]},phase:'final_answer'}],
+ ['raw-reasoning','Reasoning metadata','item/reasoning/rawContentDelta',{availability:'Reasoning summaries are shown; raw reasoning is omitted.'}],
+ ['dynamic','Host tool results','dynamicToolCall',{tool:'workspace_lookup',status:'failed',message:'Host tool is not registered.'}],
+ ['compaction','Context compaction','contextCompaction',{status:'completed',message:'Conversation context compacted.'}],
+ ['wait','Wait activity','sleep',{durationMs:250,status:'completed'}],
+ ['function-output','Function output','functionCallOutput',{name:'lookup',output:{found:true}}],
+ ['subagent','Child agent activity','subAgentActivity',{status:'completed',message:'Child analysis finished.'}]
+];
+for(const [id,title,method,data] of samples)feed(surface('sample-'+id,id,title,method,data,{placement:['status','session','account','environment','integrations','realtime'].includes(id)?'session':'turn'}));
+let count=0;
+document.getElementById('output').onclick=()=>feed(event('tool.output.delta',{id:'command',name:'Bash',text:'Completed synthetic asset '+(++count)+'\n'}));
+document.getElementById('finish').onclick=()=>feed(event('tool.result',{id:'command',name:'Bash'}));
+document.getElementById('show-request').onclick=()=>{
+ const kind=document.getElementById('request').value;
+ const input={questions:{questions:[{id:'layout',header:'Layout',question:'How should results be displayed?',options:[{label:'Grouped',description:'Keep related events together.'},{label:'Chronological',description:'Show the event timeline.'}]},{id:'secret',question:'Optional secret answer',isSecret:true,options:[{label:'Skip',description:'Use no credential in this preview.'}]}]},permissions:{permissions:{fileSystem:{write:['/workspace/floatyterm']},network:{enabled:false}}},elicitation:{serverName:'docs',mode:'form',message:'Select search options.',requestedSchema:{type:'object',required:['format'],properties:{format:{type:'string',enum:['summary','full'],title:'Result format'},tags:{type:'array',items:{enum:['api','ui','events']},title:'Tags',maxItems:2},includeLinks:{type:'boolean',default:true,title:'Include links'}}}},approval:{command:'node build.mjs',cwd:'/workspace/floatyterm',availableDecisions:['accept','acceptForSession','decline','cancel']}}[kind];
+ feed(event('approval.request',{request:{id:'preview-request-'+(++count),kind,toolName:'Bash',input,blocking:true,decisionReason:'Synthetic request; no provider action will run.'}}));
+};
+setTimeout(()=>{
+ window.dispatchEvent(new WheelEvent('wheel',{deltaY:-1}));
+ const request=new URLSearchParams(location.search).get('request');
+ if(['questions','permissions','elicitation','approval'].includes(request)){
+  document.getElementById('request').value=request;document.getElementById('show-request').click();
+  document.querySelector('.ck-native-card:last-child')?.scrollIntoView({block:'center'});
+ }else window.scrollTo(0,0);
+},250);
+</script></body></html>

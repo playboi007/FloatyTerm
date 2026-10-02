@@ -84,9 +84,14 @@ function doTurn(request) {
     return;
   }
   if (text === 'unsupported-request') {
-    write({ jsonrpc: '2.0', id: 'unsupported-1', method: 'item/tool/requestUserInput', params: { threadId: request.params.threadId, turnId: currentTurn } });
+    write({ jsonrpc: '2.0', id: 'unsupported-1', method: 'future/unsupportedRequest', params: { threadId: request.params.threadId, turnId: currentTurn } });
   }
   if (text === 'hang') return;
+  if (text === 'diff') {
+    notify('turn/diff/updated', { threadId: request.params.threadId, turnId: currentTurn, diff: 'first diff' });
+    notify('turn/diff/updated', { threadId: request.params.threadId, turnId: currentTurn, diff: 'replacement diff' });
+    notify('turn/diff/updated', { threadId: request.params.threadId, turnId: currentTurn, diff: '' });
+  }
   finishTurn(request.params.threadId, text === 'fail' ? 'failed' : 'completed');
 }
 function finishTurn(threadId, status) {
@@ -200,6 +205,22 @@ async function harness(run, env = {}) {
   }
 }
 
+test('turn diff notifications preserve ownership, full replacements, empty clearing and provenance', async () => {
+  await harness(async ({ lines, send, until }) => {
+    send({ type: 'user', text: 'diff' });
+    await until(xs => xs.some(event => event.type === 'turn.end'));
+    const diffs = lines.filter(event => event.type === 'turn.diff.snapshot');
+    assert.deepEqual(diffs.map(event => event.diff), ['first diff', 'replacement diff', '']);
+    const start = lines.find(event => event.type === 'turn.start');
+    for (const event of diffs) {
+      assert.equal(event.threadId, start.sessionId);
+      assert.equal(event.turnId, start.turnId);
+      assert.equal(event.raw.method, 'turn/diff/updated');
+    }
+    assert.ok(!lines.some(event => event.type === 'unknown' && event.name === 'turn/diff/updated'));
+  });
+});
+
 test('initializes persistent app-server, exposes model catalog by selectable slug, and starts safely', async () => {
   await harness(async ({ lines, calls }) => {
     const capabilityIndex = lines.findIndex(event => event.type === 'capabilities');
@@ -247,7 +268,7 @@ test('sends prompt with validated model slug, effort and complete read-only sand
     assert.equal(usage.plan.available, true);
     assert.match(usage.plan.limits[0].label, /5h/i);
     assert.match(usage.plan.limits[1].label, /168h/i);
-    assert.ok(lines.some(event => event.type === 'content.delta' && event.kind === 'thinking' && event.text === 'Public summary'));
+    assert.ok(lines.some(event => event.type === 'content.snapshot' && event.kind === 'thinking' && event.text === 'Public summary'));
     assert.equal(lines.some(event => JSON.stringify(event).includes('PRIVATE_RAW_REASONING')), false);
   });
 });
@@ -269,7 +290,7 @@ test('command and file approval cards round-trip allow and deny exactly once', a
     send({ type: 'user', text: 'approve' });
     await until(xs => xs.some(event => event.type === 'approval.request'));
     const commandCard = lines.find(event => event.type === 'approval.request').request;
-    assert.equal(commandCard.id, '71');
+    assert.equal(commandCard.id, 'rpc:71');
     assert.equal(commandCard.toolName, 'Bash');
     assert.equal(commandCard.input.command, 'git status --short');
     assert.equal(commandCard.suppressAlwaysAllowRule, true);
@@ -290,7 +311,7 @@ test('command and file approval cards round-trip allow and deny exactly once', a
     responses = (await calls()).filter(message => message.id === 72 && !message.method);
     assert.equal(responses.length, 1);
     assert.equal(responses[0].result.decision, 'decline');
-    assert.ok(lines.some(event => event.type === 'notice' && /do not support feedback text/i.test(event.message)));
+    assert.ok(lines.some(event => event.type === 'notice' && /approval feedback is not supported/i.test(event.message)));
   });
 });
 
@@ -313,7 +334,7 @@ test('unsupported app-server requests get an explicit JSON-RPC error and a visib
     await until(xs => xs.some(event => event.type === 'notice' && /unsupported operation/i.test(event.message)));
     const response = (await calls()).find(message => message.id === 'unsupported-1' && !message.method);
     assert.equal(response.error.code, -32601);
-    assert.match(response.error.message, /Unsupported Codex app-server request/);
+    assert.match(response.error.message, /Unsupported operation/);
   });
 });
 

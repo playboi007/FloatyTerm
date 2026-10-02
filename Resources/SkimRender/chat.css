@@ -2,6 +2,22 @@
    floating panel (about 700 × 420 pt), where every line has to earn its place. */
 
 body.ck { min-height: 100vh; display: flex; flex-direction: column; }
+/* Aggregate changes belong to a turn, below its reply and above its footer. */
+.ck-turn-diff { min-width: 0; color: var(--text-3); font-size: 12px; }
+.ck-turn-diff-summary { cursor: pointer; color: var(--muted); padding: 7px 0; overflow-wrap: anywhere; }
+.ck-turn-diff-files { display: flex; flex-direction: column; gap: 9px; margin: 7px 0 12px; }
+.ck-turn-diff-file { min-width: 0; }
+.ck-turn-diff-file > summary { cursor: pointer; color: var(--path); padding: 5px 0; overflow-wrap: anywhere; }
+.ck-turn-diff-code { margin: 6px 0 0; padding: 10px 12px; border: 1px solid var(--line-2); border-radius: 6px;
+  background: var(--surface-2); overflow: auto; max-height: min(55vh, 420px); font: 11px/1.7 var(--mono); white-space: pre; overscroll-behavior: contain; }
+.ck-turn-diff-line { display: block; min-width: max-content; }
+.ck-turn-diff-line.is-add { color: var(--good); background: rgba(134,194,138,.07); }
+.ck-turn-diff-line.is-del { color: var(--bad); background: rgba(236,127,114,.07); }
+.ck-turn-diff-line.is-hunk { color: var(--path); }
+.ck-turn-diff-copy { width: 100%; padding: 7px 12px; border: 1px solid var(--line-3); border-radius: 6px;
+  background: var(--surface); color: var(--text-3); font: 12px var(--sans); cursor: pointer; }
+.ck-turn-diff-copy:hover { border-color: var(--accent); }
+.ck-turn-diff :focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; }
 .ck-log { flex: 1; width: 100%; max-width: 860px; margin: 0 auto; padding: var(--sk-top, 16px) 16px 12px; display: flex; flex-direction: column; gap: 18px; }
 .ck-turn { display: flex; flex-direction: column; gap: 10px; }
 .ck-body { display: flex; flex-direction: column; gap: 10px; }
@@ -389,3 +405,48 @@ body.is-resizing, body.is-resizing * { cursor: ns-resize !important; user-select
   .ck-pop[data-kind="slash"] .ck-pop-main { flex-direction: column; align-items: stretch; gap: 0; }
   .ck-pop-title.is-mono { max-width: 100%; }
 }
+
+/* Semantic protocol surfaces: details stay with their turn, tool, or session. */
+.ck-session-surfaces { display:flex; flex-direction:column; gap:6px; margin:0 0 12px; }
+.ck-surface { min-width:0; width:100%; margin:6px 0; border:1px solid var(--line-3); border-radius:8px; background:var(--surface); font:12px/1.5 var(--sans); }
+.ck-surface-head { cursor:pointer; padding:8px 10px; color:var(--text-2); overflow-wrap:anywhere; }
+.ck-surface-head:focus-visible { outline:2px solid var(--accent); outline-offset:2px; }
+.ck-surface-content { padding:0 10px 10px; max-height:420px; overflow:auto; color:var(--text); }
+.ck-surface-content p { white-space:pre-wrap; overflow-wrap:anywhere; }
+.ck-surface-title { font-weight:600; }
+.ck-surface-muted { color:var(--muted); }
+.ck-surface-fields { display:grid; grid-template-columns:minmax(80px,1fr) minmax(0,3fr); gap:5px 12px; margin:6px 0; }
+.ck-surface-fields dt { color:var(--muted); overflow-wrap:anywhere; }
+.ck-surface-fields dd { margin:0; min-width:0; white-space:pre-wrap; overflow-wrap:anywhere; }
+.ck-surface-list { padding-left:18px; margin:4px 0; }
+.ck-surface-list li { margin:4px 0; }
+.ck-surface-content a { color:var(--accent); overflow-wrap:anywhere; }
+.ck-surface-content button, .ck-media button, .ck-process-input button { padding:5px 9px; margin:4px 5px 0 0; border:1px solid var(--line-3); border-radius:6px; background:var(--surface-2); color:var(--text); font:12px var(--sans); cursor:pointer; }
+.ck-surface-content button:hover, .ck-media button:hover, .ck-process-input button:hover { border-color:var(--accent); }
+.ck-surface-content progress { width:100%; accent-color:var(--accent); }
+.ck-queue-item + .ck-queue-item { border-top:1px solid var(--line-2); margin-top:8px; padding-top:8px; }
+.ck-stream-output { max-height:280px; overflow:auto; white-space:pre-wrap; overflow-wrap:anywhere; }
+.ck-process-input { display:flex; gap:6px; padding:8px; }
+.ck-process-input input { min-width:0; flex:1; }
+.ck-process-input input, .ck-native-fields input:not([type=radio]):not([type=checkbox]), .ck-native-fields select { background:var(--inset); color:var(--text); border:1px solid var(--line-3); border-radius:6px; padding:7px 9px; font:13px var(--sans); }
+.ck-process-input input:focus, .ck-native-fields input:focus, .ck-native-fields select:focus { outline:2px solid var(--accent); outline-offset:1px; }
+.ck-process-input button { flex:none; margin:0; }
+.ck-media { margin:10px 0; display:flex; flex-wrap:wrap; gap:6px; }
+.ck-media img { display:block; width:100%; max-height:340px; object-fit:contain; background:var(--inset); border-radius:8px; }
+.ck-media figcaption { width:100%; color:var(--muted); font:12px/1.5 var(--sans); overflow-wrap:anywhere; }
+.ck-native-card > .ck-card-title { margin:12px; font:600 14px var(--sans); }
+.ck-native-fields { padding:0 12px 10px; display:flex; flex-direction:column; gap:10px; }
+.ck-native-fields label { display:flex; flex-direction:column; gap:5px; color:var(--text-2); font:13px/1.45 var(--sans); }
+.ck-native-fields small { color:var(--muted); }
+.ck-native-question { min-width:0; border:1px solid var(--line-3); border-radius:7px; padding:10px; display:flex; flex-direction:column; gap:8px; }
+.ck-native-question legend { color:var(--text); padding:0 4px; font:600 13px/1.45 var(--sans); }
+.ck-native-fields .ck-native-choice { flex-direction:row; align-items:flex-start; gap:8px; cursor:pointer; }
+.ck-native-choice input { flex:none; margin-top:3px; accent-color:var(--accent); }
+.ck-native-choice span { display:flex; flex-direction:column; gap:2px; }
+.ck-native-fields select[multiple] { min-height:100px; }
+.ck-plan-explanation { margin:8px 12px; color:var(--muted); font:12px/1.5 var(--sans); white-space:pre-wrap; }
+@media(max-width:480px) { .ck-surface-fields { grid-template-columns:minmax(65px,1fr) minmax(0,2fr); gap:5px 8px; } .ck-process-input { flex-wrap:wrap; } }
+
+.ck-event-image-dialog { max-width:90vw; max-height:90vh; background:var(--surface); color:var(--text); border:1px solid var(--line-3); border-radius:8px; }
+.ck-event-image-dialog img { display:block; max-width:80vw; max-height:75vh; object-fit:contain; }
+.ck-event-child { padding:10px; }

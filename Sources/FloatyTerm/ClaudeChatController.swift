@@ -154,7 +154,12 @@ final class ClaudeChatController: NSObject, TabContent, WKNavigationDelegate {
             ch.sidecar.send(["type": "user", "text": text])
         case "permission":
             var m: [String: Any] = ["type": "permission"]
-            for key in ["id", "decision", "message"] { if let v = action[key] { m[key] = v } }
+            for key in ["id", "decision", "message", "response"] { if let v = action[key] { m[key] = v } }
+            ch.sidecar.send(m)
+        case "surfaceAction":
+            guard agent == .codex else { return }
+            var m: [String: Any] = ["type": "surfaceAction"]
+            for key in ["action", "id", "text"] { if let v = action[key] { m[key] = v } }
             ch.sidecar.send(m)
         case "interrupt":
             ch.sidecar.send(["type": "interrupt"])

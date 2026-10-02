@@ -1,11 +1,15 @@
 import { spawn } from 'node:child_process';
 import { createInterface } from 'node:readline';
 import { randomUUID } from 'node:crypto';
+import { readFile, stat } from 'node:fs/promises';
+import { extname } from 'node:path';
+import { StringDecoder } from 'node:string_decoder';
+import { eventRoutes, safePayload } from './event-routes.mjs';
 
 // FloatyTerm <-> Codex app-server bridge. App-server speaks newline-delimited
 // JSON-RPC on stdio; this process owns one persistent connection and exposes a
 // small, versioned event stream to the native host.
-const MAX_LINE_BYTES = 1024 * 1024;
+const MAX_LINE_BYTES = 8 * 1024 * 1024;
 const STDERR_BYTES = 4000;
 const REQUEST_TIMEOUT_MS = 30_000;
 const HISTORY_TURN_LIMIT = 300;
@@ -208,6 +212,8 @@ class CodexBridge {
     this.active = null;
     this.approvals = new Map();
     this.items = new Map();
+    this.childParents = new Map();
+    this.processStreams = new Map();
     this.latestUsage = null;
     this.plan = null;
     this.failureSent = false;
@@ -215,7 +221,7 @@ class CodexBridge {
   }
 
   emit(type, fields = {}, raw = undefined) {
-    output({ type, ...fields, raw: raw ?? { type: 'codex.app-server', event: type } });
+    output({ type, ...this.eventScope, ...fields, raw: safePayload(raw ?? { type: 'codex.app-server', event: type }) });
   }
 
   notice(kind, message, terminal = false, raw = undefined) {
@@ -363,7 +369,7 @@ class CodexBridge {
   applyThread(response, { emitSession = true } = {}) {
     const thread = response?.thread;
     if (!thread?.id) throw new Error('Codex app-server did not return a thread id.');
-    if (this.threadId !== thread.id) { this.items.clear(); this.latestUsage = null; this.cancelApprovals(); }
+    if (this.threadId !== thread.id) { this.items.clear(); this.childParents.clear(); this.processStreams.clear(); this.latestUsage = null; this.cancelApprovals(); }
     this.thread = thread;
     this.threadId = thread.id;
     if (response.model) {
@@ -509,6 +515,7 @@ class CodexBridge {
     if (this.active === turn) this.active = null;
     this.cancelApprovals();
     this.emit('turn.end', {
+      threadId: this.threadId, turnId: turn.id,
       status,
       ...(message ? { message } : {}),
       ...(serverTurn?.durationMs != null ? { durationMs: serverTurn.durationMs } : {}),
@@ -518,7 +525,7 @@ class CodexBridge {
   }
 
   onUsage(params, raw) {
-    if (params.threadId !== this.threadId) return;
+    if (params.threadId !== this.threadId) { this.surfaceEvent('thread/tokenUsage/updated', params); return; }
     this.latestUsage = params.tokenUsage;
     if (this.active && this.active.id === params.turnId) this.active.usage = this.usageForTurn(params.tokenUsage);
     this.emitUsage();
@@ -548,7 +555,7 @@ class CodexBridge {
           const items = Array.isArray(turn.items) ? turn.items : [];
           const user = items.find(item => item.type === 'userMessage');
           const userText = user?.content?.filter(content => content.type === 'text').map(content => content.text || '').join('\n') || '';
-          const events = [];
+          const events = [{ type: 'turn.start', threadId: sessionId, turnId: turn.id }];
           for (const item of items) {
             if (++itemCount > HISTORY_ITEM_LIMIT) break;
             events.push(...this.historyItem(sessionId, turn.id, item));
@@ -592,7 +599,16 @@ class CodexBridge {
       { type: 'tool.result', id, output: toText(item.results || item.result), isError: false },
     ];
     if (item.type === 'userMessage') return [];
-    return [{ type: 'unknown', name: `history:${item.type}`, raw: item }];
+    const details = this.toolDetails(item, { output: '' });
+    const route = eventRoutes[item.type];
+    const result = details ? [
+      { type: 'tool.start', id, name: details.name, input: details.input },
+      { type: 'tool.result', id, name: details.name, output: details.output || '', isError: !!details.isError },
+    ] : [];
+    if (route) result.push({ type: 'surface.snapshot', id: 'history:' + id, surface: route.surface, title: route.title, method: item.type,
+      threadId, turnId, ownerId: details ? id : null, data: { item: safePayload(item) } });
+    else result.push({ type: 'unknown', name: `history:${item.type}`, raw: safePayload(item) });
+    return result;
   }
 
   async sessions() {
@@ -712,52 +728,92 @@ class CodexBridge {
 
   serverRequest(message) {
     const { id, method, params = {} } = message;
-    if (params.threadId && params.threadId !== this.threadId) {
-      this.rpc.rejectRequest(id, -32602, 'Approval belongs to another conversation.');
-      return;
-    }
     const key = this.requestIdKey(id);
+    const parentId = this.childParents.get(params.threadId);
+    if (params.threadId && params.threadId !== this.threadId && !parentId) {
+      this.rpc.rejectRequest(id, -32602, 'Request belongs to another conversation.'); return;
+    }
     if (this.approvals.has(key)) {
-      this.rpc.rejectRequest(id, -32600, 'Duplicate approval request id.');
-      this.notice('error', 'Codex repeated an approval request id; the duplicate was rejected.', false, { type: 'approval.duplicate', method });
-      return;
+      this.rpc.rejectRequest(id, -32600, 'Duplicate request id.'); return;
     }
-    if (method === 'item/commandExecution/requestApproval' || method === 'item/fileChange/requestApproval') {
-      const file = method === 'item/fileChange/requestApproval';
-      const itemInput = this.items.get(toolId(params.threadId, params.turnId, params.itemId))?.input;
-      const request = {
-        id: String(id), toolUseID: toolId(params.threadId, params.turnId, params.itemId),
-        toolName: file ? 'File changes' : 'Bash',
-        input: file ? { ...(itemInput || {}), ...(params.grantRoot ? { grantRoot: params.grantRoot } : {}) } : { command: params.command || itemInput?.command || '', cwd: params.cwd || this.config.cwd },
-        decisionReason: params.reason || '', suppressAlwaysAllowRule: true,
-      };
-      this.approvals.set(key, { id, method, request });
-      this.emit('approval.request', { request }, { ...message });
-      return;
+    if (parentId) params.parentId = parentId;
+    if (method === 'currentTime/read') {
+      this.rpc.respond(id, { currentTimeAt: Math.floor(Date.now() / 1000) });
+      this.surfaceEvent(method, { status: 'completed', message: 'Host time supplied.' }); return;
     }
-    this.rpc.rejectRequest(id, -32601, `Unsupported Codex app-server request: ${method}`);
-    this.notice('error', `Codex requested an unsupported operation (${method}); it was rejected.`, false,
-      { type: 'app-server.request.unsupported', method, params });
+    if (method === 'item/tool/call') {
+      // No dynamic tools are registered by this host. Return an honest tool result.
+      const message = `Host tool ${params.namespace ? params.namespace + '/' : ''}${params.tool || 'unknown'} is not registered.`;
+      this.rpc.respond(id, { success: false, contentItems: [{ type: 'inputText', text: message }] });
+      this.surfaceEvent(method, { ...params, status: 'failed', message }); return;
+    }
+    if (method === 'account/chatgptAuthTokens/refresh' || method === 'attestation/generate') {
+      this.rpc.rejectRequest(id, -32601, 'This host does not supply external authentication or attestation.');
+      this.surfaceEvent(method, { status: 'unavailable', message: 'Reconnect with the installed Codex CLI; external credential/attestation callbacks are not configured.' }); return;
+    }
+    const supported = ['item/commandExecution/requestApproval', 'item/fileChange/requestApproval', 'item/tool/requestUserInput',
+      'item/permissions/requestApproval', 'mcpServer/elicitation/request', 'execCommandApproval', 'applyPatchApproval'];
+    if (!supported.includes(method)) {
+      this.rpc.rejectRequest(id, -32601, `Unsupported operation: ${method}`);
+      this.notice('error', `Codex requested an unsupported operation (${method}); it was rejected.`, false, { method }); return;
+    }
+    const uiId = 'rpc:' + encodeURIComponent(key);
+    const itemId = params.itemId || params.callId;
+    const itemInput = this.items.get(toolId(params.threadId || this.threadId, params.turnId, itemId))?.input;
+    const kind = method === 'item/tool/requestUserInput' ? 'questions' : method === 'item/permissions/requestApproval' ? 'permissions'
+      : method === 'mcpServer/elicitation/request' ? 'elicitation' : 'approval';
+    const request = { id: uiId, nativeId: id, kind, method, threadId: params.threadId || this.threadId, turnId: params.turnId,
+      toolUseID: itemId ? toolId(params.threadId || this.threadId, params.turnId, itemId) : null,
+      toolName: kind === 'approval' ? (method.includes('fileChange') || method === 'applyPatchApproval' ? 'File changes' : 'Bash') : kind,
+      input: kind === 'approval' ? { ...(itemInput || {}), ...safePayload(params), ...(params.fileChanges ? { changes: params.fileChanges } : {}) } : safePayload(params),
+      decisionReason: params.reason || params.message || '', blocking: params.isBlocking !== false, suppressAlwaysAllowRule: true };
+    this.approvals.set(key, { id, method, request, params });
+    // Secret questions must never be copied into diagnostic provenance.
+    this.emit('approval.request', { request, ...(parentId ? { parentId } : {}) }, { method, requestId: uiId });
   }
 
   permission(message) {
-    const match = [...this.approvals.entries()].find(([, approval]) => String(approval.id) === String(message.id));
-    if (!match) { this.notice('info', 'This Codex approval request is no longer active.'); return; }
+    const match = [...this.approvals.entries()].find(([, approval]) => approval.request.id === message.id);
+    if (!match) { this.notice('info', 'This request is no longer active.'); return; }
     const [key, approval] = match;
-    this.approvals.delete(key); // exactly-once even if writing the response fails
-    const accepted = message.decision === 'allow';
-    if (message.message) this.notice('info', 'Codex approval responses do not support feedback text; the decision was sent without it.');
+    const { method, params } = approval;
+    let result;
     try {
-      this.rpc.respond(approval.id, { decision: accepted ? 'accept' : 'decline' });
+      if (method === 'item/tool/requestUserInput') {
+        const answers = message.response?.answers;
+        if (!answers || typeof answers !== 'object') throw new Error('Answers are required.');
+        for (const q of params.questions || []) {
+          if (!Array.isArray(answers[q.id]?.answers) || !answers[q.id].answers.every(v => typeof v === 'string')) throw new Error('Each question needs text answers.');
+        }
+        result = { answers };
+      } else if (method === 'item/permissions/requestApproval') {
+        const allowed = message.decision === 'allow';
+        result = { permissions: allowed ? params.permissions : {}, scope: message.response?.scope === 'session' ? 'session' : 'turn' };
+      } else if (method === 'mcpServer/elicitation/request') {
+        const action = message.response?.action;
+        if (!['accept', 'decline', 'cancel'].includes(action)) throw new Error('Invalid elicitation action.');
+        if (params.mode === 'openai/userVerification' && action === 'accept') throw new Error('Device verification requires a host authenticator.');
+        result = { action, ...(action === 'accept' ? { content: message.response?.content ?? null } : {}) };
+      } else {
+        const legacy = method === 'execCommandApproval' || method === 'applyPatchApproval';
+        let decision = message.response?.decision ?? (message.decision === 'allow' ? 'accept' : 'decline');
+        const offered = params.availableDecisions || ['accept', 'acceptForSession', 'decline', 'cancel'];
+        if (!offered.some(d => JSON.stringify(d) === JSON.stringify(decision))) throw new Error('That decision was not offered by Codex.');
+        if (legacy) decision = ({ accept: 'approved', acceptForSession: 'approved_for_session', decline: { denied: { rejection: 'User declined.' } }, cancel: 'abort' })[decision];
+        result = { decision };
+      }
+      if (typeof message.message === 'string' && message.message.trim()) this.notice('info', 'Codex approval feedback is not supported by this request; the decision was sent.');
+      this.rpc.respond(approval.id, result);
+      this.approvals.delete(key);
+      this.emit('approval.cancel', { id: approval.request.id }, { type: 'request.resolved' });
     } catch (error) {
-      this.notice('error', `Could not send the Codex approval decision: ${plainError(error)}`);
-      return;
+      this.notice('error', `Could not answer request: ${plainError(error)}`);
+      this.emit('approval.request', { request: approval.request }, { type: 'request.retry' });
     }
-    this.emit('approval.cancel', { id: String(approval.id) }, { type: 'approval.resolved', decision: accepted ? 'allow' : 'deny' });
   }
 
   cancelApprovals() {
-    for (const [, approval] of this.approvals) this.emit('approval.cancel', { id: String(approval.id) }, { type: 'approval.cancelled' });
+    for (const [, approval] of this.approvals) this.emit('approval.cancel', { id: approval.request.id }, { type: 'approval.cancelled' });
     this.approvals.clear();
   }
 
@@ -767,7 +823,7 @@ class CodexBridge {
     const id = toolId(threadId, turnId, item.id);
     let state = this.items.get(id);
     if (!state) {
-      state = { id, itemId: item.id, threadId, turnId, type: item.type, kind: null, text: '', output: '', input: null, started: false, finished: false };
+      state = { id, itemId: item.id, threadId, turnId, parentId: this.childParents.get(threadId), type: item.type, kind: null, text: '', output: '', input: null, started: false, finished: false };
       this.items.set(id, state);
     }
     if (item.type) state.type = item.type;
@@ -785,7 +841,16 @@ class CodexBridge {
     const state = this.ensureItem(params, phase, raw);
     const item = params.item;
     if (!state) { this.emit('unknown', { name: `item.${phase}`, raw: params }, raw); return; }
-    if (item.type === 'userMessage') return;
+    if (item.type === 'userMessage') return; // The optimistic prompt already owns this user message.
+    if (item.type === 'collabAgentToolCall') {
+      for (const child of item.receiverThreadIds || []) this.childParents.set(child, state.id);
+    }
+    if (item.type === 'imageView' || (item.type === 'imageGeneration' && phase === 'completed')) void this.emitImage(item, state, raw);
+    if (['mcpToolCall','dynamicToolCall','webSearch','collabAgentToolCall','functionCallOutput','hookPrompt','enteredReviewMode','exitedReviewMode'].includes(item.type)) this.surfaceEvent(item.type, { ...params, item: safePayload(item) }, { method: item.type });
+    if (item.type === 'subAgentActivity') this.surfaceEvent(item.type, { ...params, ...item }, raw);
+    if (item.type === 'agentMessage' && (item.memoryCitation || item.questions || item.phase)) {
+      this.surfaceEvent(item.type, { ...params, item: { memoryCitation: item.memoryCitation, questions: item.questions, phase: item.phase } }, raw);
+    }
     if (item.type === 'agentMessage') {
       this.emitContentStart(state, 'text', raw);
       if (phase === 'completed') {
@@ -801,8 +866,9 @@ class CodexBridge {
       return;
     }
     if (item.type === 'reasoning') {
+      raw = { method: 'item/' + phase, threadId: params.threadId, turnId: params.turnId, itemId: item.id, summaryOnly: true };
       this.emitContentStart(state, 'thinking', raw);
-      const text = Array.isArray(item.summary) ? item.summary.join('\n') : '';
+      const text = Array.isArray(item.summary) ? item.summary.map(p => typeof p === 'string' ? p : p?.text || '').join('\n') : state.text;
       if (phase === 'completed') {
         state.text = text;
         this.emit('content.snapshot', { id: state.id, messageId: state.id, kind: 'thinking', text, final: true }, raw);
@@ -816,7 +882,7 @@ class CodexBridge {
     }
     const details = this.toolDetails(item, state);
     if (!details) {
-      this.emit('unknown', { name: `item.${phase}:${item.type || 'unknown'}`, raw: item }, raw);
+      this.surfaceEvent(item.type || `item.${phase}`, { ...params, item, status: phase }, raw);
       return;
     }
     if (!state.toolStarted) {
@@ -842,13 +908,52 @@ class CodexBridge {
       case 'webSearch': return { name: 'Web search', input: { query: item.query || '', action: item.action || '' }, output: toText(item.results || item.result), isError: false };
       case 'plan': return { name: 'Plan', input: { text: item.text || '' }, output: item.text || '', isError: false };
       case 'contextCompaction': return { name: 'Context compaction', input: {}, output: 'Conversation context compacted', isError: false };
+      case 'collabAgentToolCall': return { name: 'Agent', input: { subagent_type: item.tool || 'Agent', description: 'Child agent activity', prompt: item.prompt || '', model: item.model, agentsStates: item.agentsStates, receiverThreadIds: item.receiverThreadIds }, output: toText(item.agentsStates), isError: item.status === 'failed' };
+      case 'functionCallOutput': return { name: item.name || 'Tool output', input: { namespace: item.namespace }, output: toText(item.output), isError: false };
+      case 'hookPrompt': return { name: 'Hook prompt', input: { fragments: item.fragments }, output: toText(item.fragments), isError: false };
+      case 'sleep': return { name: 'Wait', input: { durationMs: item.durationMs }, output: `Waited ${item.durationMs || 0} ms`, isError: false };
+      case 'enteredReviewMode': case 'exitedReviewMode': return { name: 'Review', input: { review: item.review }, output: toText(item.review), isError: false };
+      case 'imageView': case 'imageGeneration': return { name: item.type === 'imageView' ? 'View image' : 'Generate image', input: { path: item.path || item.savedPath, prompt: item.revisedPrompt }, output: toText(item.failure || item.status), isError: !!item.failure || item.status === 'failed' };
       default: return null;
     }
   }
 
+  surfaceEvent(method, params, raw = { method }) {
+    if (method === 'thread/realtime/outputAudio/delta') params = { ...params, audio: { sampleRate: params.audio?.sampleRate, numChannels: params.audio?.numChannels, samplesPerChannel: params.audio?.samplesPerChannel, playback: 'Audio transport is not connected in this host.' } };
+    const route = eventRoutes[method];
+    if (!route) { this.emit('unknown', { name: method }, { method, params: safePayload(params) }); return; }
+    const scope = params.threadId || this.threadId || 'account';
+    const owner = method.startsWith('thread/realtime/transcript/') ? 'transcript:' + (params.role || 'assistant') : params.itemId || params.item?.id || params.reviewId || params.run?.id || params.processHandle || params.processId || params.subscriptionId || params.importId || params.name || params.providerId || params.attachmentId || (route.surface === 'realtime' && !method.endsWith('/delta') ? 'session' : ['thread/goal/updated','thread/goal/cleared','thread/queue/changed'].includes(method) ? '' : method);
+    const id = JSON.stringify([scope, route.surface, owner, ['goal','queue'].includes(route.surface) ? '' : params.turnId || '']);
+    this.emit('surface.snapshot', { ...(this.childParents.get(params.threadId) ? { parentId: this.childParents.get(params.threadId) } : {}), id, surface: route.surface, title: route.title, method, threadId: params.threadId,
+      turnId: params.turnId, itemId: params.itemId || params.item?.id, ownerId: (params.itemId || params.item?.id) ? toolId(params.threadId || this.threadId, params.turnId, params.itemId || params.item.id) : null, placement: ['status','session','goal','queue','account','environment','integrations','realtime'].includes(route.surface) && !params.itemId ? 'session' : 'turn', data: safePayload(params), clear: method === 'thread/goal/cleared' }, { method });
+  }
+
+  async emitImage(item, state, raw) {
+    const path = item.path || item.savedPath;
+    const types = { '.png': 'image/png', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.gif': 'image/gif', '.webp': 'image/webp' };
+    let url = null, error = null;
+    try {
+      if (path && types[extname(path).toLowerCase()] && (await stat(path)).size <= 4 * 1024 * 1024) {
+        url = `data:${types[extname(path).toLowerCase()]};base64,${(await readFile(path)).toString('base64')}`;
+      } else if (item.result && /^[A-Za-z0-9+/=]+$/.test(item.result) && item.result.length <= 6 * 1024 * 1024) url = 'data:image/png;base64,' + item.result;
+      else error = 'Image preview is not available.';
+    } catch { error = 'Image could not be loaded.'; }
+    this.emit('media.snapshot', { id: state.id, threadId: state.threadId, turnId: state.turnId, parentId: state.parentId,
+      url, path, caption: item.revisedPrompt || path || 'Image', error }, { type: 'media' });
+  }
+
   onNotification(message) {
+    const params = message.params || {};
+    const parentId = this.childParents.get(params.threadId);
+    if (params.threadId && params.threadId !== this.threadId && !parentId) return;
+    const previous = this.eventScope;
+    this.eventScope = { ...(params.threadId ? { threadId: params.threadId } : {}), ...(params.turnId ? { turnId: params.turnId } : {}), ...(parentId ? { parentId } : {}) };
+    try { this.dispatchNotification(message); } finally { this.eventScope = previous; }
+  }
+
+  dispatchNotification(message) {
     const { method, params = {} } = message;
-    if (params.threadId && params.threadId !== this.threadId) return;
     switch (method) {
       case 'thread/tokenUsage/updated': this.onUsage(params, message); break;
       case 'account/rateLimits/updated':
@@ -858,8 +963,45 @@ class CodexBridge {
           this.emitUsage();
         } else void this.readRateLimits(false);
         break;
-      case 'turn/started': this.onTurnStarted(params, message); break;
-      case 'turn/completed': this.onTurnCompleted(params, message); break;
+      case 'turn/started':
+        if (params.threadId !== this.threadId) this.emit('turn.start', { threadId: params.threadId, turnId: params.turn?.id }, { method });
+        else this.onTurnStarted(params, message); break;
+      case 'turn/completed':
+        if (params.threadId !== this.threadId) this.emit('turn.end', { threadId: params.threadId, turnId: params.turn?.id, status: params.turn?.status === 'completed' ? 'success' : 'error' }, { method });
+        else this.onTurnCompleted(params, message); break;
+      case 'item/plan/delta': {
+        const state = this.ensureItem({ ...params, item: { id: params.itemId, type: 'plan' } }, 'delta', message);
+        if (!state) break;
+        state.text += params.delta || '';
+        this.emit('tool.input', { id: state.id, name: 'Plan', input: { text: state.text } }, { method }); break;
+      }
+      case 'item/fileChange/patchUpdated': {
+        const id = toolId(params.threadId, params.turnId, params.itemId);
+        const state = this.items.get(id); if (state) state.input = { changes: params.changes || [] };
+        this.emit('tool.input', { id, name: 'File changes', input: { changes: params.changes || [] } }, { method }); break;
+      }
+      case 'item/fileChange/outputDelta':
+        this.emit('tool.output.delta', { id: toolId(params.threadId, params.turnId, params.itemId), name: 'File changes', text: params.delta || '' }, { method }); break;
+      case 'item/mcpToolCall/progress':
+        this.emit('tool.progress', { id: toolId(params.threadId, params.turnId, params.itemId), message: params.message || '' }, { method }); break;
+      case 'command/exec/outputDelta': case 'process/outputDelta': {
+        const handle = params.processHandle || params.processId;
+        const key = JSON.stringify([handle, params.stream]);
+        let decoder = this.processStreams.get(key); if (!decoder) { decoder = new StringDecoder('utf8'); this.processStreams.set(key, decoder); }
+        this.emit('tool.output.delta', { id: 'process:' + handle, name: 'Process', stream: params.stream,
+          text: decoder.write(Buffer.from(params.deltaBase64 || '', 'base64')), capped: !!params.capReached, processHandle: params.processHandle }, { method }); break;
+      }
+      case 'process/exited': {
+        for (const stream of ['stdout','stderr']) {
+          const key = JSON.stringify([params.processHandle, stream]);
+          const tail = this.processStreams.get(key)?.end();
+          if (tail) this.emit('tool.output.delta', { id: 'process:' + params.processHandle, name: 'Process', stream, text: tail }, { method });
+          this.processStreams.delete(key);
+        }
+        // Empty final captures mean output was already streamed; retain it.
+        const output = (params.stdout || '') + (params.stderr ? '\n[stderr]\n' + params.stderr : '');
+        this.emit('tool.result', { id: 'process:' + params.processHandle, name: 'Process', ...(output ? { output } : {}), isError: params.exitCode !== 0 }, { method }); break;
+      }
       case 'item/started': this.onItemLifecycle('started', params, message); break;
       case 'item/completed': this.onItemLifecycle('completed', params, message); break;
       case 'item/agentMessage/delta': {
@@ -875,38 +1017,48 @@ class CodexBridge {
         const state = this.ensureItem({ ...params, item: { id: params.itemId, type: 'reasoning' } }, 'delta', message);
         if (state) {
           this.emitContentStart(state, 'thinking', message);
-          state.text += params.delta || '';
-          this.emit('content.delta', { id: state.id, messageId: state.id, kind: 'thinking', text: params.delta || '' }, message);
+          state.summaryParts ||= new Map();
+          const index = params.summaryIndex || 0;
+          state.summaryParts.set(index, (state.summaryParts.get(index) || '') + (params.delta || ''));
+          state.text = [...state.summaryParts].sort((a,b) => a[0] - b[0]).map(([,text]) => text).join('\n');
+          this.emit('content.snapshot', { id: state.id, messageId: state.id, kind: 'thinking', text: state.text }, { method });
         }
         break;
       }
       case 'item/reasoning/textDelta':
       case 'item/reasoning/rawContentDelta':
+        // Only the presence of this stream is shown; its text is never retained.
+        this.surfaceEvent('item/reasoning/textDelta', { threadId: params.threadId, turnId: params.turnId, itemId: params.itemId,
+          contentIndex: params.contentIndex, availability: 'Raw reasoning omitted. Reasoning summaries are shown in the Thinking fold.' }); break;
       case 'item/reasoning/summaryPartAdded':
-        // The next summaryTextDelta carries the text. This structural notification
-        // has no user-facing content and is routine protocol traffic.
-        break;
+        this.surfaceEvent(method, { ...params, message: 'Reasoning summary part ' + (params.summaryIndex + 1) }); break;
       case 'item/commandExecution/outputDelta': {
         const state = this.ensureItem({ ...params, item: { id: params.itemId, type: 'commandExecution' } }, 'delta', message);
-        if (state) state.output = (state.output + (params.delta || '')).slice(-256 * 1024);
+        if (state) {
+          state.output = (state.output + (params.delta || '')).slice(-256 * 1024);
+          this.emit('tool.output.delta', { id: state.id, name: 'Bash', text: params.delta || '' }, { method });
+        }
         break;
       }
       case 'turn/plan/updated': {
         const id = toolId(params.threadId, params.turnId, 'turn-plan');
         const input = { explanation: params.explanation || '', plan: params.plan || [] };
-        this.emit('tool.start', { id, name: 'Plan', input }, message);
+        this.emit('plan.snapshot', { id, threadId: params.threadId, turnId: params.turnId, ...input }, message);
         break;
       }
       case 'turn/diff/updated':
-        this.emit('unknown', { name: method, raw: message }, message);
+        this.emit('turn.diff.snapshot', {
+          threadId: params.threadId, turnId: params.turnId, diff: params.diff || '',
+        }, message);
         break;
       case 'thread/compacted':
         this.notice('info', 'Codex conversation context was compacted.', false, message);
         break;
       case 'thread/name/updated':
         if (params.threadId === this.threadId && this.thread) this.thread.name = params.threadName || params.name || this.thread.name;
-        break;
+        this.emit('title', { title: params.threadName || params.name || '', sessionId: params.threadId, custom: true }, { method }); break;
       case 'thread/settings/updated': {
+        this.surfaceEvent(method, params);
         if (params.threadId !== this.threadId) break;
         const settings = params.threadSettings || {};
         this.model = this.modelsById.get(settings.model) || this.model;
@@ -916,19 +1068,17 @@ class CodexBridge {
         break;
       }
       case 'warning': this.notice('info', params.message || 'Codex app-server warning.', false, message); break;
-      case 'error': this.notice('error', params.message || params.error?.message || 'Codex app-server error.', false, message); break;
+      case 'error': this.notice(params.willRetry ? 'warn' : 'error', params.error?.message || params.message || 'Codex app-server error.', false, { method });
+        this.surfaceEvent(method, params); break;
       case 'serverRequest/resolved': {
         const key = this.requestIdKey(params.requestId);
         const approval = this.approvals.get(key);
-        if (approval) { this.approvals.delete(key); this.emit('approval.cancel', { id: String(approval.id) }, message); }
+        if (approval) { this.approvals.delete(key); this.emit('approval.cancel', { id: approval.request.id }, message); }
         break;
       }
       default:
-        // Preserve meaningful unhandled protocol updates for the renderer's
-        // bounded unknown-event inspector; routine startup noise is ignored.
-        if (!['thread/started', 'thread/status/changed', 'project/changed', 'fs/changed', 'mcpServer/startupStatus/updated'].includes(method)) {
-          this.emit('unknown', { name: method || 'unnamed notification', raw: message }, message);
-        }
+        this.surfaceEvent(method || 'unnamed notification', params);
+        if (method === 'thread/queue/changed' || method === 'thread/attachment/updated') void this.refreshSurface(method, params);
     }
   }
 
@@ -951,6 +1101,28 @@ class CodexBridge {
     else if (event.kind === 'exit') this.onExit(event.error);
   }
 
+  async refreshSurface(method, params) {
+    try {
+      const attachment = method === 'thread/attachment/updated';
+      const result = await this.rpc.request(attachment ? 'thread/attachment/list' : 'thread/queue/list', { threadId: params.threadId || this.threadId, limit: 100 });
+      this.surfaceEvent(method, { ...params, ...result });
+    } catch (error) { this.surfaceEvent(method, { ...params, status: 'unavailable', message: plainError(error) }); }
+  }
+
+  async surfaceAction(message) {
+    const { action, id, text } = message;
+    try {
+      if (action === 'processInput') {
+        await this.rpc.request('process/writeStdin', { processHandle: id, deltaBase64: Buffer.from(text || '', 'utf8').toString('base64') });
+      } else if (action === 'queueRemove' || action === 'queueStart') {
+        await this.rpc.request(action === 'queueRemove' ? 'thread/queue/delete' : 'thread/queue/start', { threadId: this.threadId, queuedSubmissionId: id });
+        await this.refreshSurface('thread/queue/changed', { threadId: this.threadId });
+      } else if (action === 'realtimeStop') {
+        await this.rpc.request('thread/realtime/stop', { threadId: this.threadId });
+      } else throw new Error('Unsupported surface action.');
+    } catch (error) { this.notice('error', plainError(error)); }
+  }
+
   onExit(error) {
     if (this.failureSent || this.closing) return;
     this.failureSent = true;
@@ -967,6 +1139,7 @@ class CodexBridge {
         case 'user': return this.user(message.text);
         case 'interrupt': return this.interruptActive();
         case 'permission': return this.permission(message);
+        case 'surfaceAction': return this.surfaceAction(message);
         case 'setModel': {
           const model = this.resolveModel(message.model || '', true);
           if (model === false) return;

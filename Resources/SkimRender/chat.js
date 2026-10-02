@@ -72,6 +72,8 @@
       normalizer: root.AgentEvents.createNormalizer(agent), eventState: root.AgentEvents.createState(),
       model: '', mode: 'default', sessionId: null, cost: 0,
       busy: false, turn: null, turns: [],
+      eventChildren: new Map(), surfaceViews: new Map(), mediaViews: new Map(), surfaceRoot: null, protocolStatus: null, buffering: false, connectionClosed: false,
+      turnViews: new Map(),   // thread + turn identity → owning DOM turn (including completed turns)
       rows: new Map(),        // tool_use id → row
       texts: new Map(),       // `${messageId}:${index}` → text item
       msgTexts: new Map(),    // messageId → [text item] in order (to match full assistant messages)
@@ -150,6 +152,111 @@
     return S.turn;
   }
   const turn = () => S.turn || newTurn(null);
+
+  function bindTurn(e) {
+    const key = root.AgentEvents.turnKey(e.threadId || e.sessionId || S.sessionId, e.turnId);
+    if (!key) return;
+    let view = S.turnViews.get(key);
+    if (!view) {
+      view = S.turn && !S.turn.key ? S.turn : newTurn(null);
+      view.key = key;
+      S.turnViews.set(key, view);
+    }
+    S.turn = view;
+    const snapshot = S.eventState.turnDiffs.get(key);
+    if (snapshot) paintTurnDiff(snapshot);
+    const plan = S.eventState.plans.get(key); if (plan) paintPlan(plan);
+  }
+
+  /** Preserve raw unified diff for copying; file folds only organize its lines. */
+  function turnDiffFiles(diff) {
+    const files = [];
+    let file = null;
+    for (const line of diff.split('\n')) {
+      if (line.startsWith('diff --git ') || !file) {
+        file = { path: 'Changes', oldPath: '', lines: [], add: 0, del: 0, inHunk: false };
+        files.push(file);
+        const paths = line.slice(11).match(/"(?:[^"\\]|\\.)*"|\S+/g);
+        if (line.startsWith('diff --git ') && paths?.length >= 2) file.path = diffPath(paths[1]);
+      }
+      file.lines.push(line);
+      if (!file.inHunk && line.startsWith('--- ')) file.oldPath = diffPath(line.slice(4));
+      else if (!file.inHunk && line.startsWith('+++ ')) {
+        const path = diffPath(line.slice(4));
+        file.path = path === '/dev/null' ? file.oldPath : path;
+      } else if (!file.inHunk && line.startsWith('rename to ')) file.path = line.slice(10);
+      else if (line.startsWith('@@')) file.inHunk = true;
+      else if (file.inHunk && line.startsWith('+')) file.add++;
+      else if (file.inHunk && line.startsWith('-')) file.del++;
+    }
+    return files;
+  }
+
+  function diffPath(value) {
+    let path = value.split('\t')[0];
+    if (path.startsWith('"')) { try { path = JSON.parse(path); } catch { /* retain Git's escaped path */ } }
+    return path.replace(/^[ab]\//, '');
+  }
+
+  function paintTurnDiff(e) {
+    const key = root.AgentEvents.turnKey(e.threadId, e.turnId);
+    const view = key && S.turnViews.get(key);
+    if (!view) return; // A pre-start snapshot stays in reducer state until this turn is bound.
+    const diff = S.eventState.turnDiffs.get(key)?.diff || '';
+    if (!diff.trim()) {
+      if (view.diffUI) view.diffUI.el.remove();
+      view.diffUI = null;
+      return;
+    }
+    if (view.diffUI?.diff === diff) return;
+    if (!view.diffUI) {
+      const summary = h('summary', { class: 'ck-turn-diff-summary' });
+      const files = h('div', { class: 'ck-turn-diff-files' });
+      const copy = h('button', { type: 'button', class: 'ck-turn-diff-copy', text: 'Copy diff' });
+      const el = h('details', { class: 'ck-turn-diff', open: true }, summary, files, copy);
+      view.diffUI = { el, summary, files, copy, fileViews: new Map(), diff: null };
+      // A sibling of the reply body remains below later streamed text, before the footer.
+      view.el.insertBefore(el, view.footer || null);
+      copy.onclick = async () => {
+        const ui = view.diffUI;
+        if (!ui) return;
+        const fallback = () => {
+          const field = h('textarea', { style: 'position:fixed;opacity:0', 'aria-label': 'Diff to copy' });
+          field.value = ui.diff; document.body.append(field); field.select();
+          let copied = false;
+          try { copied = document.execCommand('copy'); } catch { /* expose failure below */ }
+          field.remove(); return copied;
+        };
+        let copied = false;
+        try { await navigator.clipboard.writeText(ui.diff); copied = true; } catch { copied = fallback(); }
+        copy.textContent = copied ? 'Copied' : 'Copy failed';
+        setTimeout(() => { copy.textContent = 'Copy diff'; }, 1400);
+      };
+    }
+    const ui = view.diffUI, files = turnDiffFiles(diff);
+    ui.diff = diff;
+    const add = files.reduce((n, f) => n + f.add, 0), del = files.reduce((n, f) => n + f.del, 0);
+    ui.summary.textContent = `Changes · ${files.length} ${files.length === 1 ? 'file' : 'files'} · +${add} −${del}`;
+    const next = new Map(), occurrences = new Map();
+    ui.files.replaceChildren(...files.map((file, index) => {
+      const occurrence = occurrences.get(file.path) || 0;
+      occurrences.set(file.path, occurrence + 1);
+      const identity = JSON.stringify([file.path, occurrence]);
+      let fold = ui.fileViews.get(identity);
+      if (!fold) fold = h('details', { class: 'ck-turn-diff-file', open: index === 0 }, h('summary'), h('pre', { class: 'ck-turn-diff-code' }));
+      fold.firstChild.textContent = `${file.path} · +${file.add} −${file.del}`;
+      let inHunk = false;
+      fold.lastChild.replaceChildren(...file.lines.map(line => {
+        if (line.startsWith('@@')) inHunk = true;
+        return h('span', {
+          class: 'ck-turn-diff-line' + (line.startsWith('@@') ? ' is-hunk' : inHunk && line.startsWith('+') ? ' is-add' : inHunk && line.startsWith('-') ? ' is-del' : ''), text: line + '\n'
+        });
+      }));
+      next.set(identity, fold); return fold;
+    }));
+    ui.fileViews = next;
+    stick();
+  }
 
   // ── text blocks ────────────────────────────────────────────────────────
 
@@ -642,6 +749,7 @@
   }
 
   function addCard(req) {
+    if (req.kind) { addNativeCard(req); return; }
     closeRun();
     const [level, risk] = riskOf(req);
     const always = alwaysChoice(req);
@@ -1667,7 +1775,7 @@
     evT = 0;
     closeRun();
     for (const th of S.thinks.values()) endThink(th);
-    S.busy = false; S.thinking = false;
+    S.busy = false; S.thinking = false; S.buffering = false;
     const done = h('div', { class: 'ck-resumed', text: `Resumed${S.resumeTitle ? ' “' + S.resumeTitle + '”' : ''} · you can continue below` });
     S.log.append(done);
     S.turn = null;
@@ -1678,19 +1786,22 @@
   // ── status line + composer ─────────────────────────────────────────────
 
   function updateStatus() {
-    const waiting = S.cards.size > 0;
+    const waiting = [...S.cards.values()].some(card => card.req.blocking !== false);
     let text = 'Ready', state = 'idle';
-    if (waiting) { text = 'Waiting for you'; state = 'waiting'; }
+    if (S.connectionClosed) { text = 'Conversation closed'; state = 'idle'; }
+    else if (waiting) { text = 'Waiting for you'; state = 'waiting'; }
+    else if (S.protocolStatus === 'systemError') { text = 'Session needs attention'; state = 'waiting'; }
     else if (S.busy) {
       state = 'busy';
       const live = S.lastTool && (S.lastTool.state === 'running' || S.lastTool.state === 'preparing') ? S.lastTool : null;
-      text = live ? `${shortName(live.name)} ${live.argEl.textContent}`.trim() : S.thinking ? (S.thinkWord || 'Thinking') + '…' : 'Working';
+      text = S.buffering ? 'Preparing response…' : live ? `${shortName(live.name)} ${live.argEl.textContent}`.trim() : S.thinking ? (S.thinkWord || 'Thinking') + '…' : 'Working';
     }
     postState();
     if (!inView()) { paintView(); return; }
     statusText.textContent = text;
     statusDot.dataset.state = state;
     dock.dataset.state = state;
+    input.disabled = S.connectionClosed; sendBtn.disabled = S.connectionClosed;
     sendBtn.dataset.mode = S.busy && (!supports('midTurnInput') || !input.value.trim() && !S.refs.length) ? 'stop' : 'send';
     sendBtn.title = sendBtn.dataset.mode === 'stop' ? 'Stop (Esc)' : 'Send (Return)';
     paintView();
@@ -1858,7 +1969,7 @@
     }
     for (const id of [...S.cards.keys()]) resolveCard(id, 'cancelled');
     closeRun();
-    S.busy = false; S.thinking = false;
+    S.busy = false; S.thinking = false; S.buffering = false;
     updateStatus();
   }
 
@@ -1891,16 +2002,21 @@
   function paintTool(e) {
     if (!e.id) return;
     const row = addRow(e.id, e.name || 'Tool', e.parentId);
+    for (const [id, view] of S.surfaceViews) if (S.eventState.surfaces.get(id)?.ownerId === e.id && view.parentNode !== row.detail) row.detail.append(view);
+    const media = S.mediaViews.get(e.id); if (media && media.parentNode !== row.detail) row.detail.append(media);
     if (e.type === 'tool.input') { setRowInput(row, e.input); return; }
     if (e.type === 'tool.start') { if (e.input !== undefined) setRowInput(row, e.input); else setRowState(row, 'running'); return; }
-    const output = String(e.output == null ? '' : e.output);
+    const output = String(e.output ?? S.eventState.tools.get(e.id)?.output ?? '');
     row.t1 = clock();
+    if (row.stdinForm) row.stdinForm.querySelectorAll('input,button').forEach(el => el.disabled = true);
+    row.streamEl = null;
     for (const [cardId, card] of S.cards) if (card.req.toolUseID === row.id) resolveCard(cardId, e.isError ? 'denied' : 'allowed');
     if (row.waitStart) { row.waitMs += row.t1 - row.waitStart; row.waitStart = 0; }
     row.metaEl.textContent = metaOf(row, output, e.isError);
     const out = h('pre', { class: 'ck-out', text: output.length > 4000 ? output.slice(0, 4000) + '\n…' : output });
-    if (!row.change) row.detail.replaceChildren(out);
-    else if (e.isError) row.detail.replaceChildren(out, row.change);
+    const extras = [...row.detail.children].filter(el => el.classList.contains('ck-surface') || el.classList.contains('ck-media'));
+    if (!row.change) row.detail.replaceChildren(out, ...extras);
+    else if (e.isError) row.detail.replaceChildren(out, row.change, ...extras);
     setRowState(row, e.isError ? 'error' : 'done');
     if (row.run) paintRun(row.run);
   }
@@ -1916,7 +2032,7 @@
       S.turns_n++; S.apiMs += e.apiMs || 0;
       if (e.status !== 'success') bits.push(String(e.label || e.status).replace(/_/g, ' '));
       S.turn.footer = h('div', { class: 'ck-foot', text: bits.join(' · ') });
-      S.turn.body.append(S.turn.footer);
+      S.turn.el.append(S.turn.footer);
     }
     if (e.status === 'error' && e.message) notice('error', e.message);
     paintMeta(); stick();
@@ -1933,7 +2049,270 @@
     stick();
   }
 
+  // ── semantic event surfaces shared by live Codex and replay ────────────
+  // Event components also work before optional chat enhancements are installed.
+  function registerEventCard(req, card, opts) {
+    turn().body.append(card);
+    S.cards.set(req.id, { card, keys: {}, req, opts });
+    const row = req.toolUseID && S.rows.get(req.toolUseID);
+    if (row) { row.waitStart = clock(); setRowState(row, 'waiting'); }
+    updateStatus(); stick();
+  }
+
+  function showEventImage(image) {
+    if (typeof openLightbox === 'function') { openLightbox(image); return; }
+    const dialog = h('dialog', { class: 'ck-event-image-dialog', 'aria-label': image.name },
+      h('img', { src: image.url, alt: image.name }), h('button', { type: 'button', text: 'Close', onclick: () => dialog.close() }));
+    dialog.addEventListener('close', () => dialog.remove());
+    document.body.append(dialog); dialog.showModal();
+  }
+
+  function routeEventChild(e) {
+    const top = S;
+    let child = top.eventChildren.get(e.parentId);
+    if (!child) {
+      child = newConv(top.id + '/' + e.parentId, 'Agent');
+      child.log = h('div', { class: 'ck-event-child' });
+      const panel = h('details', { class: 'ck-surface', 'data-surface': 'agent' }, h('summary', { class: 'ck-surface-head', text: 'Agent transcript' }), child.log);
+      const owner = top.rows.get(e.parentId);
+      (owner ? owner.detail : turn().body).append(panel);
+      top.eventChildren.set(e.parentId, child);
+    }
+    S = child;
+    try { receiveOne({ ...e, parentId: null }); } finally { S = top; }
+  }
+
+  const safeLink = value => { try { const url = new URL(value); return ['http:', 'https:'].includes(url.protocol) ? url.href : null; } catch { return null; } };
+  const fieldLabel = name => String(name).replace(/([a-z])([A-Z])/g, '$1 $2').replace(/[_/]/g, ' ');
+  function eventValue(value, depth = 0) {
+    if (depth > 6) return h('span', { text: 'Further details omitted' });
+    if (value == null) return h('span', { class: 'ck-surface-muted', text: '—' });
+    if (typeof value !== 'object') {
+      const text = String(value), url = safeLink(text);
+      return url ? h('a', { href: url, target: '_blank', rel: 'noreferrer', text }) : h('span', { text });
+    }
+    if (Array.isArray(value)) return h('ul', { class: 'ck-surface-list' }, value.slice(0, 100).map(item => h('li', null, eventValue(item, depth + 1))));
+    return h('dl', { class: 'ck-surface-fields' }, Object.entries(value).filter(([,v]) => v != null).map(([key, v]) => [h('dt', { text: fieldLabel(key) }), h('dd', null, eventValue(v, depth + 1))]));
+  }
+
+  function paintPlan(e) {
+    const key = root.AgentEvents.turnKey(e.threadId, e.turnId);
+    if (key && !S.turnViews.has(key)) return;
+    paintSurface({ ...e, id: 'plan:' + (key || e.id), type: 'surface.snapshot', surface: 'plan', title: 'Plan', method: 'turn/plan/updated', data: { explanation: e.explanation, steps: e.plan } });
+    if (key && key !== S.turn?.key || !S.tasks || typeof paintTasks !== 'function') return;
+    S.tasks.list = (e.plan || []).map((step, index) => ({ id: String(index), subject: String(step.step || ''),
+      status: step.status === 'inProgress' ? 'in_progress' : step.status || 'pending' }));
+    S.tasks.explanation = e.explanation || '';
+    S.tasks.seen.clear(); S.tasks.byTool.clear();
+    paintTasks();
+  }
+
+  function paintToolStream(e) {
+    const state = S.eventState.tools.get(e.id);
+    if (!state) return;
+    const row = addRow(e.id, e.name || state.name || 'Tool', e.parentId);
+    if (e.type === 'tool.progress') { row.metaEl.textContent = state.progress; return; }
+    if (!row.streamEl) {
+      row.streamEl = h('pre', { class: 'ck-out ck-stream-output', 'aria-label': 'Live tool output' });
+      row.detail.append(row.streamEl);
+    }
+    row.streamEl.textContent = String(state.output || '') + (state.capped ? '\n[Output limit reached]' : '');
+    if (state.state === 'running') setRowState(row, 'running');
+    if (state.processHandle && !row.stdinForm) {
+      const input = h('input', { type: 'text', placeholder: 'Process input', 'aria-label': 'Process input' });
+      const submit = h('button', { type: 'submit', text: 'Send input' });
+      row.stdinForm = h('form', { class: 'ck-process-input' }, input, submit);
+      row.stdinForm.onsubmit = event => { event.preventDefault(); post({ type: 'surfaceAction', action: 'processInput', id: state.processHandle, text: input.value + '\n' }); input.value = ''; };
+      row.detail.append(row.stdinForm);
+    }
+    stick();
+  }
+
+  function paintMedia(e) {
+    let view = S.mediaViews.get(e.id);
+    if (!view) {
+      view = h('figure', { class: 'ck-media' }); S.mediaViews.set(e.id, view);
+      const row = S.rows.get(e.id);
+      (row ? row.detail : turn().body).append(view);
+    }
+    const valid = typeof e.url === 'string' && /^data:image\/(png|jpeg|gif|webp);base64,[A-Za-z0-9+/=]+$/.test(e.url);
+    const children = [valid ? h('img', { src: e.url, alt: e.caption || 'Image result', loading: 'lazy' }) : h('p', { class: 'ck-surface-muted', text: e.error || 'Image preview unavailable' }), h('figcaption', { text: e.caption || e.path || 'Image' })];
+    if (e.path) children.push(h('button', { type: 'button', text: 'Reveal image', onclick: () => post({ type: 'reveal', path: e.path }) }));
+    if (valid) children.push(h('button', { type: 'button', text: 'View image', onclick: () => showEventImage({ url: e.url, name: e.path || e.caption || 'Image' }) }));
+    view.replaceChildren(...children); stick();
+  }
+
+  function paintSurface(e) {
+    if (e.clear) {
+      for (const [id, view] of S.surfaceViews) if (view.dataset.surface === e.surface) { view.remove(); S.surfaceViews.delete(id); }
+      return;
+    }
+    const entry = S.eventState.surfaces.get(e.id) || e, data = entry.data || {};
+    let view = S.surfaceViews.get(e.id);
+    if (!view) {
+      view = h('details', { class: 'ck-surface ck-event-' + e.surface, 'data-surface': e.surface }, h('summary', { class: 'ck-surface-head' }), h('div', { class: 'ck-surface-content' }));
+      S.surfaceViews.set(e.id, view);
+      const owner = e.ownerId && S.rows.get(e.ownerId);
+      const owningTurn = root.AgentEvents.turnKey(e.threadId, e.turnId);
+      const target = owningTurn && S.turnViews.get(owningTurn);
+      if (owner) owner.detail.append(view);
+      else if (e.placement === 'session') {
+        if (!S.surfaceRoot) { S.surfaceRoot = h('section', { class: 'ck-session-surfaces', 'aria-label': 'Conversation status and details' }); S.log.prepend(S.surfaceRoot); }
+        S.surfaceRoot.append(view);
+      } else (target || turn()).body.append(view);
+    }
+    const state = typeof data.status === 'string' ? data.status : data.status?.type || data.item?.status || data.run?.status || '';
+    view.firstChild.textContent = (e.title || fieldLabel(e.surface)) + (state ? ' · ' + state : '');
+    const body = view.lastChild;
+    if (e.surface === 'goal' && data.goal) {
+      const goal = data.goal;
+      body.replaceChildren(...[h('p', { class: 'ck-surface-title', text: goal.objective || 'Goal' }),
+        h('p', { class: 'ck-surface-muted', text: `${goal.status || 'active'} · ${goal.tokensUsed || 0} tokens · ${goal.timeUsedSeconds || 0}s` }),
+        goal.tokenBudget > 0 ? h('progress', { value: goal.tokensUsed || 0, max: goal.tokenBudget, 'aria-label': 'Goal token budget' }) : null,
+        eventValue({ tokenBudget: goal.tokenBudget, tokensUsed: goal.tokensUsed })].filter(Boolean));
+    } else if (e.surface === 'queue' && Array.isArray(data.data)) {
+      body.replaceChildren(...data.data.map(item => h('div', { class: 'ck-queue-item' }, h('p', { text: (item.input || []).filter(p => p.type === 'text').map(p => p.text).join('\n') || 'Queued message' }),
+        h('button', { type: 'button', text: 'Start now', onclick: () => post({ type: 'surfaceAction', action: 'queueStart', id: item.id }) }),
+        h('button', { type: 'button', text: 'Remove', onclick: () => post({ type: 'surfaceAction', action: 'queueRemove', id: item.id }) }))));
+      if (!data.data.length) body.append(h('p', { class: 'ck-surface-muted', text: 'No queued messages' }));
+    } else if (e.surface === 'realtime') {
+      if (e.method.includes('transcript')) {
+        if (view.transcriptDone && !e.method.endsWith('/done')) view.transcript = '';
+        view.transcript ||= '';
+        view.transcriptDone = e.method.endsWith('/done');
+        view.transcript = e.method.endsWith('/done') ? data.text || '' : (view.transcript + (e.data?.delta || '')).slice(-64000);
+        body.replaceChildren(h('p', { text: (data.role ? data.role + ': ' : '') + view.transcript }));
+      } else body.replaceChildren(eventValue(data));
+      if (!e.method.endsWith('/closed')) body.append(h('button', { type: 'button', text: 'End voice session', onclick: () => post({ type: 'surfaceAction', action: 'realtimeStop' }) }));
+    } else body.replaceChildren(eventValue(data));
+    if (e.surface === 'status' && e.method === 'thread/status/changed') {
+      S.protocolStatus = state; S.busy = state === 'active'; updateStatus();
+    }
+    if (e.method === 'model/rerouted' && data.toModel) { S.model = data.toModel; paintMeta(); }
+    if (e.method === 'model/safetyBuffering/updated') { S.buffering = !!data.showBufferingUi; updateStatus(); }
+    if (e.method === 'thread/closed' || e.method === 'thread/deleted') { S.connectionClosed = true; settleLive('cancelled'); updateStatus(); }
+    if (e.method === 'thread/started') { S.connectionClosed = false; updateStatus(); }
+    stick();
+  }
+
+  function addNativeCard(req) {
+    const existing = S.cards.get(req.id);
+    if (existing) { existing.card.remove(); S.cards.delete(req.id); }
+    const data = req.input || {}, fields = [], questions = [];
+    const body = h('div', { class: 'ck-native-fields' });
+    const opts = h('div', { class: 'ck-opts' });
+    const title = req.kind === 'questions' ? 'Codex needs your input' : req.kind === 'permissions' ? 'Grant permissions?' : req.kind === 'elicitation' ? `${data.serverName || 'MCP server'} needs input` : req.toolName;
+    const card = h('div', { class: 'ck-card ck-native-card', 'data-kind': req.kind }, h('h3', { class: 'ck-card-title', text: title }),
+      req.decisionReason ? h('p', { class: 'ck-why', text: req.decisionReason }) : null, body, opts);
+    const respond = (response, decision) => {
+      if (card.dataset.done) return;
+      if (decision !== 'deny' && !form.reportValidity()) return;
+      card.dataset.done = '1';
+      post({ type: 'permission', id: req.id, decision, response });
+      form.querySelectorAll('input,select,textarea,button').forEach(el => { if (el.type === 'password') el.value = ''; el.disabled = true; });
+      resolveCard(req.id, decision === 'deny' ? 'denied' : 'allowed');
+    };
+    const form = h('form', null, body, opts); card.append(form);
+    const button = (text, callback, validate = true) => {
+      const b = h('button', { type: 'button', class: 'ck-opt', text });
+      b.onclick = () => { if (!validate) { for (const field of fields) field.required = false; } callback(); }; opts.append(b);
+    };
+    if (req.kind === 'questions') {
+      for (const [index, q] of (data.questions || []).entries()) {
+        const fieldset = h('fieldset', { class: 'ck-native-question' }, h('legend', { text: q.question || q.header || 'Question' }));
+        const choices = [];
+        for (const [choiceIndex, choice] of (q.options || []).entries()) {
+          const input = h('input', { type: 'radio', name: req.id + '-' + index, value: choice.label });
+          if (choiceIndex === 0) input.checked = true;
+          choices.push(input);
+          fieldset.append(h('label', { class: 'ck-native-choice' }, input, h('span', null, h('strong', { text: choice.label }), choice.description ? h('small', { text: choice.description }) : null)));
+        }
+        const text = h('input', { type: q.isSecret ? 'password' : 'text', placeholder: choices.length ? 'Or enter your own answer' : 'Your answer', 'aria-label': q.question || q.header || 'Answer', autocomplete: 'off' });
+        if (!choices.length) text.required = true;
+        fields.push(text); questions.push({ q, text, choices }); fieldset.append(text); body.append(fieldset);
+      }
+      button('Send answers', () => {
+        const answers = Object.fromEntries(questions.map(({q,text,choices}) => [q.id, { answers: [text.value.trim() || choices.find(c=>c.checked)?.value || ''] }]));
+        respond({ answers }, 'allow');
+      });
+      button('Skip', () => respond({ answers: Object.fromEntries(questions.map(({q}) => [q.id,{answers:[]}])) }, 'deny'), false);
+    } else if (req.kind === 'permissions') {
+      body.append(eventValue(data.permissions || {}));
+      const scope = h('select', { 'aria-label': 'Permission duration' }, h('option', { value: 'turn', text: 'This turn' }), h('option', { value: 'session', text: 'This session' }));
+      body.append(h('label', null, 'Grant duration ', scope));
+      button('Grant requested permissions', () => respond({ scope: scope.value }, 'allow'));
+      button('Decline', () => respond({ scope: 'turn' }, 'deny'), false);
+    } else if (req.kind === 'elicitation') {
+      if (data.mode === 'url') {
+        const url = safeLink(data.url); body.append(h('p', { text: data.message || 'Continue in the linked service.' }));
+        if (url) body.append(h('a', { href: url, target: '_blank', rel: 'noreferrer', text: 'Open service ↗' }));
+        button('Completed in service', () => respond({ action: 'accept' }, 'allow'));
+      } else if (data.mode === 'openai/userVerification') {
+        body.append(h('p', { text: 'Device verification is unavailable in this host. Use the service’s supported verification client.' }));
+      } else {
+        const schema = data.requestedSchema || {}, values = [];
+        let unsupported = false;
+        for (const [key, property] of Object.entries(schema.properties || {})) {
+          let input;
+          const options = property.oneOf || property.items?.anyOf;
+          const enums = property.enum || property.items?.enum;
+          if (options || enums) {
+            input = h('select', null, (options || enums).map((value, index) => h('option', { value: options ? value.const : value, text: options ? value.title : property.enumNames?.[index] || String(value) })));
+            if (property.type === 'array') input.multiple = true;
+          } else if (['string','boolean','number','integer'].includes(property.type)) {
+            input = h('input', { type: property.type === 'boolean' ? 'checkbox' : ['number','integer'].includes(property.type) ? 'number' : ({ email:'email',uri:'url',date:'date' })[property.format] || 'text' });
+            if (property.type === 'number') input.step = 'any';
+          } else { unsupported = true; body.append(h('p', { text: 'Unsupported field: ' + key })); continue; }
+          // Required booleans may validly be false; checkbox required would forbid that.
+          input.required = property.type !== 'boolean' && (schema.required || []).includes(key);
+          if (property.minimum != null) input.min = property.minimum;
+          if (property.maximum != null) input.max = property.maximum;
+          if (property.minLength != null) input.minLength = property.minLength;
+          if (property.maxLength != null) input.maxLength = property.maxLength;
+          if (property.default != null) {
+            if (property.type === 'boolean') input.checked = property.default;
+            else if (property.type === 'array') [...input.options].forEach(option => option.selected = property.default.includes(option.value));
+            else input.value = String(property.default);
+          }
+          fields.push(input); values.push({ key, property, input });
+          body.append(h('label', null, property.title || fieldLabel(key), input, property.description ? h('small', { text: property.description }) : null));
+        }
+        if (!unsupported) button('Submit', () => {
+          const content = {};
+          for (const { key, property, input } of values) {
+            input.setCustomValidity('');
+            let value = input.value;
+            if (property.type === 'array') {
+              value = [...input.selectedOptions].map(option => option.value);
+              if (value.length < (property.minItems || 0) || (property.maxItems != null && value.length > property.maxItems)) input.setCustomValidity('Select the requested number of options.');
+            } else if (property.type === 'boolean') value = input.checked;
+            else if (['number','integer'].includes(property.type)) {
+              if (!value && !input.required) continue;
+              value = Number(value);
+            } else if (!value && !input.required) continue;
+            content[key] = value;
+          }
+          respond({ action: 'accept', content }, 'allow');
+        });
+      }
+      button('Decline', () => respond({ action: 'decline' }, 'deny'), false);
+      button('Cancel', () => respond({ action: 'cancel' }, 'deny'), false);
+    } else {
+      body.append(eventValue(data));
+      for (const decision of data.availableDecisions || ['accept','acceptForSession','decline','cancel']) {
+        const key = typeof decision === 'string' ? decision : Object.keys(decision)[0];
+        const label = ({ accept:'Allow once',acceptForSession:'Allow for session',decline:'Decline',cancel:'Cancel',acceptWithExecpolicyAmendment:'Allow and apply command policy',applyNetworkPolicyAmendment:'Apply offered network policy' })[key] || fieldLabel(key);
+        button(label, () => respond({ decision }, ['decline','cancel'].includes(key) ? 'deny' : 'allow'));
+      }
+    }
+    form.onsubmit = event => event.preventDefault();
+    if (typeof registerCard === 'function') registerCard(req, card, {}, opts);
+    else registerEventCard(req, card, opts);
+  }
+
+
   function receiveOne(e) {
+    if (e.parentId && !e.type.startsWith('approval.')) { routeEventChild(e); return; }
     root.AgentEvents.reduce(S.eventState, e);
     switch (e.type) {
       case 'session': {
@@ -1946,7 +2325,12 @@
         if (e.terminalCommands) SHARED.terminalCmds = new Set(e.terminalCommands);
         paintMeta(); paintContext(); break;
       }
-      case 'turn.start': S.busy = true; updateStatus(); break;
+      case 'turn.start': bindTurn(e); S.busy = true; updateStatus(); break;
+      case 'turn.diff.snapshot': paintTurnDiff(e); break;
+      case 'plan.snapshot': paintPlan(e); break;
+      case 'tool.output.delta': case 'tool.progress': paintToolStream(e); updateStatus(); break;
+      case 'surface.snapshot': paintSurface(e); break;
+      case 'media.snapshot': paintMedia(e); break;
       case 'turn.end':
         if (e.local) { settleLive(e.status); paintMeta(); }
         else onTurnEnd(e);

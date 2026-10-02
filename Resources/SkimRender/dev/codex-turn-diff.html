@@ -1,0 +1,42 @@
+<!doctype html><html lang="en" class="no-motion"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Turn Changes · actual renderer</title>
+<link rel="stylesheet" href="../fonts.css"><link rel="stylesheet" href="../skim.css"><link rel="stylesheet" href="../chat.css">
+<style>:root{--sk-top:72px}.diff-controls{position:fixed;top:0;left:0;right:0;z-index:20;background:var(--bg);padding:12px 16px;border-bottom:1px solid var(--line-2);display:flex;flex-wrap:wrap;gap:8px;align-items:center;font-size:12px}.diff-controls button{background:var(--surface);color:var(--text);border:1px solid var(--line-3);border-radius:5px;padding:5px 9px;cursor:pointer}.diff-controls a{margin-left:auto}@media(max-width:600px){:root{--sk-top:120px}}</style></head><body>
+<header class="diff-controls"><span>Actual Changes renderer · synthetic events</span><button id="replace">Replace first diff</button><button id="clear">Clear first diff</button><button onclick="location.reload()">Reset</button><a href="codex-ui-preview/#turn-diff">Component lab ↗</a></header>
+<script src="../vendor/marked.min.js"></script><script src="../vendor/purify.min.js"></script><script src="../vendor/highlight.min.js"></script><script src="../skim-classify.js"></script><script src="../skim-render.js"></script><script src="../agent-events.js"></script><script src="../agent-claude.js"></script><script src="../agent-codex.js"></script><script src="../chat.js"></script>
+<script>
+window.webkit = { messageHandlers: { skim: { postMessage: () => {} } } };
+const event = (type,fields={}) => ({v:1,agent:'codex',type,t:Date.now(),raw:{synthetic:true},...fields});
+const feed = (...events) => AgentChat.receive(events);
+const diff = text => 'diff --git a/src/events.ts b/src/events.ts\n--- a/src/events.ts\n+++ b/src/events.ts\n@@ -12,1 +12,2 @@\n-  output += delta;\n+  '+text+'\n+  paintOutput(itemId);\n';
+const update = (turnId,value) => feed(event('turn.diff.snapshot',{threadId:'diff-thread',turnId,diff:value}));
+const checks=[];const check=(name,pass)=>{checks.push({name,pass:!!pass});if(!pass)console.error(name);};
+AgentChat.boot({agent:'codex',cwd:'/workspace/floatyterm',home:'/workspace'});
+feed(event('session',{sessionId:'diff-thread'}));
+AgentChat.showUser('Make command output render as it arrives.');
+feed(event('turn.start',{threadId:'diff-thread',turnId:'first'}));
+update('first',diff('streams.get(itemId).append(delta);'));
+feed(event('content.snapshot',{id:'reply-first',kind:'text',text:'Command output now updates its owning tool row.',final:true}));
+const first=document.querySelector('.ck-turn');const fold=first.querySelector('.ck-turn-diff');
+check('Changes remain below reply even when diff arrives before text',first.lastChild===fold && !!first.querySelector('.ck-body .ck-text'));
+fold.open=false;const file=fold.querySelector('.ck-turn-diff-file');file.open=false;
+update('first',diff('streams.get(itemId).append(latestDelta);'));
+check('Snapshot replaces the same fold and preserves expansion',first.querySelectorAll('.ck-turn-diff').length===1 && first.querySelector('.ck-turn-diff')===fold && !fold.open && !file.open);
+check('Replacement removes previous diff text',fold.textContent.includes('latestDelta')&&!fold.textContent.includes('append(delta)'));
+feed(event('turn.end',{threadId:'diff-thread',turnId:'first',status:'success',durationMs:8400}));
+check('Footer follows Changes',first.lastChild.classList.contains('ck-foot'));
+AgentChat.showUser('Show another turn with its own changes.');
+update('second',diff('renderItem(itemId);'));
+feed(event('turn.start',{threadId:'diff-thread',turnId:'second'}),event('content.snapshot',{id:'reply-second',kind:'text',text:'The next turn has its own Changes fold.',final:true}),event('turn.end',{status:'success'}));
+const second=document.querySelectorAll('.ck-turn')[1];
+check('Pre-start snapshot attaches when its turn starts',!!second.querySelector('.ck-turn-diff'));
+update('first',diff('lateUpdateForFirstTurn();'));
+check('Late snapshot updates only the owning historical turn',first.textContent.includes('lateUpdateForFirstTurn')&&!second.textContent.includes('lateUpdateForFirstTurn'));
+update('first','');check('Empty snapshot clears only its own Changes fold',!first.querySelector('.ck-turn-diff')&&!!second.querySelector('.ck-turn-diff'));
+update('first',diff('<img src=x onerror=alert(1)>'));
+check('Diff is rendered as text, never HTML',!first.querySelector('.ck-turn-diff img')&&first.textContent.includes('<img src=x'));
+update('first',diff('streams.get(itemId).append(latestDelta);'));
+check('No unrecognized event entry is generated',!document.querySelector('.ck-unknown'));
+window.__testResults={passed:checks.filter(c=>c.pass).length,failed:checks.filter(c=>!c.pass).length,results:checks};
+document.getElementById('replace').onclick=()=>update('first',diff('streams.get(itemId).append(replacement);'));
+document.getElementById('clear').onclick=()=>update('first','');
+</script></body></html>

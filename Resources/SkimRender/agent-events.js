@@ -3,7 +3,7 @@
   'use strict';
   const VERSION = 1;
   const factories = new Map();
-  const controls = new Set(['capabilities', 'model', 'mode', 'effort', 'git', 'sessions', 'history', 'thinking', 'usage']);
+  const controls = new Set(['capabilities', 'model', 'mode', 'effort', 'git', 'sessions', 'history', 'thinking', 'usage', 'files', 'title', 'rewind', 'btw']);
   function envelope(agent, raw, event) {
     return { ...event, v: VERSION, agent, t: raw.t || 0, raw };
   }
@@ -32,13 +32,44 @@
     };
   }
   function createState() {
-    return { sessionId: null, busy: false, status: 'idle', blocks: new Map(), tools: new Map(), approvals: new Map(), unknown: [] };
+    return { sessionId: null, busy: false, status: 'idle', blocks: new Map(), tools: new Map(), approvals: new Map(), turnDiffs: new Map(), plans: new Map(), surfaces: new Map(), media: new Map(), unknown: [] };
   }
+  const turnKey = (threadId, turnId) => threadId != null && turnId != null ? JSON.stringify([String(threadId), String(turnId)]) : null;
   function reduce(state, e) {
     if (e.v !== VERSION) throw new Error('Unsupported agent event version: ' + e.v);
     switch (e.type) {
       case 'session': state.sessionId = e.sessionId || state.sessionId; break;
       case 'turn.start': state.busy = true; state.status = 'running'; break;
+      case 'plan.snapshot': state.plans.set(turnKey(e.threadId, e.turnId), e); break;
+      case 'surface.snapshot': {
+        if (e.clear) {
+          for (const [key, value] of state.surfaces) if (value.surface === e.surface && value.threadId === e.threadId) state.surfaces.delete(key);
+        } else {
+          const previous = state.surfaces.get(e.id);
+          state.surfaces.set(e.id, { ...e, data: previous?.method === e.method ? e.data : { ...previous?.data, ...e.data } });
+        }
+        break;
+      }
+      case 'media.snapshot': state.media.set(e.id, e); break;
+      case 'tool.output.delta': case 'tool.progress': {
+        const tool = state.tools.get(e.id) || { id: e.id, name: e.name || 'Tool', state: 'running' };
+        if (e.type === 'tool.output.delta') {
+          const stream = e.stream || 'stdout';
+          tool.streams ||= {};
+          const appended = (tool.streams[stream] || '') + (e.text || '');
+          tool.capped = tool.capped || appended.length > 256 * 1024;
+          tool.streams[stream] = appended.slice(-256 * 1024);
+          tool.output = Object.entries(tool.streams).map(([name, text]) => name === 'stdout' ? text : '[' + name + ']\n' + text).join('\n');
+          tool.capped = tool.capped || !!e.capped;
+          if (e.processHandle) tool.processHandle = e.processHandle;
+        } else tool.progress = e.message || '';
+        state.tools.set(e.id, tool); break;
+      }
+      case 'turn.diff.snapshot': {
+        const key = turnKey(e.threadId, e.turnId);
+        if (key) state.turnDiffs.set(key, { threadId: e.threadId, turnId: e.turnId, diff: typeof e.diff === 'string' ? e.diff : '' });
+        break;
+      }
       case 'content.start': case 'content.delta': case 'content.snapshot': case 'content.end': {
         let block = state.blocks.get(e.id);
         if (!block) {
@@ -57,7 +88,8 @@
         if (e.name) tool.name = e.name;
         if (e.input !== undefined) tool.input = e.input;
         if (e.type === 'tool.result') {
-          tool.output = e.output; tool.state = e.isError ? 'error' : 'done';
+          if (e.output !== undefined) tool.output = e.output;
+          tool.state = e.isError ? 'error' : 'done';
           for (const [id, request] of state.approvals) if (request.toolUseID === e.id) state.approvals.delete(id);
         }
         else state.busy = true;
@@ -85,7 +117,7 @@
     }
     return state;
   }
-  const api = { VERSION, envelope, createNormalizer, createState, reduce, register: (name, factory) => factories.set(name, factory) };
+  const api = { VERSION, envelope, createNormalizer, createState, reduce, turnKey, register: (name, factory) => factories.set(name, factory) };
   root.AgentEvents = api;
   if (typeof module !== 'undefined' && module.exports) module.exports = api;
 })(typeof globalThis !== 'undefined' ? globalThis : this);
