@@ -36,9 +36,7 @@ final class ChromeNetwork {
             return ["error": "nothing is recording for label '\(label)'",
                     "hint": "run `floaty net start --label \(label)` first"]
         }
-        lock.lock()
-        let existing = tabs[key]
-        lock.unlock()
+        let existing = lock.withLock { tabs[key] }
         if let existing {
             return ["error": "Chrome is already recording for '\(label)'",
                     "tabId": existing.tabId, "url": existing.url]
@@ -53,7 +51,7 @@ final class ChromeNetwork {
             let tab = Tab(tabId: tabId, label: label,
                           url: result["url"] as? String ?? "",
                           title: result["title"] as? String ?? "")
-            lock.lock(); tabs[key] = tab; lock.unlock()
+            lock.withLock { tabs[key] = tab }
             return ["attached": true, "tabId": tabId, "url": tab.url, "title": tab.title,
                     "note": "Chrome shows an \"is debugging this browser\" banner while recording. Dismissing it ends the recording."]
         } catch {
@@ -65,9 +63,7 @@ final class ChromeNetwork {
     /// everything. Returns nil when Chrome was never part of this session.
     func stop(label: String) async -> [String: Any]? {
         let key = DevtoolsRelay.sanitize(label)
-        lock.lock()
-        let tab = tabs.removeValue(forKey: key)
-        lock.unlock()
+        let tab = lock.withLock { tabs.removeValue(forKey: key) }
         guard let tab else { return nil }
 
         do {

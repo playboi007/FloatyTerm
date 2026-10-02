@@ -87,14 +87,14 @@ final class DartVMNetwork {
                         "hint": "dart:io HTTP profiling exists only in DEBUG/PROFILE builds — a release build cannot be recorded this way"]
             }
 
-            lock.lock()
-            self.client = client
-            self.attachedURI = url.absoluteString
-            self.label = label
-            self.emitted = []
-            self.enabledIsolates = Set(enabled)
-            self.requestCount = 0
-            lock.unlock()
+            lock.withLock {
+                self.client = client
+                self.attachedURI = url.absoluteString
+                self.label = label
+                self.emitted = []
+                self.enabledIsolates = Set(enabled)
+                self.requestCount = 0
+            }
 
             let interval = max(0.2, min(poll, 10))
             pollTask = Task { [weak self] in await self?.loop(every: interval) }
@@ -117,15 +117,13 @@ final class DartVMNetwork {
     func detach() async -> [String: Any] {
         pollTask?.cancel()
         pollTask = nil
-        lock.lock()
-        let client = self.client
-        let isolates = enabledIsolates
-        let count = requestCount
-        let uri = attachedURI
-        self.client = nil
-        self.attachedURI = nil
-        self.enabledIsolates = []
-        lock.unlock()
+        let (client, isolates, count, uri) = lock.withLock {
+            let taken = (self.client, enabledIsolates, requestCount, attachedURI)
+            self.client = nil
+            self.attachedURI = nil
+            self.enabledIsolates = []
+            return taken
+        }
 
         guard let client else { return ["attached": false] }
         for id in isolates {
@@ -153,7 +151,7 @@ final class DartVMNetwork {
         while !Task.isCancelled {
             try? await Task.sleep(nanoseconds: UInt64(interval * 1_000_000_000))
             if Task.isCancelled { return }
-            lock.lock(); let client = self.client; let isolates = enabledIsolates; lock.unlock()
+            let (client, isolates) = lock.withLock { (self.client, enabledIsolates) }
             guard let client else { return }
 
             for isolateId in isolates {
@@ -181,11 +179,11 @@ final class DartVMNetwork {
         guard let vm = try? await client.call("getVM", [:]),
               let isolates = vm["isolates"] as? [[String: Any]] else { return }
         let live = Set(isolates.compactMap { $0["id"] as? String })
-        lock.lock(); let known = enabledIsolates; lock.unlock()
+        let known = lock.withLock { enabledIsolates }
         for id in live.subtracting(known) where await Self.enableLogging(client, isolateId: id) {
-            lock.lock(); enabledIsolates.insert(id); lock.unlock()
+            lock.withLock { _ = enabledIsolates.insert(id) }
         }
-        lock.lock(); enabledIsolates.formIntersection(live); lock.unlock()
+        lock.withLock { enabledIsolates.formIntersection(live) }
     }
 
     /// Emits one profile entry, once, when both halves have finished. Fetches
@@ -198,7 +196,7 @@ final class DartVMNetwork {
         // both collectors running would fill up with itself, each entry
         // containing the entry it was reporting.
         if let uri = (ref["uri"] ?? ref["url"]) as? String, Self.isRelay(uri) {
-            lock.lock(); emitted.insert(id); lock.unlock()
+            lock.withLock { _ = emitted.insert(id) }
             return
         }
         let requestDone = (ref["requestInProgress"] as? NSNumber)?.boolValue != true
@@ -208,12 +206,14 @@ final class DartVMNetwork {
         let errored = ref["request"].flatMap { ($0 as? [String: Any])?["error"] } != nil
         guard (requestDone && responseDone) || errored else { return }
 
-        lock.lock()
-        if emitted.contains(id) { lock.unlock(); return }
-        emitted.insert(id)
-        requestCount += 1
-        let label = self.label
-        lock.unlock()
+        // nil: another poll already emitted it.
+        let claimed: String? = lock.withLock {
+            if emitted.contains(id) { return nil }
+            emitted.insert(id)
+            requestCount += 1
+            return self.label
+        }
+        guard let label = claimed else { return }
 
         let full = (try? await client.call("ext.dart.io.getHttpProfileRequest",
                                            ["isolateId": isolateId, "id": id])) ?? ref
@@ -350,7 +350,9 @@ final class DartVMNetwork {
 /// by id, with events ignored. Kept private to this file — CDPBridge speaks a
 /// different dialect over a connection it does not own, and sharing one client
 /// between them would couple two protocols that only look alike.
-private final class VMClient {
+// Unchecked: the mutable state (pending, nextId, closed) is read and written
+// only under `lock`, and `task` is set once in connect() before any call.
+private final class VMClient: @unchecked Sendable {
 
     private let url: URL
     private let session = URLSession(configuration: .ephemeral)
@@ -395,11 +397,12 @@ private final class VMClient {
     /// answering (a paused isolate, a suspended app) cannot wedge the poll
     /// loop forever.
     func call(_ method: String, _ params: [String: Any]) async throws -> [String: Any] {
-        lock.lock()
-        if closed { lock.unlock(); throw VMError.closed }
-        nextId += 1
-        let id = nextId
-        lock.unlock()
+        let id: Int? = lock.withLock {
+            if closed { return nil }
+            nextId += 1
+            return nextId
+        }
+        guard let id else { throw VMError.closed }
 
         var message: [String: Any] = ["jsonrpc": "2.0", "id": id, "method": method]
         if !params.isEmpty { message["params"] = params }

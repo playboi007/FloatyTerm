@@ -291,10 +291,11 @@ final class NetworkRecordingHUD {
             stack.trailingAnchor.constraint(equalTo: content.trailingAnchor),
         ])
 
+        let originKey = Self.originKey   // read here: the observer's closure is not main-actor isolated
         moveObserver = NotificationCenter.default.addObserver(
             forName: NSWindow.didMoveNotification, object: panel, queue: .main) { [weak panel] _ in
             guard let origin = panel?.frame.origin else { return }
-            UserDefaults.standard.set(NSStringFromPoint(origin), forKey: Self.originKey)
+            UserDefaults.standard.set(NSStringFromPoint(origin), forKey: originKey)
         }
     }
 
