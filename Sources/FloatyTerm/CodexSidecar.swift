@@ -83,7 +83,7 @@ final class CodexSidecar: AgentSidecar {
         do { try p.run() } catch { throw StartError.launch(error) }
         process = p
         input = stdin.fileHandleForWriting
-        var start: [String: Any] = ["type": "start", "cwd": cwd, "codexPath": codex]
+        var start: [String: Any] = ["type": "start", "cwd": cwd, "codexPath": codex, "hostTools": true, "nativeAudio": true]
         if let resume { start["resume"] = resume }
         if fork { start["fork"] = true }
         if let model { start["model"] = model }

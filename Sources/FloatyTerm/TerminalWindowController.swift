@@ -1319,6 +1319,16 @@ final class TerminalWindowController: NSObject, NSWindowDelegate {
             ?? NSHomeDirectory()
         let tab = ClaudeChatController(cwd: cwd, agent: agent)
         tab.onOpenTUI = { [weak self] dir, sessionID in self?.openAgentTUI(in: dir, sessionID: sessionID, agent: agent) }
+        tab.onOpenHostFile = { [weak self] url in
+            guard let self else { return false }
+            if let viewer = MarkdownViewerController(path: url.path) {
+                self.installSimpleTab(viewer); return true
+            }
+            if let viewer = ImageViewerController(path: url.path) {
+                self.installSimpleTab(viewer); return true
+            }
+            return false
+        }
         // /exit or /quit in the tab closes it.
         tab.onTerminated = { [weak self, weak tab] in
             guard let self, let tab,

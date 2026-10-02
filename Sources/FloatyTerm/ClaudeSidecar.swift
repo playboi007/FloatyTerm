@@ -83,6 +83,9 @@ final class ClaudeSidecar {
     /// `fork`: with `resume`, start a new session from a copy of that one's
     /// transcript (a side chat) instead of continuing it.
     /// `thinking`: show thinking summaries (true/false); nil follows the user's settings.
+    /// Extra fields for the next start message only (a rewind's `resumeAt` and `dropsTurn`).
+    var startExtras: [String: Any] = [:]
+
     func start(cwd: String, resume: String? = nil, fork: Bool = false, permissionMode: String? = nil,
                model: String? = nil, effort: String? = nil, thinking: Bool? = nil) throws {
         guard let dir = Self.directory else { throw StartError.missingSidecar }
@@ -130,6 +133,9 @@ final class ClaudeSidecar {
         if let model { start["model"] = model }
         if let effort { start["effort"] = effort }
         if let thinking { start["thinking"] = thinking }
+        // One start only (a rewind's cut-back point): used, then cleared.
+        for (k, v) in startExtras { start[k] = v }
+        startExtras = [:]
         send(start)
     }
 

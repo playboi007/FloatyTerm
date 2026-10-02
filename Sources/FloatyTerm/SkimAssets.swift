@@ -145,7 +145,7 @@ extension SkimAssets {
     /// runs once the document has parsed; events arrive later through
     /// `AgentChat.receive`.
     static func chatDocument(cwd: String, intro: String? = nil, agent: String = "claude") -> String {
-        let cfg: [String: Any] = ["cwd": cwd, "home": NSHomeDirectory(), "intro": intro ?? "", "agent": agent]
+        let cfg: [String: Any] = ["cwd": cwd, "home": NSHomeDirectory(), "intro": intro ?? "", "agent": agent, "voice": true]
         let json = (try? JSONSerialization.data(withJSONObject: cfg)).flatMap { String(data: $0, encoding: .utf8) } ?? "{}"
         return """
         <!DOCTYPE html>
