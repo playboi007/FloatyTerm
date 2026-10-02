@@ -1,25 +1,6 @@
-/*
- * SkimRender — draws SkimClassify blocks as DOM.
- *
- *   SkimRender.render(container, markdown, { streaming, interactive, onAction })
- *
- * Needs marked, DOMPurify and SkimClassify on the page; highlight.js and
- * mermaid are used when present. Every piece of Markdown-derived HTML goes
- * through DOMPurify before it touches the DOM — the text comes from a model,
- * and the host page may expose a bridge to native code. Our own structure is
- * built with createElement and textContent.
- *
- * Re-rendering is keyed: a block whose source did not change keeps its DOM, so
- * a streaming reply does not redraw finished diagrams or lose checklist ticks.
- *
- * `onAction({ type: 'reply', text })` fires when a control answers Claude
- * (choosing an option). Without `interactive`, those controls are hidden.
- *
- * `reveal` (a live reply): text that arrived since the last render fades in,
- * and a block that is new rises in. The block still growing is rebuilt on each
- * render, so the words still fading are wrapped again with their fade already
- * under way (a negative animation delay): the fade does not restart or stop.
- */
+/**
+ * Renders SkimClassify blocks as DOM; streaming replies update incrementally without
+ * losing state (diagrams, checklist ticks); new text fades in, new blocks rise. */
 (function (root) {
   'use strict';
 
@@ -101,8 +82,7 @@
   const copyBtn = text => { const b = h('button', { class: 'sk-icon-btn', text: 'Copy' }); b.onclick = () => copyText(text, b); return b; };
 
   // ── progressive disclosure ─────────────────────────────────────────────
-  // FloatyTerm's panel is small (about 700 × 420 pt), so a long block shows
-  // its head and folds the rest behind one "Show …" row.
+  // Small panel: fold long blocks behind "Show …" row.
   const FOLD = { keepRows: 5, keepTableRows: 6, codeLines: 16, treeRows: 12, keepKids: 2 };
 
   function moreBtn(label, onClick) {
@@ -137,8 +117,7 @@
     const bars = level => h('span', { class: 'sk-bars', 'data-level': level }, h('span'), h('span'), h('span'));
     const cards = b.options.map((o, idx) => {
       const rec = recIds.includes(o.id);
-      // In the narrow panel only the recommended option (or the first) starts
-      // open; the rest show a one-line peek — effort and pro/con counts.
+      // Recommended (or first) starts open; others show one-line peek.
       const open = rec || (!recIds.length && idx === 0);
       const peek = h('span', { class: 'sk-card-peek' },
         o.effort && o.effort.level ? bars(o.effort.level) : null,
@@ -206,8 +185,7 @@
         h('div', { class: 'sk-meter' }, h('div', { style: `width:${Math.max(p.all ? p.done / p.all * 100 : 0, p.st === 'current' ? 4 : 0)}%;background:${color(p.st)}` })),
         h('span', { class: 'sk-cap', text: `P${p.num} · ${p.done}/${p.all}` })))));
     }
-    // Only the phase in progress starts open. A plan with no status opens in
-    // full when it is short, and as an outline of titles when it is long.
+    // In-progress phase starts open; no status: full if short, outline if long.
     const totalSteps = phases.reduce((n, p) => n + p.all, 0);
     const startsOpen = (p, i) => b.hasStatus ? p.st === 'current' : (totalSteps <= 10 || i === 0);
     wrap.append(h('div', { class: 'sk-track' }, phases.map((p, i) => {
@@ -258,8 +236,7 @@
     };
     apply();
     const canvas = h('div', { class: 'sk-canvas' }, pre);
-    // Shrink a wide diagram to the panel width (never below 8 px, where box
-    // characters stop reading); past that the canvas scrolls. A manual zoom wins.
+    // Shrink wide diagram to panel width (min 8px); scroll past that; manual zoom wins.
     if (typeof ResizeObserver === 'function') {
       new ResizeObserver(() => {
         if (manual || !canvas.clientWidth) return;
@@ -369,8 +346,7 @@
       if (!row.r.isDir) continue;
       row.el.onclick = () => { row.collapsed = !row.collapsed; setChev(row); refresh(); };
     }
-    // A long tree folds every nested folder that holds no changed file, so
-    // the rows marked M / A / D stay in view.
+    // Long tree: fold nested folders with no changed files; keep M/A/D in view.
     if (rows.length > FOLD.treeRows) {
       rows.forEach((row, i) => {
         if (!row.r.isDir || row.r.depth < 1) return;

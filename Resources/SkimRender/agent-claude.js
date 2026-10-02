@@ -20,7 +20,7 @@
     }
     function reset() { current = null; serial = 0; stopSeen = false; blocks.clear(); messageBlocks.clear(); confirmations.clear(); }
     const STOP_TEXT = /^\[Request interrupted by user/;
-    // Claude Code's own trace lines in a result's errors ("[ede_diagnostic] result_type=user …"): for logs, not for people.
+    // Skip Claude Code's diagnostic trace lines (for logs, not people).
     const DIAGNOSTIC = /^\[[a-z_]+_diagnostic\]/;
     function normalize(raw) {
       if (raw.type === 'permission_request') return [{ type: 'approval.request', request: raw }];
@@ -77,16 +77,13 @@
         const messageId = m.id || 'anonymous-' + ++serial;
         for (const [index, c] of (m.content || []).entries()) {
           if (msg.parent_tool_use_id && ['text', 'thinking', 'redacted_thinking'].includes(c.type)) {
-            // A subagent's words: its own transcript (a panel), never this conversation's blocks.
-            // Envelopes of one message each hold one block at index 0, so the envelope's uuid keys it.
+            // A subagent's words go to its own transcript (the panel); the envelope's uuid keys the block.
             out.push({ type: 'content.snapshot', id: 'sub:' + (msg.uuid || messageId) + ':' + index, messageId, kind: c.type === 'text' ? 'text' : 'thinking',
               redacted: c.type === 'redacted_thinking', text: c.text || c.thinking || '', final: true, parentId: msg.parent_tool_use_id });
           } else if (['text', 'thinking', 'redacted_thinking'].includes(c.type)) {
             const kind = c.type === 'text' ? 'text' : 'thinking';
             const text = c.text || c.thinking || '';
-            // SDK assistant envelopes can contain ONE completed block even when
-            // the native message had thinking, text, and tools at other indices.
-            // Match by kind/order, not the envelope's local content-array index.
+            // One block per envelope; match by kind/order, not envelope's content-array index.
             const confirmation = msg.uuid ? msg.uuid + ':' + index : null;
             const candidates = (messageBlocks.get(messageId) || []).filter(b => b.kind === kind);
             let block = confirmation && confirmations.get(confirmation);

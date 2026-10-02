@@ -1,7 +1,5 @@
-/* SkimRender — styles for the skimmable Markdown patterns.
-   Colors and spacing follow the "Markdown, made skimmable" design. The app is
-   dark-only, so there is one palette. Type: Rubik for text, JetBrains Mono for
-   code, labels and numbers. */
+/** Styles for skimmable Markdown patterns; dark-only with design tokens.
+ *  Type: Rubik (text) + JetBrains Mono (code, labels, numbers). */
 
 :root {
   color-scheme: dark;
@@ -349,8 +347,7 @@ strong { font-weight: 600; color: var(--text); }
   -webkit-mask-image: linear-gradient(#000 75%, transparent); mask-image: linear-gradient(#000 75%, transparent); }
 
 /* ── compact: the floating panel ─────────────────────────────────────────
-   FloatyTerm's panel is about 700 × 420 pt. Below 760 px wide the page trades
-   whitespace for content and folds what can wait. */
+   Below 760 px: trade whitespace for content; fold what can wait. */
 @media (max-width: 760px) {
   body { font-size: 13.5px; }
   .sk-doc { padding: var(--sk-top, 44px) 16px 40px; gap: 12px; }

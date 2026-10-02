@@ -1,19 +1,6 @@
-/*
- * SkimClassify — turns one Markdown reply into a list of typed blocks.
- *
- * Pure: markdown in, plain JSON-able objects out, no DOM. The renderer
- * (skim-render.js) draws each block kind; anything no rule claims stays a
- * plain `md` block rendered by marked, so a miss degrades to ordinary
- * Markdown, never to broken output.
- *
- * Rules classify from marked's token tree, not from raw lines, because one
- * real reply mixes many patterns. Each rule is deliberately strict: a false
- * match (a sentence styled as a finding, a random list styled as a change
- * log) reads worse than no match.
- *
- * Streaming: with { streaming: true } the last block may still be growing,
- * so it — and any group that reaches it — stays plain until it closes.
- */
+/**
+ * Parses Markdown into typed blocks (options, findings, changes, etc.) or plain
+ * blocks; misses degrade to ordinary Markdown, never broken output. */
 (function (root, factory) {
   if (typeof module === 'object' && module.exports) module.exports = factory();
   else root.SkimClassify = factory();
@@ -183,8 +170,7 @@
     const lines = src.replace(/\s+$/, '').split('\n');
     const cols = [];
     for (const l of lines) { const m = l.match(TREE_BRANCH); if (m) cols.push(m.index); }
-    // Each nesting level puts its branches in its own column, whatever the
-    // indent width, so a branch's depth is the rank of its column.
+    // Branch depth = column rank, independent of indent width.
     const distinct = [...new Set(cols)].sort((a, b) => a - b);
     const rows = [];
     for (const line of lines) {

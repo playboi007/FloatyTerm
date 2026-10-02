@@ -1,20 +1,8 @@
 import AppKit
 import WebKit
 
-/// A tab that runs an agent without its TUI: replies render as skimmable
-/// Markdown, tool calls as a live timeline, and approvals as cards (the
-/// "Markdown, made skimmable" design, `Resources/SkimRender/chat.js`).
-///
-/// `ChatAgent` selects the existing Claude SDK driver or the Codex exec driver.
-/// Both use the user's installed CLI. Native events are normalized before the
-/// shared page renders them; page actions return over the `skim` bridge.
-///
-/// "Open in TUI" hands the session to a terminal tab running `claude --resume`,
-/// and this tab stops its sidecar — two processes must not append to one
-/// session file. Sending a message here afterwards resumes it and takes it back.
-///
-/// Side chats are forks of the main session (`forkSession`), each in its own
-/// sidecar and session file, so they run next to main without touching it.
+/// A tab that runs an agent (Claude or Codex) without its TUI, on the shared SkimRender page.
+/// Side chats fork main; "Open in TUI" hands the session over, and a message here takes it back.
 final class ClaudeChatController: NSObject, TabContent, WKNavigationDelegate {
 
     let cwd: String
@@ -107,8 +95,7 @@ final class ClaudeChatController: NSObject, TabContent, WKNavigationDelegate {
     }
 
     private func receive(_ lines: [String], on ch: Channel) {
-        // Every turn starts with an init; /clear changes its session ID, and a
-        // fork's first init carries the new session's ID.
+        // Every turn starts with init; /clear or fork init changes session ID.
         var pageLines: [String] = []
         for line in lines {
             if let data = line.data(using: .utf8),
@@ -296,8 +283,7 @@ final class ClaudeChatController: NSObject, TabContent, WKNavigationDelegate {
             ch.sidecar.send(m)
         case "restartAt":
             if realtime?.channel === ch { stopRealtime() }
-            // Rewind: the conversation part. The session goes on from the entry before the dropped prompt;
-            // with none (the first prompt), a side chat forks main again and main starts a new conversation.
+            // Rewind conversation; session resumes from entry before dropped prompt.
             let at = (action["resumeAt"] as? String).flatMap { Self.isID($0) ? $0 : nil }
             let drops = (action["dropsTurn"] as? String).flatMap { Self.isID($0) ? $0 : nil }
             ch.sidecar.onExit = nil
@@ -331,8 +317,7 @@ final class ClaudeChatController: NSObject, TabContent, WKNavigationDelegate {
             (ch.sidecar.isRunning ? ch : channels.values.first { $0.sidecar.isRunning } ?? ch).sidecar.send(["type": type])
         case "resume":
             stopRealtime()
-            // /resume: main continues another conversation of this folder. Its own
-            // sidecar restarts on that session; the page draws the history it sends.
+            // /resume: continue another conversation; sidecar restarts; page draws history.
             guard ch === main, let sid = action["sessionId"] as? String, !sid.isEmpty,
                   sid.allSatisfy({ $0.isHexDigit || $0 == "-" }) else { return }
             main.sidecar.onExit = nil
@@ -459,9 +444,7 @@ final class ClaudeChatController: NSObject, TabContent, WKNavigationDelegate {
 
     // MARK: - Dropped files
 
-    /// Finder drops: each file becomes an @-mention in the composer (relative to
-    /// the session folder when inside it); image files come with their data, to
-    /// attach as images.
+    /// Finder drops: files become @-mentions (relative to session folder); images attach.
     private func dropFiles(_ urls: [URL]) {
         guard pageReady else { return }
         let base = cwd.hasSuffix("/") ? cwd : cwd + "/"
@@ -544,9 +527,8 @@ final class ClaudeChatController: NSObject, TabContent, WKNavigationDelegate {
     }
 }
 
-/// The chat tab's web view. A drag of files (from Finder) is taken here, not by
-/// WebKit, which would open the file in place of the conversation; other drags
-/// (text, links, images from a browser) go to the page as usual.
+/// Chat tab's web view: takes file drags (Finder) instead of WebKit
+/// (which would open file in place); other drags go to page as usual.
 private final class DropWebView: WKWebView {
     var onDropFiles: (([URL]) -> Void)?
 

@@ -1,13 +1,8 @@
 import AVFoundation
 import Speech
 
-/// Dictation for the chat tab's mic button: the Mac's own speech recognition,
-/// on the device when its language model is installed. (Claude Code's /voice
-/// records inside its terminal UI only, so a tab on the Agent SDK cannot use it.)
-///
-/// `start()` asks for the Speech Recognition and Microphone permissions the
-/// first time. Partial text arrives while you speak; `stop()` ends the audio,
-/// and the final text follows.
+/// Mic button dictation: device speech recognition; requests permissions on first use;
+/// partial text streams, then final text.
 final class Dictation {
     enum Event {
         case listening

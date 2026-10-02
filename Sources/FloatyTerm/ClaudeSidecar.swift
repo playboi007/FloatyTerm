@@ -1,15 +1,7 @@
 import Foundation
 
-/// Runs one Claude Code session through `Resources/ClaudeSidecar/sidecar.mjs`
-/// (Node + the Claude Agent SDK) and speaks its line protocol: one JSON object
-/// per line each way. See sidecar.mjs for the message list.
-///
-/// The SDK drives the user's own `claude` executable (`pathToClaudeCodeExecutable`),
-/// so the Claude tab and the TUI always run the same version, with the same
-/// login, settings, CLAUDE.md files, skills and hooks.
-///
-/// Output lines are delivered raw and batched per run-loop turn — a streaming
-/// reply produces hundreds of small events, and the page wants them in groups.
+/// Runs one Claude Code session (sidecar.mjs + Node.js + SDK) on line protocol;
+/// shared version, login, and settings with the TUI.
 final class ClaudeSidecar {
 
     enum StartError: Error, CustomStringConvertible {
@@ -80,12 +72,10 @@ final class ClaudeSidecar {
 
     // MARK: - Lifecycle
 
-    /// `fork`: with `resume`, start a new session from a copy of that one's
-    /// transcript (a side chat) instead of continuing it.
-    /// `thinking`: show thinking summaries (true/false); nil follows the user's settings.
     /// Extra fields for the next start message only (a rewind's `resumeAt` and `dropsTurn`).
     var startExtras: [String: Any] = [:]
 
+    /// `fork`: with `resume`, start a copy of that session (a side chat); `thinking`: nil follows the settings.
     func start(cwd: String, resume: String? = nil, fork: Bool = false, permissionMode: String? = nil,
                model: String? = nil, effort: String? = nil, thinking: Bool? = nil) throws {
         guard let dir = Self.directory else { throw StartError.missingSidecar }
@@ -179,9 +169,7 @@ final class ClaudeSidecar {
         onLines?(lines)
     }
 
-    /// The app's environment with the usual tool locations on PATH, minus the
-    /// markers of an enclosing Claude Code session (FloatyTerm may have been
-    /// launched from one) so the new session starts clean.
+    /// App environment with tool locations on PATH, minus Claude Code session markers.
     private static func environment() -> [String: String] {
         var env = ProcessInfo.processInfo.environment
         for key in env.keys where key == "CLAUDECODE" || key.hasPrefix("CLAUDE_CODE_") { env.removeValue(forKey: key) }

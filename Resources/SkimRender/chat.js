@@ -1,28 +1,5 @@
-/*
- * AgentChat — one conversation renderer for normalized agent events.
- *
- *   ClaudeChat.receive([event, …])   host → page, in order
- *   ClaudeChat.boot({ cwd })         once, before the first event
- *
- * Page → host goes through `skim` bridge actions:
- *   { type: 'send', text, images? } · { type: 'permission', id, decision, message?, updatedInput?, updatedPermissions? }
- *   { type: 'files', query, id }  (@-mention suggestions)
- *   { type: 'interrupt' } · { type: 'setPermissionMode', mode } · { type: 'openTUI' }
- *   { type: 'setModel', model } · { type: 'setEffort', effort } · { type: 'usage', plan? }
- *   { type: 'state', busy, waiting }  (for the tab's attention dot)
- *
- * Replies render through SkimRender as they stream. Tool calls gather into
- * activity groups — one per run of calls between two pieces of text — drawn
- * as the design's timeline and folded to one summary line once the run ends.
- * Approval requests become cards in the flow; answered cards collapse to one
- * line and cannot be undone (the tool may already have run).
- *
- * The dock at the bottom holds the task list (when the agent keeps one), the
- * status line (model menu, permission-mode menu, a usage chip that opens the
- * usage panel, TUI hand-off) and the composer, which suggests slash commands
- * and their arguments as you type, and @-mentions of files and subagents.
- * Images arrive by paste or drop and go with the next message.
- */
+/** AgentChat: one conversation page for normalized agent events (Claude or Codex):
+ *  streamed replies, tool calls, approvals, side chats, and the dock with its composer. */
 (function (root) {
   'use strict';
 
@@ -68,10 +45,7 @@
   };
 
   /**
-   * One conversation: main, or a side chat forked from it. Unset fields read
-   * through to SHARED. Events are processed against their own conversation;
-   * only the one in view paints the dock.
-   */
+   * One conversation (main or side chat); events paint the dock only when in view. */
   function newConv(id, label) {
     return Object.assign(Object.create(SHARED), {
       id, label, log: null,
@@ -119,12 +93,10 @@
 
   // ── scrolling: follow the bottom while the user is near it ────────────
 
-  // Only sending a message (or the down button) moves the view: typing never
-  // does, and output that arrives while you read higher up leaves you there.
+  // Only sending (or the down button) scrolls: typing never does, and new output leaves you where you read.
   let follow = true;
   const nearBottom = (slack = 80) => window.innerHeight + window.scrollY >= document.documentElement.scrollHeight - slack;
-  // A scroll up that you make stops following at once, even a few pixels, so the
-  // next streamed paint does not pull you back. Following resumes at the very bottom.
+  // Any scroll up stops following at once; following resumes only at the very bottom.
   let upAt = 0, dragging = false, pinUntil = 0;
   const leaveBottom = () => { follow = false; upAt = Date.now(); paintDown(); };
   function onScroll() {
@@ -137,9 +109,7 @@
 
   // ── motion: new things rise in, menus and panels open softly, folds slide ──
 
-  // One set of values (skim.css has the same as CSS variables). Motion is off
-  // with the macOS "Reduce motion" setting, with the `no-motion` class on
-  // <html> (the test pages), while a history is drawn, and out of view.
+  // Motion off: macOS "Reduce motion", no-motion class, replaying, or out of view.
   const M = { fast: 120, mid: 180, slow: 260, ease: 'cubic-bezier(.2, .8, .2, 1)' };
   const RISE = [{ opacity: 0, transform: 'translateY(4px)' }, { opacity: 1, transform: 'none' }];
   const POP = [{ opacity: 0, transform: 'scale(.94)' }, { opacity: 1, transform: 'none' }];
@@ -157,10 +127,7 @@
   const enter = el => { if (el && !quiet()) play(el, RISE); return el; };
 
   /**
-   * Open and close, with a height slide. `apply` changes the state at once (the
-   * hidden attribute, a class), so every other check sees the new state now;
-   * only the drawing follows. A second toggle during a slide takes over from it.
-   */
+   * Expand or collapse with height slide; apply() runs before animation so state is live. */
   function stopSlide(el) { if (el._slide) { const a = el._slide; el._slide = null; a.cancel(); } }
   function expand(el, apply) {
     stopSlide(el);
@@ -220,8 +187,7 @@
 
   // A long prompt folds to its first lines, faded at the bottom; a click opens it.
   const isLongPrompt = text => text.length > 420 || text.split('\n').length > 6;
-  // Folded by the heuristic; a prompt that fits once laid out (a wide window) loses the fold.
-  // (The change waits a frame: a size change inside the observer's own callback is a "loop" error.)
+  // Fold lost if prompt fits after layout; observer change via requestAnimationFrame to avoid loop.
   const foldFit = root.ResizeObserver ? new ResizeObserver(list => {
     const fit = list.map(x => x.target).filter(t => t.isConnected && t.offsetHeight && !t.classList.contains('is-open') && !t.dataset.fits
       && t.scrollHeight <= t.clientHeight + 4);
@@ -241,7 +207,7 @@
     };
     more.onmousedown = e => e.preventDefault();
     more.onclick = toggle;
-    // A click on the folded text opens it; a click that ends a text selection does not.
+    // Click folded text to open it; end-of-selection clicks don't.
     text.addEventListener('click', () => { if (!text.classList.contains('is-open') && !text.dataset.fits && !String(root.getSelection ? getSelection() : '')) toggle(); });
     box.append(more);
     if (foldFit) foldFit.observe(text);
@@ -540,12 +506,7 @@
 
   // ── tool calls: a tray per turn, out of the reading flow ──────────────
 
-  // The reply reads as one text: each turn's tool calls go into a tray, a pill
-  // under the prompt that stays at the top of the view while you read the turn
-  // and counts the calls as they run. A click opens the turn's whole tool
-  // history over the reply. Where a run happened, a faint mark stays in the
-  // text (it opens the tray at that run). Approval cards stay in the reply.
-  // A subagent's transcript (the panel) keeps its runs inline: they are what you open it for.
+  // Tool calls in a tray (pill, sticky at top) with faint marks where they run in the text.
   let toolsInline = false;
   try { toolsInline = localStorage.getItem('ck.toolsInline') === '1'; } catch (e) { /* storage may be blocked */ }
   let openTray = null;
@@ -666,7 +627,7 @@
     run.t1 = Math.max(...run.list.map(r => r.t1 || r.t0), run.t0 + 1);
     clearInterval(run.timer);
     run.el.classList.remove('is-live');
-    // A long run folds to its summary, in the reply; in the tray, which you open to read, it stays open.
+    // Long runs fold in reply; stay open in tray (which you open to read).
     if (run.list.length > 3 && !run.list.some(r => r.state === 'error') && (!run.mark || toolsInline)) run.el.classList.add('is-folded');
     paintRun(run);
   }
@@ -900,10 +861,7 @@
   }
 
   /**
-   * The change view for Edit / MultiEdit / Write, in approval cards and in the
-   * tool rows. "Now" first; "Diff" on request. The body scrolls; a change that
-   * does not fit gets Expand, which makes the box taller (and a card wider).
-   */
+   * Change view (Now/Diff) for Edit/MultiEdit/Write; scrolls; Expand for big changes. */
   function changeView(name, inp) {
     if (Array.isArray(inp?.changes) && inp.changes.length) {
       return h('div', { class: 'ck-file-changes' }, inp.changes.map(change =>
@@ -1080,10 +1038,7 @@
   // ── dialog tools: AskUserQuestion and ExitPlanMode get their own cards ──
 
   /**
-   * AskUserQuestion: the questions as one card. The answers go back in the
-   * tool's input ({ ...input, answers: { [question]: answer } }); Skip declines.
-   * Number keys answer the current question (the first one not yet answered).
-   */
+   * One question card; answers go in tool input; number keys answer current question. */
   function addQuestionCard(req) {
     closeRun();
     const qs = req.input.questions.map(q => ({ ...q, options: Array.isArray(q.options) ? q.options : [] }));
@@ -1354,7 +1309,7 @@
     P.kind = kind; P.anchor = anchor; P.build = build; P.sel = -1;
     popEl.hidden = false;
     refreshPop();
-    // Opens from its chip (menus) or from the composer (suggestions); a switch between suggestion lists does not replay it.
+    // Open with animation unless switching between slash/mention suggestion lists.
     if (!popEl.hidden && !(was && (was === 'slash' || was === 'mention') && (kind === 'slash' || kind === 'mention')))
       play(popEl, [{ opacity: 0, transform: 'translateY(4px) scale(.98)' }, { opacity: 1, transform: 'none' }], M.fast);
   }
@@ -1843,7 +1798,7 @@
         side: h('span', { class: 'ck-pop-tag', text: 'agent' }), run: () => pickMention(st, 'agent-' + a.name, false) });
     }
     const hit = MEN.cache.get(q);
-    // While the answer is on its way, the last one, narrowed to what still matches, keeps the list from blinking.
+    // Keep narrowed list while answer arrives; no blink.
     const files = hit ? hit.list : MEN.last ? MEN.last.list.filter(p => p.toLowerCase().includes(ql)) : [];
     for (const p of files.slice(0, 15)) {
       const dir = p.endsWith('/');
@@ -2484,10 +2439,7 @@
 
   // ── /btw: a side question, outside the conversation ──────────────────
 
-  // Claude Code answers it from the conversation so far, with no tools, and
-  // keeps it out of the transcript (the side_question request). The panel above
-  // the status line holds the side thread: each follow-up sends the earlier
-  // questions and answers as its history. Esc or × closes it and drops the thread.
+  // Side question answered from conversation (no tools, not in transcript); panel holds thread.
   const ICON_BTW = '<svg viewBox="0 0 16 16" width="12" height="12" aria-hidden="true"><path d="M2.5 3.5h11v7h-6l-3 2.5v-2.5h-2z" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round"/></svg>';
   let btw = null;   // { conv, list, field, thread: [{ question, response, error, el }], pending }
 
@@ -2564,11 +2516,7 @@
 
   // ── rewind: back to before an earlier prompt ──────────────────────────
 
-  // Each prompt sent here gets an ID (Claude Code keeps it in the transcript)
-  // and remembers the transcript entry before it. A rewind can put the files
-  // back as they were before the prompt (Claude Code's file checkpoints), cut
-  // the conversation back to that entry (the session restarts there), or both.
-  // The prompt and everything after it go away; its text goes back in the composer.
+  // Each prompt gets an ID and the entry before it; a rewind restores files, cuts the conversation, or both.
   const ICON_REWIND = '<svg viewBox="0 0 16 16" width="12" height="12" aria-hidden="true"><path d="M3 4.5v3.2h3.2" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/><path d="M3.4 7.5A5 5 0 1 1 4.6 11" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg>';
   let lastEsc = 0, rewindCard = null;
   const rewindWait = new Map();   // request id → resolve, for the files answers
@@ -2771,9 +2719,7 @@
 
   // ── dictation: the mic button ─────────────────────────────────────────
 
-  // The host listens (the Mac's speech recognition, on the device when it can)
-  // and sends the words heard so far; they go where the caret was. Claude
-  // Code's own /voice records in its terminal UI only, so it cannot run here.
+  // Host listens (device speech recognition); words go where the caret was.
   const ICON_MIC = '<svg viewBox="0 0 16 16" width="13" height="13" aria-hidden="true"><rect x="5.5" y="1.5" width="5" height="8.5" rx="2.5" fill="none" stroke="currentColor" stroke-width="1.4"/><path d="M3.2 7.6a4.8 4.8 0 0 0 9.6 0M8 12.4v2.1" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/></svg>';
   const V = { state: 'idle', before: '', after: '', value: '', detached: false };
 
@@ -2964,7 +2910,7 @@
     input.addEventListener('click', updateSuggest);
     input.addEventListener('keyup', e => { if (e.key === 'ArrowLeft' || e.key === 'ArrowRight' || e.key === 'Home' || e.key === 'End') updateSuggest(); });
     input.addEventListener('blur', () => setTimeout(() => { if ((P.kind === 'slash' || P.kind === 'mention') && document.activeElement !== input) closePop(); }, 120));
-    // An image on the clipboard becomes an attachment; text (also rich text with a picture in it) pastes as text.
+    // Clipboard images attach; rich text+images paste text only.
     input.addEventListener('paste', e => {
       const cd = e.clipboardData;
       if (!supports('images') || !cd) return;
@@ -3016,8 +2962,7 @@
     bindGrip();
     ctxEl.onclick = openMoreMenu;
     moreBtn.onclick = openMoreMenu;
-    // Content that grows after the follow scroll (images loading, a diagram, late
-    // layout) would leave the last lines under the dock: follow the growth too.
+    // Follow growth (images, diagrams, late layout) to keep last lines visible.
     if (root.ResizeObserver) {
       let lastH = 0;
       new ResizeObserver(() => {
@@ -3224,11 +3169,8 @@
     return [u.tool_uses ? plural(u.tool_uses, 'tool') : null, u.total_tokens ? fmtTok(u.total_tokens) + ' tokens' : null].filter(Boolean).join(' · ');
   }
 
-  /**
-   * task_started / progress / updated / notification. A task started by a tool
-   * call shows on that row; a background one also says when it ends, since its
-   * row finished long before (its result only said "running in the background").
-   */
+  /** task_* frames: a task shows on the row of the tool that started it.
+   *  A background one also gets a notice when it ends (its row finished long before). */
   function onTask(e) {
     let t = S.agentTasks.get(e.taskId);
     if (!t) { t = { id: e.taskId, toolId: null, description: '', background: false, ambient: false, usage: null }; S.agentTasks.set(e.taskId, t); }
@@ -3269,10 +3211,7 @@
 
   // ── subagents: each one's transcript in a panel, not in the conversation ──
 
-  // A subagent's messages carry the id of the Agent call that started it
-  // (parent_tool_use_id). Its text, thinking and tool rows are drawn into a
-  // conversation of their own, with the same code as the main one, and shown
-  // in a panel when you click the Agent row. The conversation keeps one row.
+  // Subagent messages (parent_tool_use_id) draw into own conversation, shown in panel on Agent click.
   const SUB_EVENTS = new Set(['content.start', 'content.delta', 'content.snapshot', 'content.end', 'tool.start', 'tool.input', 'tool.result', 'tool.output.delta', 'tool.progress', 'surface.snapshot', 'media.snapshot', 'plan.snapshot', 'turn.start', 'turn.end', 'turn.diff.snapshot']);
   const isAgentTool = name => name === 'Agent' || name === 'Task';
   let subOpen = null;   // the subagent transcript in the panel
@@ -3297,7 +3236,7 @@
 
   function toSub(e) {
     const top = S.root || S;
-    // A subagent's tool result also settles the approval card for it (the card stays in the conversation).
+    // Subagent tool result settles its approval card (stays in conversation).
     if (e.type === 'tool.result') for (const [id, card] of [...top.cards]) if (card.req.toolUseID === e.id) resolveCard(id, e.isError ? 'denied' : 'allowed');
     const sub = subConv(top, e.parentId);
     const own = { ...e, parentId: null };
@@ -3342,10 +3281,7 @@
   }
 
   /**
-   * The panel: the Agent call (type, description, state, counts), its prompt,
-   * then the transcript. A resumed chat has no subagent messages: the result only.
-   * `live`: new output; the panel follows it when you are at its bottom.
-   */
+   * Subagent panel: call info, prompt, transcript; follows output when at bottom. */
   function paintSubPanel(live) {
     const sub = subOpen;
     if (!sub) return;

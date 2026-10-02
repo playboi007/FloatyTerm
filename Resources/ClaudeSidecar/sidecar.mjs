@@ -48,8 +48,7 @@ import readline from 'node:readline';
 import fs from 'node:fs';
 import { execFile } from 'node:child_process';
 
-// Output shapes the Claude tab renders specially (editable, next to this file).
-// A host-supplied appendSystemPrompt replaces it.
+// Output shapes the Claude tab renders specially (prompt-contract.md); a host appendSystemPrompt replaces it.
 const CONTRACT = (() => {
   try { return fs.readFileSync(new URL('./prompt-contract.md', import.meta.url), 'utf8'); } catch { return ''; }
 })();
@@ -173,11 +172,8 @@ function start(m) {
 }
 
 /**
- * Thinking summaries. Claude Code's display default is "omitted" (the blocks
- * arrive empty), and over the SDK it does not apply showThinkingSummaries
- * itself, so the sidecar does: the host's choice, else the merged settings
- * (what /config says), else off. The thinking tokens cost the same either way.
- */
+ * Thinking summaries: Claude Code shows none by default over the SDK, so the sidecar sets them:
+ * the host's choice, else the merged settings (/config), else off. */
 async function initThinking(choice) {
   let on = false, source = 'default';
   if (typeof choice === 'boolean') { on = choice; source = 'user'; }
@@ -249,10 +245,7 @@ async function sessionTitle() {
 }
 
 /**
- * Names the session through the running Claude Code, as a rename made in the
- * host app, so its own copy of the title stays the same. An older Claude Code
- * without the request gets the title entry written to the transcript instead.
- */
+ * Rename via running Claude Code; fallback writes to transcript if unsupported. */
 async function rename(m) {
   const title = String(m.title || '').replace(/\s+/g, ' ').trim().slice(0, 200);
   if (!title) throw new Error('the name is empty');
@@ -262,8 +255,7 @@ async function rename(m) {
   return sessionTitle();
 }
 
-// History for a resumed conversation: the page draws the last messages, not a whole
-// transcript (one can be tens of MB). Long tool output and file contents are cut.
+// History for resume: last messages only (not full transcript, can be tens of MB); output trimmed.
 const HISTORY_MAX = 400, RESULT_MAX = 4000, INPUT_MAX = 20000;
 const cut = (s, n) => typeof s === 'string' && s.length > n ? s.slice(0, n) + `\n… (${s.length - n} more characters)` : s;
 function trimBlock(b) {

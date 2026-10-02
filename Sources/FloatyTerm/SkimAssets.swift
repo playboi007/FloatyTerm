@@ -1,20 +1,8 @@
 import Foundation
 import WebKit
 
-/// Loads the SkimRender web renderer (`Resources/SkimRender`) into a
-/// `WKWebView`: skimmable Markdown — option cards, phase tracks, diagrams,
-/// file trees, callouts, itemized notes, tables, checklists and labeled
-/// sections — styled after the "Markdown, made skimmable" design.
-///
-/// The files ship in the app bundle (`Contents/Resources/SkimRender`, copied by
-/// build.sh) rather than as Swift string literals: Mermaid alone is 3.5 MB,
-/// which would make every compile slow. A `swift run` from the repo falls back
-/// to the source tree. When neither is present, `isAvailable` is false and
-/// callers keep their plain renderer.
-///
-/// Scripts go in as `WKUserScript`s, so no library text passes through the
-/// HTML parser. Mermaid is not injected up front: the page asks for it over the
-/// `skim` bridge the first time a reply contains a Mermaid block.
+/// Loads SkimRender into WKWebView as WKUserScripts to avoid HTML parsing;
+/// Mermaid lazy-loaded on first use via skim bridge.
 enum SkimAssets {
 
     /// The directory holding skim-render.js and its vendor files, if any.
@@ -74,9 +62,8 @@ enum SkimAssets {
 
     // MARK: - Web view setup
 
-    /// Adds the renderer's scripts and the `skim` bridge to a configuration.
-    /// `onAction` receives controls that answer Claude, e.g. choosing an option
-    /// (`["type": "reply", "text": "Go with option A"]`).
+    /// Add renderer scripts and skim bridge to WKWebViewConfiguration.
+    /// onAction receives controls that answer Claude (e.g. choosing an option).
     static func install(in config: WKWebViewConfiguration, chat: Bool = false,
                         onAction: (([String: Any]) -> Void)? = nil) {
         guard var scripts = coreScripts else { return }
@@ -91,10 +78,7 @@ enum SkimAssets {
         }
         let bridge = SkimBridge(onAction: onAction)
         ucc.addScriptMessageHandler(bridge, contentWorld: .page, name: "skim")
-        // The renderer calls this the first time it meets a Mermaid block. The
-        // source runs as a <script> element, not through eval: mermaid.min.js
-        // opens with "use strict", and strict eval keeps its top-level `var`s
-        // local, so the library would never reach globalThis.
+        // On first Mermaid block: load as <script> not eval (mermaid strict mode requires globalThis access).
         let hook = """
         SkimRender.requestMermaid = () =>
           window.webkit.messageHandlers.skim.postMessage({ type: 'loadMermaid' }).then(src => {
@@ -141,9 +125,8 @@ enum SkimAssets {
 }
 
 extension SkimAssets {
-    /// The shared agent page (chat.js on top of the renderer). `AgentChat.boot`
-    /// runs once the document has parsed; events arrive later through
-    /// `AgentChat.receive`.
+    /// Shared agent page (chat.js on renderer); AgentChat.boot after parse;
+    /// events via AgentChat.receive.
     static func chatDocument(cwd: String, intro: String? = nil, agent: String = "claude") -> String {
         let cfg: [String: Any] = ["cwd": cwd, "home": NSHomeDirectory(), "intro": intro ?? "", "agent": agent, "voice": true]
         let json = (try? JSONSerialization.data(withJSONObject: cfg)).flatMap { String(data: $0, encoding: .utf8) } ?? "{}"
@@ -160,9 +143,8 @@ extension SkimAssets {
     }
 }
 
-/// The page-to-native side of the renderer. The user content controller
-/// retains it until `SkimAssets.uninstall` removes it, so an `onAction` that
-/// captures its owner must capture it weakly.
+/// Page-to-native renderer side; retained by user content controller until uninstall;
+/// onAction capturing owner must be weak.
 private final class SkimBridge: NSObject, WKScriptMessageHandlerWithReply {
     private let onAction: (([String: Any]) -> Void)?
 

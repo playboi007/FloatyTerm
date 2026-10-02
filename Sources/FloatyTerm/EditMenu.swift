@@ -1,13 +1,7 @@
 import AppKit
 
-/// FloatyTerm is a menu-bar app, so it has no visible menu bar. macOS still
-/// routes key equivalents through `NSApp.mainMenu`, and the Edit menu is what
-/// turns ⌘Z, ⌘C, ⌘V and the other editing keys into `undo:`, `copy:`, `paste:`…
-/// for the first responder. Without it, text fields and web views (the Claude
-/// tab's composer, browser tabs, the Markdown Viewer) get none of them.
-///
-/// The menu is never shown. Terminal views keep their own ⌘C/⌘V/⌘Z: a view's
-/// `performKeyEquivalent` runs before the main menu is consulted.
+/// Hidden Edit menu routes ⌘Z/⌘C/⌘V key equivalents to first responders;
+/// installed as NSApp.mainMenu. Never displayed.
 enum EditMenu {
     static func install() {
         guard NSApp.mainMenu == nil else { return }
