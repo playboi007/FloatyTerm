@@ -403,3 +403,11 @@ strong { font-weight: 600; color: var(--text); }
   .sk-note { display: none; }
   .sk-card-peek .sk-bars { display: none; }
 }
+
+/* ── motion (a live reply): new words fade in, a new non-text block rises in ── */
+:root { --m-fast: 120ms; --m-mid: 180ms; --m-slow: 260ms; --m-ease: cubic-bezier(.2, .8, .2, 1); --m-rise: 4px; }
+.sk-fresh { animation: sk-fresh var(--m-slow) ease-out both; }
+@keyframes sk-fresh { from { opacity: 0; } }
+.sk-in { animation: sk-in var(--m-mid) var(--m-ease) both; }
+@keyframes sk-in { from { opacity: 0; transform: translateY(var(--m-rise)); } }
+@media (prefers-reduced-motion: reduce) { .sk-fresh, .sk-in { animation: none; } }

@@ -14,6 +14,11 @@
  *
  * `onAction({ type: 'reply', text })` fires when a control answers Claude
  * (choosing an option). Without `interactive`, those controls are hidden.
+ *
+ * `reveal` (a live reply): text that arrived since the last render fades in,
+ * and a block that is new rises in. The block still growing is rebuilt on each
+ * render, so the words still fading are wrapped again with their fade already
+ * under way (a negative animation delay): the fade does not restart or stop.
  */
 (function (root) {
   'use strict';
@@ -540,17 +545,85 @@
     return el;
   }
 
+  // ── reveal: new text fades in ──────────────────────────────────────────
+
+  const REVEAL_MS = 260;
+  /** Blocks whose text is not read as it streams: a diagram, a picture. */
+  const noReveal = el => !!el.querySelector('svg, canvas, img, .sk-mermaid');
+
+  function commonPrefix(a, b) {
+    const n = Math.min(a.length, b.length);
+    let i = 0;
+    while (i < n && a.charCodeAt(i) === b.charCodeAt(i)) i++;
+    return i;
+  }
+
+  /**
+   * `marks`: [{ at, t }] — the text from offset `at` (to the next mark) arrived
+   * at time `t`. Wraps each range still fading in a span that carries its age.
+   */
+  function wrapFresh(el, marks, now) {
+    if (!marks.length) return;
+    const walker = document.createTreeWalker(el, NodeFilter.SHOW_TEXT);
+    const nodes = [];
+    for (let n = walker.nextNode(); n; n = walker.nextNode()) nodes.push(n);
+    const total = el.textContent.length;
+    const ranges = marks.map((m, i) => [m.at, i + 1 < marks.length ? marks[i + 1].at : total, now - m.t]).filter(r => r[1] > r[0]);
+    let pos = 0;
+    for (const node of nodes) {
+      const start = pos, end = pos + node.data.length;
+      pos = end;
+      if (!ranges.some(r => r[0] < end && r[1] > start)) continue;
+      // Split this text node at every range edge inside it; wrap the fading pieces.
+      const cuts = [...new Set(ranges.flatMap(r => [r[0], r[1]]).filter(c => c > start && c < end))].sort((a, b) => a - b);
+      let cur = node, curStart = start;
+      for (const c of [...cuts, end]) {
+        const piece = cur;
+        if (c < end) cur = piece.splitText(c - curStart);
+        const r = ranges.find(x => x[0] <= curStart && x[1] >= c);
+        if (r && piece.data.trim()) {   // white space has nothing to fade
+          const span = document.createElement('span');
+          span.className = 'sk-fresh';
+          span.style.animationDelay = -Math.round(r[2]) + 'ms';
+          piece.replaceWith(span);
+          span.append(piece);
+        }
+        curStart = c;
+      }
+    }
+  }
+
+  /** The new element for a block that changed: carry the fades of the old one, add the text that is new. */
+  function reveal(el, cur, now) {
+    if (noReveal(el)) return;
+    const text = el.textContent;
+    let marks = [];
+    if (cur) {
+      const keep = commonPrefix(cur.textContent, text);
+      marks = (cur._marks || []).filter(m => now - m.t < REVEAL_MS && m.at < keep);
+      if (text.length > keep) marks.push({ at: keep, t: now });
+    } else if (text) marks = [{ at: 0, t: now }];
+    el._marks = marks;
+    wrapFresh(el, marks, now);
+  }
+
   function render(container, markdown, opts) {
     opts = opts || {};
     const ctx = { interactive: !!opts.interactive, onAction: opts.onAction || function () {} };
     const blocks = root.SkimClassify.classify(markdown, root.marked, { streaming: !!opts.streaming });
     const old = Array.from(container.children);
+    const now = Date.now();
     blocks.forEach((b, i) => {
       const key = b.kind + '|' + hash(b.raw) + (b.open ? '|open' : '');
       const cur = old[i];
       if (cur && cur.dataset.key === key) return;
       const el = renderBlock(b, ctx);
       el.dataset.key = key;
+      if (opts.reveal) {
+        reveal(el, cur, now);
+        // A new block that is not text to read (a table, a card, a diagram) rises in instead.
+        if (!cur && !el._marks?.length) el.classList.add('sk-in');
+      }
       if (cur) cur.replaceWith(el); else container.append(el);
       old[i] = el;
     });
