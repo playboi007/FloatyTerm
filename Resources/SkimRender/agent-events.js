@@ -71,6 +71,7 @@
         break;
       }
       case 'content.start': case 'content.delta': case 'content.snapshot': case 'content.end': {
+        if (e.parentId) break;   // a subagent's words belong to its own transcript
         let block = state.blocks.get(e.id);
         if (!block) {
           block = { id: e.id, messageId: e.messageId, kind: e.kind || 'text', text: '', final: false, redacted: !!e.redacted };
