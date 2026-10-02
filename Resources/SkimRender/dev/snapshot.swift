@@ -62,12 +62,15 @@ final class Shot: NSObject, WKNavigationDelegate {
         super.init()
         window.contentView = web
         // On screen, 1% opaque and click-through, for the few seconds of the run. An
-        // offscreen, fully transparent or desktop-level window is "occluded", and
+        // offscreen, fully transparent, desktop-level or covered window is "occluded", and
         // WebKit then skips animation frames, which the pages use. The snapshot
         // itself is WebKit's rendering, so the window's opacity does not show in it.
         window.setFrameOrigin(NSPoint(x: 0, y: 0))
         window.alphaValue = 0.01
         window.ignoresMouseEvents = true
+        // Above other windows: a window covered by another one is occluded too,
+        // and its animation frames stop part of the way through a run.
+        window.level = .screenSaver
         window.orderFrontRegardless()
         web.navigationDelegate = self
         #if SKIM_HOST
@@ -81,7 +84,21 @@ final class Shot: NSObject, WKNavigationDelegate {
     }
 
     func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
-        DispatchQueue.main.asyncAfter(deadline: .now() + settle) {
+        DispatchQueue.main.asyncAfter(deadline: .now() + settle) { self.whenSettled { self.finish() } }
+    }
+
+    /// A page that sets `window.__pending = true` is waited for until it sets it
+    /// back (scripted checks that run longer on a busy machine), up to 90 s.
+    private func whenSettled(since start: Date = Date(), _ then: @escaping () -> Void) {
+        web.evaluateJavaScript("window.__pending === true") { pending, _ in
+            if pending as? Bool == true, Date().timeIntervalSince(start) < 90 {
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { self.whenSettled(since: start, then) }
+            } else { then() }
+        }
+    }
+
+    private func finish() {
+        do {
             self.web.evaluateJavaScript("window.__testResults || null") { result, _ in
                 if let checks = result as? [String: Any] {
                     let failed = checks["failed"] as? Int ?? 0
@@ -133,5 +150,5 @@ final class Shot: NSObject, WKNavigationDelegate {
 let app = NSApplication.shared
 app.setActivationPolicy(.prohibited)
 let shot = Shot()
-DispatchQueue.main.asyncAfter(deadline: .now() + 60) { print("timed out"); exit(1) }
+DispatchQueue.main.asyncAfter(deadline: .now() + 120) { print("timed out"); exit(1) }
 app.run()
