@@ -4,6 +4,7 @@ import { randomUUID } from 'node:crypto';
 import { readFile, stat } from 'node:fs/promises';
 import { extname } from 'node:path';
 import { StringDecoder } from 'node:string_decoder';
+import { hostToolSpecs, hostToolArguments, toolResult } from './host-tools.mjs';
 import { eventRoutes, safePayload } from './event-routes.mjs';
 
 // FloatyTerm <-> Codex app-server bridge. App-server speaks newline-delimited
@@ -214,6 +215,18 @@ class CodexBridge {
     this.items = new Map();
     this.childParents = new Map();
     this.processStreams = new Map();
+    this.hostCalls = new Map();
+    this.hostRequests = new Map();
+    this.hostToolsEnabled = false;
+    this.nativeAudio = false;
+    this.voice = null;
+    this.voiceStop = null;
+    this.voiceStarting = null;
+    this.voiceBlocked = false;
+    this.accountBusy = false;
+    this.loginId = null;
+    this.loginEpoch = 0;
+    this.authMode = null;
     this.latestUsage = null;
     this.plan = null;
     this.failureSent = false;
@@ -236,6 +249,8 @@ class CodexBridge {
     }
     this.starting = true;
     this.config = { cwd: message.cwd, codexPath: message.codexPath };
+    this.hostToolsEnabled = message.hostTools === true;
+    this.nativeAudio = message.nativeAudio === true;
     this.permissionMode = message.permissionMode === 'plan' ? 'plan' : 'default';
     this.effort = typeof message.effort === 'string' && message.effort ? message.effort : null;
     this.thinkingOn = typeof message.thinking === 'boolean' ? message.thinking : false;
@@ -274,6 +289,7 @@ class CodexBridge {
       this.emitCapabilities();
       await this.readRateLimits(false);
       await this.openThread(message);
+      await this.readAccount(false);
       this.started = true;
       this.starting = false;
       for (const pending of this.startQueue.splice(0)) this.handleControl(pending);
@@ -314,10 +330,11 @@ class CodexBridge {
   }
 
   emitCapabilities() {
-    const features = { ...featureSet, models: this.models.length > 0, effort: this.models.length > 0 };
+    const features = { ...featureSet, realtimeVoice: this.nativeAudio, credentials: true, models: this.models.length > 0, effort: this.models.length > 0 };
     this.emit('capabilities', {
       features, commands: COMMANDS, models: this.modelRows(), mode: this.permissionMode,
       permissionModes: ['default', 'plan'],
+      hostTools: this.hostToolsEnabled ? hostToolSpecs : [],
     }, { type: 'app-server.capabilities', methods: ['thread/start', 'thread/resume', 'thread/fork', 'turn/start', 'turn/interrupt'] });
   }
 
@@ -342,6 +359,7 @@ class CodexBridge {
   currentSandbox() { return this.permissionMode === 'plan' ? 'read-only' : 'workspace-write'; }
 
   async openThread(message = {}) {
+    await this.stopRealtime();
     const sandbox = this.currentSandbox();
     const config = {};
     if (this.effort) config.model_reasoning_effort = this.effort;
@@ -361,15 +379,16 @@ class CodexBridge {
     } else if (typeof message.resume === 'string' && message.resume) {
       response = await this.rpc.request('thread/resume', { threadId: message.resume, ...common, excludeTurns: true });
     } else {
-      response = await this.rpc.request('thread/start', common);
+      response = await this.rpc.request('thread/start', { ...common, ...(this.hostToolsEnabled ? { dynamicTools: hostToolSpecs } : {}) });
     }
     this.applyThread(response, { emitSession: true });
+    if (this.hostToolsEnabled) this.surfaceEvent('item/tool/call', { threadId: this.threadId, status: 'available', hostTools: hostToolSpecs.map(tool => ({ name: tool.name, description: tool.description })), registration: message.resume || message.fork ? 'Tools are advertised on thread/start only. Resume/fork do not add this catalog; use a new conversation.' : 'Registered with this new conversation.' });
   }
 
   applyThread(response, { emitSession = true } = {}) {
     const thread = response?.thread;
     if (!thread?.id) throw new Error('Codex app-server did not return a thread id.');
-    if (this.threadId !== thread.id) { this.items.clear(); this.childParents.clear(); this.processStreams.clear(); this.latestUsage = null; this.cancelApprovals(); }
+    if (this.threadId !== thread.id) { this.cancelHostTools('Conversation changed.'); this.items.clear(); this.childParents.clear(); this.processStreams.clear(); this.latestUsage = null; this.cancelApprovals(); }
     this.thread = thread;
     this.threadId = thread.id;
     if (response.model) {
@@ -483,6 +502,7 @@ class CodexBridge {
     const turn = this.active;
     if (!turn || turn.ended) return;
     turn.interruptRequested = true;
+    this.cancelHostTools('Host tool cancelled by interruption.');
     if (!turn.id || turn.interruptSent) return;
     turn.interruptSent = true;
     try { await this.rpc.request('turn/interrupt', { threadId: this.threadId, turnId: turn.id }); }
@@ -514,6 +534,7 @@ class CodexBridge {
     turn.ended = true;
     if (this.active === turn) this.active = null;
     this.cancelApprovals();
+    this.cancelHostTools('Turn ended before the host tool completed.', this.threadId, turn.id);
     this.emit('turn.end', {
       threadId: this.threadId, turnId: turn.id,
       status,
@@ -733,6 +754,7 @@ class CodexBridge {
     if (params.threadId && params.threadId !== this.threadId && !parentId) {
       this.rpc.rejectRequest(id, -32602, 'Request belongs to another conversation.'); return;
     }
+    if (this.hostRequests.has(key)) { this.notice('error', 'Duplicate pending host tool request ignored.'); return; }
     if (this.approvals.has(key)) {
       this.rpc.rejectRequest(id, -32600, 'Duplicate request id.'); return;
     }
@@ -741,15 +763,14 @@ class CodexBridge {
       this.rpc.respond(id, { currentTimeAt: Math.floor(Date.now() / 1000) });
       this.surfaceEvent(method, { status: 'completed', message: 'Host time supplied.' }); return;
     }
-    if (method === 'item/tool/call') {
-      // No dynamic tools are registered by this host. Return an honest tool result.
-      const message = `Host tool ${params.namespace ? params.namespace + '/' : ''}${params.tool || 'unknown'} is not registered.`;
-      this.rpc.respond(id, { success: false, contentItems: [{ type: 'inputText', text: message }] });
-      this.surfaceEvent(method, { ...params, status: 'failed', message }); return;
+    if (method === 'item/tool/call') { this.startHostTool(message); return; }
+    if (method === 'account/chatgptAuthTokens/refresh') {
+      this.rpc.rejectRequest(id, -32601, 'FloatyTerm uses Codex-managed sign-in, not externally supplied tokens.');
+      this.accountState({ status: 'reauthenticationRequired', message: 'Sign in with ChatGPT to use Codex-managed credential renewal.' }); return;
     }
-    if (method === 'account/chatgptAuthTokens/refresh' || method === 'attestation/generate') {
+    if (method === 'attestation/generate') {
       this.rpc.rejectRequest(id, -32601, 'This host does not supply external authentication or attestation.');
-      this.surfaceEvent(method, { status: 'unavailable', message: 'Reconnect with the installed Codex CLI; external credential/attestation callbacks are not configured.' }); return;
+      this.surfaceEvent(method, { status: 'unavailable', message: 'A host attestation provider is not configured.' }); return;
     }
     const supported = ['item/commandExecution/requestApproval', 'item/fileChange/requestApproval', 'item/tool/requestUserInput',
       'item/permissions/requestApproval', 'mcpServer/elicitation/request', 'execCommandApproval', 'applyPatchApproval'];
@@ -770,6 +791,58 @@ class CodexBridge {
     this.approvals.set(key, { id, method, request, params });
     // Secret questions must never be copied into diagnostic provenance.
     this.emit('approval.request', { request, ...(parentId ? { parentId } : {}) }, { method, requestId: uiId });
+  }
+
+  startHostTool(message) {
+    const { id, params = {} } = message;
+    const key = this.requestIdKey(id);
+    if (this.hostRequests.has(key)) { this.notice('error', 'Duplicate host tool request ignored.'); return; }
+    const ownerId = toolId(params.threadId, params.turnId, params.callId);
+    const scope = { threadId: params.threadId, turnId: params.turnId, ...(this.childParents.get(params.threadId) ? { parentId: this.childParents.get(params.threadId) } : {}) };
+    let argumentsValue;
+    try {
+      if (!this.hostToolsEnabled) throw new Error('Native host tools are not connected.');
+      if (typeof params.callId !== 'string' || !params.callId || !params.turnId) throw new Error('Host tool call identity is missing.');
+      argumentsValue = hostToolArguments(params.tool, params.namespace, params.arguments);
+    } catch (error) {
+      const result = toolResult(false, plainError(error));
+      this.rpc.respond(id, result);
+      this.emit('tool.start', { ...scope, id: ownerId, name: params.tool || 'Host tool', input: safePayload(params.arguments) }, { method: 'item/tool/call' });
+      this.emit('tool.result', { ...scope, id: ownerId, name: params.tool || 'Host tool', output: result.contentItems[0].text, isError: true }, { method: 'item/tool/call' });
+      return;
+    }
+    const requestId = randomUUID();
+    const call = { requestId, nativeId: id, key, ownerId, scope, tool: params.tool, expiresAt: Date.now() + 10000 };
+    this.hostCalls.set(requestId, call); this.hostRequests.set(key, requestId);
+    call.timer = setTimeout(() => this.finishHostTool(requestId, toolResult(false, 'Native host tool timed out.')), 10000);
+    call.timer.unref();
+    this.emit('tool.start', { ...scope, id: ownerId, name: params.tool, input: argumentsValue }, { method: 'item/tool/call' });
+    this.emit('host.tool.request', { ...scope, requestId, rootThreadId: this.threadId, expiresAt: call.expiresAt, model: this.model?.model || null, permissionMode: this.permissionMode, tool: params.tool, arguments: argumentsValue }, { type: 'host.tool.dispatch' });
+  }
+
+  finishHostTool(requestId, result, respond = true) {
+    const call = this.hostCalls.get(requestId); if (!call) return;
+    this.hostCalls.delete(requestId); this.hostRequests.delete(call.key); clearTimeout(call.timer);
+    if (respond && !this.rpc.dead) {
+      try { this.rpc.respond(call.nativeId, result); }
+      catch (error) { result = toolResult(false, 'Host action finished but its result could not be delivered: ' + plainError(error)); this.notice('error', result.contentItems[0].text); }
+    }
+    this.emit('tool.result', { ...call.scope, id: call.ownerId, name: call.tool, output: result.contentItems[0]?.text || '', isError: !result.success }, { type: 'host.tool.result' });
+  }
+
+  hostToolResult(message) {
+    if (!this.hostCalls.has(message.requestId)) return; // stale, cancelled or duplicate native result
+    if (typeof message.success !== 'boolean' || typeof message.text !== 'string' || message.text.length > 64000) {
+      this.finishHostTool(message.requestId, toolResult(false, 'Invalid native host tool result.')); return;
+    }
+    this.finishHostTool(message.requestId, toolResult(message.success, message.text));
+  }
+
+  cancelHostTools(reason, threadId = null, turnId = null, respond = true) {
+    for (const [id, call] of this.hostCalls) {
+      if (threadId && call.scope.threadId !== threadId || turnId && call.scope.turnId !== turnId) continue;
+      this.finishHostTool(id, toolResult(false, reason), respond);
+    }
   }
 
   permission(message) {
@@ -919,7 +992,7 @@ class CodexBridge {
   }
 
   surfaceEvent(method, params, raw = { method }) {
-    if (method === 'thread/realtime/outputAudio/delta') params = { ...params, audio: { sampleRate: params.audio?.sampleRate, numChannels: params.audio?.numChannels, samplesPerChannel: params.audio?.samplesPerChannel, playback: 'Audio transport is not connected in this host.' } };
+    if (method === 'thread/realtime/outputAudio/delta') params = { ...params, audio: { sampleRate: params.audio?.sampleRate, numChannels: params.audio?.numChannels, samplesPerChannel: params.audio?.samplesPerChannel, playback: this.nativeAudio ? 'Native FloatyTerm audio' : 'Audio transport is not connected in this host.' } };
     const route = eventRoutes[method];
     if (!route) { this.emit('unknown', { name: method }, { method, params: safePayload(params) }); return; }
     const scope = params.threadId || this.threadId || 'account';
@@ -954,7 +1027,37 @@ class CodexBridge {
 
   dispatchNotification(message) {
     const { method, params = {} } = message;
+    if (method.startsWith('thread/realtime/') && params.threadId === this.threadId) {
+      const voice = this.voice;
+      if (method === 'thread/realtime/started' && voice && !voice.ready) {
+        clearTimeout(voice.timer); voice.ready = true;
+        this.emit('native.realtime', { requestId: voice.id, threadId: voice.threadId, state: 'active' });
+        this.voiceState('active');
+      }
+      if (voice?.ready && params.role === 'user' && method === 'thread/realtime/transcript/delta' && !voice.userTranscriptOpen) {
+        voice.userTranscriptOpen = true;
+        this.emit('native.realtime', { requestId: voice.id, threadId: voice.threadId, state: 'clearPlayback' });
+      }
+      if (voice && params.role === 'user' && method === 'thread/realtime/transcript/done') voice.userTranscriptOpen = false;
+      if (method === 'thread/realtime/outputAudio/delta') {
+        if (voice?.ready && !voice.stopping) this.emit('native.realtime', { requestId: voice.id, threadId: voice.threadId, state: 'audio', audio: params.audio });
+        // Keep bytes entirely in native IPC; the DOM receives metadata at most once/second.
+        if (voice && Date.now() - (voice.lastOutput || 0) > 1000) { voice.lastOutput = Date.now(); this.surfaceEvent(method, params); }
+        return;
+      }
+      if (method === 'thread/realtime/closed' || method === 'thread/realtime/error') {
+        if (voice) this.retireVoice(voice, method.endsWith('/error') ? 'error' : 'closed', params.message || params.error || params.reason);
+      }
+    }
     switch (method) {
+      case 'account/updated':
+        this.authMode = params.authMode; void this.readAccount(false); this.surfaceEvent(method, params); break;
+      case 'account/login/completed':
+        this.loginEpoch++;
+        if (params.loginId === this.loginId) this.loginId = null;
+        this.accountState({ status: params.success ? 'signedIn' : 'error', message: params.success ? 'Signed in.' : params.error || 'Sign-in failed.' });
+        if (params.success) { void this.readAccount(false); void this.readRateLimits(false); }
+        break;
       case 'thread/tokenUsage/updated': this.onUsage(params, message); break;
       case 'account/rateLimits/updated':
         if (this.plan) {
@@ -968,7 +1071,8 @@ class CodexBridge {
         else this.onTurnStarted(params, message); break;
       case 'turn/completed':
         if (params.threadId !== this.threadId) this.emit('turn.end', { threadId: params.threadId, turnId: params.turn?.id, status: params.turn?.status === 'completed' ? 'success' : 'error' }, { method });
-        else this.onTurnCompleted(params, message); break;
+        else this.onTurnCompleted(params, message);
+        this.cancelHostTools('Child turn ended before the host tool completed.', params.threadId, params.turn?.id); break;
       case 'item/plan/delta': {
         const state = this.ensureItem({ ...params, item: { id: params.itemId, type: 'plan' } }, 'delta', message);
         if (!state) break;
@@ -1072,6 +1176,8 @@ class CodexBridge {
         this.surfaceEvent(method, params); break;
       case 'serverRequest/resolved': {
         const key = this.requestIdKey(params.requestId);
+        const hostId = this.hostRequests.get(key);
+        if (hostId) this.finishHostTool(hostId, toolResult(false, 'Host tool request was resolved by the server.'), false);
         const approval = this.approvals.get(key);
         if (approval) { this.approvals.delete(key); this.emit('approval.cancel', { id: approval.request.id }, message); }
         break;
@@ -1109,6 +1215,105 @@ class CodexBridge {
     } catch (error) { this.surfaceEvent(method, { ...params, status: 'unavailable', message: plainError(error) }); }
   }
 
+  accountState(data) {
+    this.emit('surface.snapshot', { id: 'codex:account:credentials', surface: 'account', title: 'Codex account', method: 'floaty/account', placement: 'session', data: { ...data, loginPending: !!this.loginId } });
+  }
+
+  async readAccount(refresh) {
+    if (this.accountBusy) return;
+    this.accountBusy = true;
+    this.accountState({ status: refresh ? 'refreshing' : 'checking', message: refresh ? 'Refreshing credentials…' : 'Checking sign-in…' });
+    try {
+      if (refresh && this.authMode === 'chatgptAuthTokens') throw new Error('External tokens cannot be refreshed here. Sign in with ChatGPT first.');
+      const result = await this.rpc.request('account/read', { refreshToken: refresh });
+      const account = result.account ? Object.fromEntries(["type", "email", "planType", "credentialSource"].filter(key => typeof result.account[key] === "string").map(key => [key, result.account[key]])) : null;
+      // account/read exposes identity only. Never request or export access tokens.
+      this.accountState({ status: account ? 'signedIn' : result.requiresOpenaiAuth ? 'signedOut' : 'notRequired',
+        account, requiresOpenaiAuth: result.requiresOpenaiAuth,
+        message: refresh ? account?.type === 'chatgpt' ? 'Managed credentials refreshed.' : 'Account checked; refresh applies to managed ChatGPT credentials.' : account ? 'Signed in.' : 'No Codex account is signed in.' });
+    } catch (error) { this.accountState({ status: 'reauthenticationRequired', message: plainError(error) }); }
+    finally { this.accountBusy = false; }
+  }
+
+  async login() {
+    if (this.accountBusy || this.loginId) return;
+    this.accountBusy = true;
+    const epoch = this.loginEpoch;
+    try {
+      const result = await this.rpc.request('account/login/start', { type: 'chatgpt' });
+      if (epoch !== this.loginEpoch) return;
+      if (typeof result.loginId !== 'string' || !result.loginId) throw new Error('Invalid Codex login response.');
+      let url;
+      try { url = new URL(result.authUrl); } catch { throw new Error('Invalid Codex sign-in URL.'); }
+      if (url.protocol !== 'https:' || !['auth.openai.com', 'auth0.openai.com'].includes(url.hostname) || url.username || url.password) throw new Error('Unexpected Codex sign-in URL.');
+      this.loginId = result.loginId;
+      this.accountState({ status: 'signingIn', message: 'Complete sign-in in your browser.' });
+      this.emit('native.account.login', { url: url.href, loginId: this.loginId });
+    } catch (error) { this.accountState({ status: 'error', message: plainError(error) }); }
+    finally { this.accountBusy = false; }
+  }
+
+  voiceState(status, message) {
+    this.emit('surface.snapshot', { id: 'codex:voice:' + this.threadId, surface: 'realtime', title: 'Voice conversation', method: 'floaty/realtime', threadId: this.threadId, placement: 'session', data: { status, message } });
+  }
+
+  retireVoice(voice, state, message) {
+    clearTimeout(voice.timer);
+    if (this.voice !== voice) return;
+    this.voice = null;
+    this.emit('native.realtime', { requestId: voice.id, threadId: voice.threadId, state, message: typeof message === 'string' ? message : undefined });
+    this.voiceState(state, typeof message === 'string' ? message : undefined);
+  }
+
+  async startRealtime(message) {
+    if (!/^[0-9a-f-]{36}$/i.test(message.requestId || '')) return;
+    if (!this.nativeAudio || !this.threadId || this.voice || this.voiceStop || this.voiceStarting || this.voiceBlocked || this.transitioning) {
+      this.emit('native.realtime', { requestId: message.requestId, state: 'error', message: 'Voice is not ready. Wait or reopen this conversation.' });
+      this.voiceState('error', 'Voice is not ready. Wait or reopen this conversation.'); return;
+    }
+    const voice = { id: message.requestId, threadId: this.threadId, ready: false, pending: 0 };
+    this.voice = voice;
+    this.voiceState('starting', 'Connecting voice…');
+    voice.timer = setTimeout(() => { if (this.voice === voice) void this.stopRealtime('error', 'Voice did not start in time.'); }, 15000);
+    const starting = this.rpc.request('thread/realtime/start', { threadId: voice.threadId, outputModality: 'audio', transport: { type: 'websocket' }, version: 'v1' }, 15000);
+    this.voiceStarting = starting;
+    try { await starting; }
+    catch (error) { if (this.voice === voice) void this.stopRealtime('error', plainError(error)); }
+    finally { if (this.voiceStarting === starting) this.voiceStarting = null; }
+  }
+
+  async stopRealtimeRPC(threadId) {
+    try { await this.rpc.request('thread/realtime/stop', { threadId }, 3000); }
+    catch (error) { this.voiceBlocked = true; if (!this.closing) this.notice('error', 'Voice stop could not be confirmed. Reopen the conversation before starting voice again. ' + plainError(error)); }
+  }
+
+  async stopRealtime(state = 'closed', message) {
+    if (this.voiceStop) return this.voiceStop;
+    const voice = this.voice;
+    if (!voice) return;
+    this.retireVoice(voice, state, message);
+    const starting = this.voiceStarting;
+    this.voiceStop = (async () => {
+      // Local capture is already stopped. Settle startup before stopping its remote session.
+      if (starting) { try { await starting; } catch { /* stop remains necessary after timeout */ } }
+      await this.stopRealtimeRPC(voice.threadId);
+    })();
+    try { await this.voiceStop; } finally { this.voiceStop = null; }
+  }
+
+  async appendRealtimeAudio(message) {
+    const voice = this.voice, audio = message.audio;
+    if (!voice?.ready || voice.id !== message.requestId || voice.stopping) return;
+    if (!audio || audio.sampleRate !== 24000 || audio.numChannels !== 1 || typeof audio.data !== 'string' || audio.data.length > 16000 || !/^[A-Za-z0-9+/]+={0,2}$/.test(audio.data)) return;
+    const bytes = Buffer.from(audio.data, 'base64');
+    if (!bytes.length || bytes.length % 2 || bytes.length / 2 !== audio.samplesPerChannel) return;
+    if (voice.pending >= 8) { await this.stopRealtime('error', 'Audio connection fell behind. Start voice again.'); return; }
+    voice.pending++;
+    try { await this.rpc.request('thread/realtime/appendAudio', { threadId: voice.threadId, audio }, 3000); }
+    catch (error) { if (this.voice === voice) await this.stopRealtime('error', plainError(error)); }
+    finally { voice.pending--; }
+  }
+
   async surfaceAction(message) {
     const { action, id, text } = message;
     try {
@@ -1118,7 +1323,16 @@ class CodexBridge {
         await this.rpc.request(action === 'queueRemove' ? 'thread/queue/delete' : 'thread/queue/start', { threadId: this.threadId, queuedSubmissionId: id });
         await this.refreshSurface('thread/queue/changed', { threadId: this.threadId });
       } else if (action === 'realtimeStop') {
-        await this.rpc.request('thread/realtime/stop', { threadId: this.threadId });
+        await this.stopRealtime();
+      } else if (action === 'accountRead' || action === 'accountRefresh') {
+        await this.readAccount(action === 'accountRefresh');
+      } else if (action === 'accountLogin') {
+        await this.login();
+      } else if (action === 'accountLoginCancel' && this.loginId) {
+        const loginId = this.loginId;
+        await this.rpc.request('account/login/cancel', { loginId });
+        if (this.loginId === loginId) this.loginId = null;
+        this.accountState({ status: 'cancelled', message: 'Sign-in cancelled.' });
       } else throw new Error('Unsupported surface action.');
     } catch (error) { this.notice('error', plainError(error)); }
   }
@@ -1126,6 +1340,8 @@ class CodexBridge {
   onExit(error) {
     if (this.failureSent || this.closing) return;
     this.failureSent = true;
+    if (this.voice) this.retireVoice(this.voice, 'error', 'Codex disconnected.');
+    this.cancelHostTools('Codex app-server disconnected.', null, null, false);
     if (this.active) this.endTurn(this.active, 'error', `Codex app-server stopped: ${plainError(error)}`, { type: 'app-server.exit' });
     else this.notice('error', `Codex app-server stopped: ${plainError(error)}`, true, { type: 'app-server.exit' });
   }
@@ -1139,6 +1355,13 @@ class CodexBridge {
         case 'user': return this.user(message.text);
         case 'interrupt': return this.interruptActive();
         case 'permission': return this.permission(message);
+        case 'realtimeStart': return this.startRealtime(message);
+        case 'realtimeAudio': return this.appendRealtimeAudio(message);
+        case 'realtimeStop': return this.stopRealtime();
+        case 'realtimeState':
+          if (this.voice?.id === message.requestId) this.voiceState(message.muted === true ? 'muted' : 'active');
+          return;
+        case 'hostToolResult': return this.hostToolResult(message);
         case 'surfaceAction': return this.surfaceAction(message);
         case 'setModel': {
           const model = this.resolveModel(message.model || '', true);
@@ -1203,6 +1426,8 @@ class CodexBridge {
   async shutdown() {
     if (this.closing) return;
     this.closing = true;
+    await this.stopRealtime();
+    this.cancelHostTools('Host is shutting down.');
     process.stdin.destroy();
     if (this.active?.id) {
       try { await this.rpc.request('turn/interrupt', { threadId: this.threadId, turnId: this.active.id }, 1000); }

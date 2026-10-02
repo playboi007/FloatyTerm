@@ -578,8 +578,8 @@ window.CODEX_UI_LAB = {
       "title": "Realtime voice",
       "group": "Session",
       "description": "Audio controls and per-role transcripts belong beside the composer.",
-      "dom": ".ck-realtime (proposed)",
-      "rule": "Separate voice session state from normal turns; audio/SDP stay in transport.",
+      "dom": ".ck-voice-start; .ck-surface[data-surface=\"realtime\"]",
+      "rule": "Native microphone/playback plus start, mute and end controls; audio bytes stay outside the DOM.",
       "method": "thread/realtime/transcript/delta",
       "fixture": {
         "method": "thread/realtime/transcript/delta",
@@ -1280,7 +1280,7 @@ window.CODEX_UI_LAB = {
       "current": "Named details",
       "shared": "surface.snapshot",
       "dom": ".ck-surface[data-surface=\"realtime\"]",
-      "rule": "Display session/transcript metadata; audio playback and SDP negotiation are unavailable.",
+      "rule": "Native WebSocket voice captures and plays PCM16; DOM receives session/transcript state and audio metadata. WebRTC SDP is not used.",
       "component": "realtime"
     },
     {
@@ -1289,7 +1289,7 @@ window.CODEX_UI_LAB = {
       "current": "Named details",
       "shared": "surface.snapshot",
       "dom": ".ck-surface[data-surface=\"realtime\"]",
-      "rule": "Display session/transcript metadata; audio playback and SDP negotiation are unavailable.",
+      "rule": "Native WebSocket voice captures and plays PCM16; DOM receives session/transcript state and audio metadata. WebRTC SDP is not used.",
       "component": "realtime"
     },
     {
@@ -1298,7 +1298,7 @@ window.CODEX_UI_LAB = {
       "current": "Named details",
       "shared": "surface.snapshot",
       "dom": ".ck-surface[data-surface=\"realtime\"]",
-      "rule": "Display session/transcript metadata; audio playback and SDP negotiation are unavailable.",
+      "rule": "Native WebSocket voice captures and plays PCM16; DOM receives session/transcript state and audio metadata. WebRTC SDP is not used.",
       "component": "realtime"
     },
     {
@@ -1307,7 +1307,7 @@ window.CODEX_UI_LAB = {
       "current": "Named details",
       "shared": "surface.snapshot",
       "dom": ".ck-surface[data-surface=\"realtime\"]",
-      "rule": "Display session/transcript metadata; audio playback and SDP negotiation are unavailable.",
+      "rule": "Native WebSocket voice captures and plays PCM16; DOM receives session/transcript state and audio metadata. WebRTC SDP is not used.",
       "component": "realtime"
     },
     {
@@ -1316,7 +1316,7 @@ window.CODEX_UI_LAB = {
       "current": "Named details",
       "shared": "surface.snapshot",
       "dom": ".ck-surface[data-surface=\"realtime\"]",
-      "rule": "Display session/transcript metadata; audio playback and SDP negotiation are unavailable.",
+      "rule": "Native WebSocket voice captures and plays PCM16; DOM receives session/transcript state and audio metadata. WebRTC SDP is not used.",
       "component": "realtime"
     },
     {
@@ -1325,7 +1325,7 @@ window.CODEX_UI_LAB = {
       "current": "Named details",
       "shared": "surface.snapshot",
       "dom": ".ck-surface[data-surface=\"realtime\"]",
-      "rule": "Display session/transcript metadata; audio playback and SDP negotiation are unavailable.",
+      "rule": "Native WebSocket voice captures and plays PCM16; DOM receives session/transcript state and audio metadata. WebRTC SDP is not used.",
       "component": "realtime"
     },
     {
@@ -1334,7 +1334,7 @@ window.CODEX_UI_LAB = {
       "current": "Named details",
       "shared": "surface.snapshot",
       "dom": ".ck-surface[data-surface=\"realtime\"]",
-      "rule": "Display session/transcript metadata; audio playback and SDP negotiation are unavailable.",
+      "rule": "Native WebSocket voice captures and plays PCM16; DOM receives session/transcript state and audio metadata. WebRTC SDP is not used.",
       "component": "realtime"
     },
     {
@@ -1343,7 +1343,7 @@ window.CODEX_UI_LAB = {
       "current": "Named details",
       "shared": "surface.snapshot",
       "dom": ".ck-surface[data-surface=\"realtime\"]",
-      "rule": "Display session/transcript metadata; audio playback and SDP negotiation are unavailable.",
+      "rule": "Native WebSocket voice captures and plays PCM16; DOM receives session/transcript state and audio metadata. WebRTC SDP is not used.",
       "component": "realtime"
     },
     {
@@ -1352,7 +1352,7 @@ window.CODEX_UI_LAB = {
       "current": "Named details",
       "shared": "surface.snapshot",
       "dom": ".ck-surface[data-surface=\"realtime\"]",
-      "rule": "Display session/transcript metadata; audio playback and SDP negotiation are unavailable.",
+      "rule": "Native WebSocket voice captures and plays PCM16; DOM receives session/transcript state and audio metadata. WebRTC SDP is not used.",
       "component": "realtime"
     },
     {
@@ -1361,7 +1361,7 @@ window.CODEX_UI_LAB = {
       "current": "Named details",
       "shared": "surface.snapshot",
       "dom": ".ck-surface[data-surface=\"realtime\"]",
-      "rule": "Display session/transcript metadata; audio playback and SDP negotiation are unavailable.",
+      "rule": "Native WebSocket voice captures and plays PCM16; DOM receives session/transcript state and audio metadata. WebRTC SDP is not used.",
       "component": "realtime"
     },
     {
@@ -1370,7 +1370,7 @@ window.CODEX_UI_LAB = {
       "current": "Named details",
       "shared": "surface.snapshot",
       "dom": ".ck-surface[data-surface=\"realtime\"]",
-      "rule": "Display session/transcript metadata; audio playback and SDP negotiation are unavailable.",
+      "rule": "Native WebSocket voice captures and plays PCM16; DOM receives session/transcript state and audio metadata. WebRTC SDP is not used.",
       "component": "realtime"
     },
     {
@@ -1448,19 +1448,19 @@ window.CODEX_UI_LAB = {
     {
       "name": "item/tool/call",
       "kind": "request",
-      "current": "Unregistered host tool",
-      "shared": "surface.snapshot",
-      "dom": ".ck-surface[data-surface=\"integrations\"]",
-      "rule": "Return failed native tool result; no host tools registered.",
+      "current": "Native host tools",
+      "shared": "tool.start / tool.result",
+      "dom": ".ck-row; .ck-detail",
+      "rule": "Validate arguments; execute registered native host action; respond once or fail with timeout/cancellation.",
       "component": "integrations"
     },
     {
       "name": "account/chatgptAuthTokens/refresh",
       "kind": "request",
-      "current": "Unavailable callback",
+      "current": "Managed refresh / sign-in",
       "shared": "surface.snapshot",
       "dom": ".ck-surface[data-surface=\"account\"]",
-      "rule": "Explicit JSON-RPC error; no credentials or attestation fabricated.",
+      "rule": "Refresh managed credentials with account/read; external-token callback returns explicit error and offers managed sign-in.",
       "component": "account"
     },
     {

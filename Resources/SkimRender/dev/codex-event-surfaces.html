@@ -5,12 +5,14 @@
 <script src="../vendor/marked.min.js"></script><script src="../vendor/purify.min.js"></script><script src="../vendor/highlight.min.js"></script><script src="../skim-classify.js"></script><script src="../skim-render.js"></script><script src="../agent-events.js"></script><script src="../agent-claude.js"></script><script src="../agent-codex.js"></script><script src="../chat.js"></script>
 <script>
 const feedback=document.getElementById('feedback');
-window.webkit={messageHandlers:{skim:{postMessage:message=>{const action=message.action&&typeof message.action==='object'?message.action:message;if(action.type==='state'||action.type==='usage'||action.type==='git')return;feedback.textContent='Local action: '+action.type+(typeof action.action==='string'?' · '+action.action:'')+(action.decision?' · '+action.decision:'');}}}};
+window.webkit={messageHandlers:{skim:{postMessage:message=>{const action=message.action&&typeof message.action==='object'?message.action:message;if(action.type==='state'||action.type==='usage'||action.type==='git')return;feedback.textContent='Local action: '+action.type+(typeof action.action==='string'?' · '+action.action:'')+(action.decision?' · '+action.decision:'');
+if(action.type==='realtimeStart'||action.type==='realtimeStop'||action.type==='realtimeMute')feed(surface('codex:voice:preview-thread','realtime','Voice conversation','floaty/realtime',{status:action.type==='realtimeStop'?'closed':action.muted?'muted':'active',message:'Synthetic voice state — microphone stays off'},{placement:'session'}));
+if(action.type==='surfaceAction'&&['accountRead','accountRefresh','accountLogin','accountLoginCancel'].includes(action.action))feed(surface('sample-account','account','Codex account','floaty/account',{status:action.action==='accountLogin'?'signingIn':action.action==='accountLoginCancel'?'cancelled':'signedIn',message:'Synthetic account action — no credentials accessed',loginPending:action.action==='accountLogin'},{placement:'session'}));}}}};
 const event=(type,fields={})=>({v:1,agent:'codex',type,t:Date.now(),raw:{synthetic:true},threadId:'preview-thread',turnId:'preview-turn',...fields});
 const feed=(...events)=>AgentChat.receive(events);
 const surface=(id,surface,title,method,data,extra={})=>event('surface.snapshot',{id,surface,title,method,data,...extra});
 AgentChat.boot({agent:'codex',cwd:'/workspace/floatyterm',home:'/workspace'});
-feed(event('session',{sessionId:'preview-thread'}));AgentChat.showUser('Show the remaining Codex event surfaces.');
+feed(event('session',{sessionId:'preview-thread'}),event('capabilities',{features:{realtimeVoice:true,credentials:true}}));AgentChat.showUser('Show the remaining Codex event surfaces.');
 feed(event('turn.start'),event('content.snapshot',{id:'reply',kind:'text',text:'The following panels use the production renderer with synthetic events. Expand details to inspect results and metadata.',final:true}),
  event('plan.snapshot',{explanation:'Normalize events, render owned components, then connect native responses.',plan:[{step:'Map event destinations',status:'completed'},{step:'Render remaining surfaces',status:'inProgress'},{step:'Connect host capabilities',status:'pending'}]}),
  event('tool.start',{id:'command',name:'Bash',input:{command:'node build.mjs',cwd:'/workspace/floatyterm'}}),
@@ -29,10 +31,10 @@ feed(event('turn.start'),event('content.snapshot',{id:'reply',kind:'text',text:'
 const samples=[
  ['status','Status / buffering','thread/status/changed',{status:{type:'active'}}],
  ['session','Thread / project details','thread/attachment/updated',{attachments:[{id:'attachment-1',path:'docs/events.md'}],project:{name:'FloatyTerm'}}],
- ['account','Account / usage / auth','account/updated',{authMode:'chatgpt',planType:'synthetic',status:'connected'}],
+ ['account','Codex account','floaty/account',{account:{type:'chatgpt',email:'preview@example.invalid',planType:'synthetic'},status:'signedIn',message:'Synthetic signed-in account',loginPending:false}],
  ['environment','Environment / remote control','thread/environment/disconnected',{status:'disconnected',message:'Remote environment is not connected.'}],
  ['integrations','Integrations / MCP progress','mcpServer/status/updated',{server:'docs',status:'ready',tools:3}],
- ['realtime','Realtime voice','thread/realtime/outputAudio/delta',{audio:{sampleRate:24000,playback:'Audio transport is not connected in this host.'}}],
+ ['realtime','Voice conversation','floaty/realtime',{status:'active',message:'Synthetic voice session — no microphone or provider connection'}],
  ['hooks','Hook runs','hook/completed',{run:{id:'hook-1',eventName:'postToolUse',status:'completed',durationMs:15,entries:[{kind:'feedback',text:'Synthetic hook finished.'}]}}],
  ['review','Review mode','enteredReviewMode',{review:'Reviewing the current working tree.'}],
  ['search','File search results','fuzzyFileSearch/sessionUpdated',{files:[{path:'Resources/SkimRender/chat.js',score:98}]}],
@@ -47,7 +49,7 @@ const samples=[
  ['function-output','Function output','functionCallOutput',{name:'lookup',output:{found:true}}],
  ['subagent','Child agent activity','subAgentActivity',{status:'completed',message:'Child analysis finished.'}]
 ];
-for(const [id,title,method,data] of samples)feed(surface('sample-'+id,id,title,method,data,{placement:['status','session','account','environment','integrations','realtime'].includes(id)?'session':'turn'}));
+for(const [id,title,method,data] of samples)feed(surface(id==='realtime'?'codex:voice:preview-thread':'sample-'+id,id,title,method,data,{placement:['status','session','account','environment','integrations','realtime'].includes(id)?'session':'turn'}));
 let count=0;
 document.getElementById('output').onclick=()=>feed(event('tool.output.delta',{id:'command',name:'Bash',text:'Completed synthetic asset '+(++count)+'\n'}));
 document.getElementById('finish').onclick=()=>feed(event('tool.result',{id:'command',name:'Bash'}));
