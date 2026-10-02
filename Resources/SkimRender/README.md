@@ -110,6 +110,128 @@ with long tool output and file contents cut. A conversation changed in the
 last two minutes is tagged "active now": it may be open in another tab or
 terminal, and two writers must not share a session.
 
+**@ mentions.** Type `@` for Claude Code's own fuzzy file search (the sidecar
+sends the `file_suggestions` control request) and for `@agent-…` subagents;
+a folder keeps the list open. Claude Code expands `@path` itself. Files dropped
+from Finder become mentions (the host's `DropWebView` takes file drags, so
+WebKit does not open them).
+
+**Images.** Paste or drop images: chips in the composer, sent as image blocks
+before the text; big ones are downscaled to 1568 px.
+
+**Questions and plans.** `AskUserQuestion` and `ExitPlanMode` get their own
+cards. Answers go back through the approval (`updatedInput.answers`); a plan
+approval can switch the mode (`updatedPermissions` setMode).
+
+**Status and tasks.** Retries, rate-limit warnings, hook output, blocked tools
+and notifications show as notices (mapped in `agent-claude.js`). TodoWrite and
+TaskCreate/TaskUpdate feed a task line above the status line.
+
+**Subagents and background work.** `task_started` / `task_progress` /
+`task_notification` join their tool row by `tool_use_id`: a running Agent row
+shows its tool count and tokens (the progress summary in its tooltip), a
+background command or agent gets a "background" badge, and when a background
+one ends a notice says so, with its summary. `background_tasks_changed` counts
+the live ones in the idle status line ("Ready · 2 in the background").
+Ambient (housekeeping) tasks stay hidden. `thinking_tokens` puts a running
+estimate on the thinking line ("12s · ~1.5k tokens") when the thinking text
+itself is not shown.
+
+**Tool tray.** Each turn's tool calls go into a tray: a pill under the
+prompt, sticky at the top of the view while you read that turn. It counts the
+calls by phase ("8 tools · Explore 5 · Change 2 · Verify 1"), shows failures,
+and names the call that runs now (or "waiting for you") with its time. A click
+opens the turn's whole tool history over the reply; Esc or a click outside
+closes it. Where a run happened, a faint mark ("3 tools") stays in the reply
+and opens the tray at that run. Approval cards stay in the reply. ⋮ "Tool
+calls inline" puts the runs back in the reply, after their marks (kept in
+localStorage `ck.toolsInline`). A subagent's panel keeps its runs inline.
+
+**Stops and endings.** A stop arrives as `error_during_execution` with an
+`aborted_…` terminal reason and an `[ede_diagnostic] …` line; the normalizer
+makes it `turn.end` with status `interrupted` and drops diagnostic lines, so
+the footer says "Stopped · 1.9s" and no error notice shows. Limits say which
+("Stopped at the turn limit"); other errors keep their message.
+
+**A prompt's fate.** Prompts sent with an ID get `command_lifecycle` frames
+(`prompt.state`): a message that waits for the running turn says "Queued"
+(after 600 ms, so a quick start shows nothing); one cancelled or discarded
+before it ran says "Not sent", and "Refused" when the session declined it — a
+click puts its text back in the composer. Other frames the TUI shows as banners
+(API errors, model fallbacks, memories saved, agents stopped, the away
+summary, scheduled tasks, Stop-hook problems, published changes, feedback
+drafts, peer notices) become notices; `vcs_state_changed` re-reads git and
+`task_summary` is the status line's live phrase. Heartbeats, transcript
+mirroring and cloud-session frames are dropped.
+
+**Side questions.** `/btw <question>` asks Claude a quick question about the
+conversation without adding to it: the sidecar sends Claude Code's
+`side_question` control request (answered from the conversation so far, no
+tools, not saved to the transcript; it works while a turn runs). The answer
+shows in a panel above the status line, with a field for follow-ups: each
+follow-up sends the earlier questions and answers of that panel as `history`.
+Esc or × closes the panel and drops its thread. `/btw` alone opens an empty one.
+
+**Rewind.** Each prompt sent here carries its own ID (`send.uuid`; Claude Code
+keeps it in the transcript), and the page remembers the transcript entry before
+it (the newest `uuid` of a main-chain assistant or user message; the history
+sends `uuid`s and `before`). Hover a prompt for ↺, press Esc Esc in an empty
+composer, or type `/rewind` (alias `/checkpoint`) for a list. The panel above
+the status line asks the sidecar for a dry run (`rewindFiles` with `dryRun`:
+files, +/− lines), then offers 1 Code and conversation, 2 Conversation only,
+3 Code only, Esc Cancel. Files: `Query.rewindFiles(promptId)` (the sidecar
+starts every session with `enableFileCheckpointing`). Conversation: the page
+removes that turn and everything after it, puts the prompt's text back in the
+composer, and the host restarts the session with `resumeAt` / `dropsTurn`
+(`resumeSessionAt` / `resumeDropsTurn`); before the first prompt, main starts a
+new conversation and a side chat forks main again. If Claude Code refuses the
+cut ("Resume rejected by --resume-drops-turn"), the session goes on whole.
+
+**Long prompts.** A prompt over about 6 lines (or 420 characters) folds to its
+first lines, faded at the bottom; "Show all" (or a click on the text) opens
+it. A prompt that fits once laid out loses the fold.
+
+**Subagent transcripts.** A subagent's messages carry the id of the Agent
+call that started it (`parent_tool_use_id`); the normalizer marks its text,
+thinking and tool results with that `parentId`. The page draws them into a
+transcript of its own (a hidden conversation, with the same code as the main
+one), so the conversation keeps only the Agent row. Click the row (it counts
+the agent's tools) to open a panel above the dock: type, description, state,
+the prompt (folded) and every step, live while it runs. A nested agent opens
+from the panel, with a back button. Esc or × closes it. The approval card for a
+subagent's tool stays in the conversation. A resumed chat has no subagent
+messages, so the panel shows the agent's result and says why.
+
+**Motion.** One set of values (`--m-fast` 120 ms, `--m-mid` 180 ms,
+`--m-slow` 260 ms, one easing; `M` in `chat.js`). In a live reply, new words
+fade in: `SkimRender.render(…, { reveal: true })` wraps the text that arrived
+since the last render in `.sk-fresh` spans, and because the growing block is
+rebuilt on every render, words still fading are wrapped again with a negative
+animation delay, so the fade goes on instead of starting over. A new non-text
+block, tool row, run, thinking line, card, notice and your own message rise in
+(`enter()`); menus, the usage panel, the subagent panel, chips, the lightbox and
+the reference button open softly. Folds slide: thinking, tool details, runs,
+the subagent prompt, the task list and the usage panel (`expand()` /
+`collapse()`); the state (the hidden attribute or class) changes at once and
+only the drawing follows, so no other code waits for a slide. Nothing moves
+while a history is drawn, in a conversation out of view, with macOS "Reduce
+motion", or with `class="no-motion"` on `<html>` (the test pages; dock-test
+section 31 turns it on to check the motion).
+
+**Session name.** The ⋮ menu shows the conversation's name (the one you gave
+it, else Claude Code's summary or first prompt) and "Rename…". `/rename <name>`
+(alias `/name`) names it here: the sidecar sends Claude Code the
+`rename_session` control request (`source: 'host'`), so the running session and
+its transcript agree, and `/resume` lists it by that name.
+
+**Mic.** The mic above the send button dictates into the composer, where the
+caret was: the host uses the Mac's speech recognition (`Dictation.swift`,
+`SFSpeechRecognizer`, on the device when it can), and asks for the Speech
+Recognition and Microphone permissions the first time. Click again or press
+Esc to stop; Return sends what it heard; typing stops it and keeps your text.
+`/voice` toggles it too. Claude Code's own `/voice` cannot run here: it records
+inside its terminal UI and is not available to non-interactive (SDK) sessions.
+
 **Composer height.** Drag the grip on the text field's left edge (up is
 taller, up to 60% of the window); double-click resets it to grow with the text.
 
@@ -151,7 +273,7 @@ swift Resources/SkimRender/dev/snapshot.swift "Resources/SkimRender/dev/chat-rep
 # a dock menu at the panel's real size (width, settle seconds, viewport height)
 swift Resources/SkimRender/dev/snapshot.swift "Resources/SkimRender/dev/chat-replay.html?pop=slash&q=co" /tmp/slash.png 700 2 420
 # scripted checks of the dock (keys, menus, suggestions); failures print as errors
-swift Resources/SkimRender/dev/snapshot.swift Resources/SkimRender/dev/dock-test.html /tmp/dock.png 700 8 420
+swift Resources/SkimRender/dev/snapshot.swift Resources/SkimRender/dev/dock-test.html /tmp/dock.png 700 1 420
 ```
 
 `?change=edit|write|multi` (with `&diff=1`, `&big=1`) shows a file-change card (data: `dev/change-sample.js`).

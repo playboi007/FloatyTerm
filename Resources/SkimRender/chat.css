@@ -2,6 +2,7 @@
    floating panel (about 700 × 420 pt), where every line has to earn its place. */
 
 body.ck { min-height: 100vh; display: flex; flex-direction: column; }
+
 /* Aggregate changes belong to a turn, below its reply and above its footer. */
 .ck-turn-diff { min-width: 0; color: var(--text-3); font-size: 12px; }
 .ck-turn-diff-summary { cursor: pointer; color: var(--muted); padding: 7px 0; overflow-wrap: anywhere; }
@@ -175,6 +176,8 @@ body.ck { min-height: 100vh; display: flex; flex-direction: column; }
 /* ── notices, turn footer ──────────────────────────────────────────────── */
 .ck-notice { font-size: 12.5px; color: var(--muted); padding: 6px 10px; border-radius: 8px; background: var(--surface); border: 1px solid var(--line); }
 .ck-notice[data-kind="error"] { color: #f2b8b0; border-color: rgba(236,127,114,.35); background: rgba(236,127,114,.06); }
+.ck-notice[data-kind="warn"] { color: #ecd9a4; border-color: rgba(226,189,98,.35); background: rgba(226,189,98,.06); }
+.ck-notice.is-faded { opacity: .55; }
 .ck-foot { font: 11px var(--mono); color: var(--ghost); }
 
 /* ── dock: status line + composer, pinned to the bottom ────────────────── */
@@ -277,7 +280,7 @@ body.is-resizing, body.is-resizing * { cursor: ns-resize !important; user-select
 /* popover: model menu, mode menu, slash suggestions */
 .ck-pop { position: absolute; z-index: 20; min-width: 260px; max-width: min(420px, 100%); display: flex; flex-direction: column;
   background: #1e1d1a; border: 1px solid var(--line-3); border-radius: 10px; box-shadow: 0 12px 32px rgba(0,0,0,.5), 0 2px 6px rgba(0,0,0,.3); overflow: hidden; }
-.ck-pop[data-kind="slash"] { max-width: none; }
+.ck-pop[data-kind="slash"], .ck-pop[data-kind="mention"] { max-width: none; }
 .ck-pop-head { flex: none; display: flex; align-items: center; gap: 8px; padding: 7px 12px 6px; border-bottom: 1px solid var(--line);
   font: 500 10.5px var(--mono); letter-spacing: .05em; text-transform: uppercase; color: var(--faint); }
 .ck-pop-head > span { display: flex; flex: 1; gap: 8px; }
@@ -287,9 +290,12 @@ body.is-resizing, body.is-resizing * { cursor: ns-resize !important; user-select
 .ck-pop-item.is-sel { background: #2a2824; }
 .ck-pop-check { flex: none; width: 12px; height: 12px; position: relative; }
 .ck-pop-item.is-current .ck-pop-check::after { content: ''; position: absolute; left: 3px; top: 0; width: 4px; height: 8px; border: solid var(--accent); border-width: 0 1.5px 1.5px 0; transform: rotate(45deg); }
-.ck-pop[data-kind="slash"] .ck-pop-check { display: none; }
+.ck-pop[data-kind="slash"] .ck-pop-check, .ck-pop[data-kind="mention"] .ck-pop-check { display: none; }
 .ck-pop-main { display: flex; flex-direction: column; min-width: 0; flex: 1; }
-.ck-pop[data-kind="slash"] .ck-pop-main { flex-direction: row; align-items: baseline; gap: 10px; }
+.ck-pop[data-kind="slash"] .ck-pop-main, .ck-pop[data-kind="mention"] .ck-pop-main { flex-direction: row; align-items: baseline; gap: 10px; }
+/* a path takes the room it needs; a subagent's description gets what is left */
+.ck-pop[data-kind="mention"] .ck-pop-title.is-mono { flex: 0 1 auto; max-width: 100%; }
+.ck-pop[data-kind="mention"] .ck-pop-desc { flex: 1 1 0; }
 .ck-pop-title { font-size: 13px; color: var(--text); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .ck-pop-title.is-mono { font: 12px var(--mono); flex: none; max-width: 60%; }
 .ck-pop-title b { color: var(--accent); font-weight: 600; }
@@ -385,6 +391,19 @@ body.is-resizing, body.is-resizing * { cursor: ns-resize !important; user-select
 .ck-send-ic { width: 0; height: 0; border-left: 9px solid var(--text); border-top: 6px solid transparent; border-bottom: 6px solid transparent; margin-left: 2px; }
 .ck-send[data-mode="stop"] .ck-send-ic { width: 10px; height: 10px; border: 0; border-radius: 2px; background: var(--bad); margin: 0; }
 
+/* the mic above the send button: dictation into the composer */
+.ck-actions { flex: none; display: flex; flex-direction: column; align-items: center; gap: 5px; }
+.ck-mic { position: relative; width: 36px; height: 26px; border-radius: 8px; border: 1px solid var(--line-3); background: var(--surface); color: var(--text-3);
+  cursor: pointer; display: flex; align-items: center; justify-content: center; }
+.ck-mic[hidden] { display: none; }
+.ck-mic:hover { border-color: var(--accent); color: var(--text); }
+.ck-mic[data-state="starting"], .ck-mic[data-state="stopping"] { color: var(--text); border-color: var(--line-3); opacity: .75; }
+.ck-mic[data-state="listening"] { color: #fff; background: var(--bad); border-color: var(--bad); }
+.ck-mic[data-state="listening"]::after { content: ''; position: absolute; inset: -4px; border-radius: 11px; border: 2px solid var(--bad);
+  opacity: 0; animation: ck-mic-ring 1.4s ease-out infinite; pointer-events: none; }
+@keyframes ck-mic-ring { 0% { opacity: .55; transform: scale(.9); } 100% { opacity: 0; transform: scale(1.12); } }
+@media (prefers-reduced-motion: reduce) { .ck-mic[data-state="listening"]::after { animation: none; } }
+
 /* The status chips use explicit display rules; keep capability-hidden controls out of layout. */
 .ck-chip[hidden], .ck-view[hidden], .ck-view-more[hidden] { display: none; }
 .ck-unknown { margin: 8px 0; border: 1px solid var(--line-2); border-radius: 6px; color: var(--text-3); font: 11px var(--mono); }
@@ -402,9 +421,250 @@ body.is-resizing, body.is-resizing * { cursor: ns-resize !important; user-select
   .ck-model-x { display: none; }
   .ck-ctx { display: none; }   /* the ⋮ menu has the same facts */
   .ck-view-t { display: none; }  /* the icon and dot are enough at this width */
-  .ck-pop[data-kind="slash"] .ck-pop-main { flex-direction: column; align-items: stretch; gap: 0; }
+  .ck-pop[data-kind="slash"] .ck-pop-main, .ck-pop[data-kind="mention"] .ck-pop-main { flex-direction: column; align-items: stretch; gap: 0; }
   .ck-pop-title.is-mono { max-width: 100%; }
 }
+
+/* ── @ mentions in the user's message ──────────────────────────────────── */
+.ck-mention { font: 12.5px var(--mono); color: var(--path); }
+
+/* ── images: chips above the composer, thumbnails in the sent message ──── */
+.ck-field.is-drop { border-color: var(--accent); background: color-mix(in srgb, var(--accent) 6%, var(--surface)); }
+.ck-ref.ck-img { border-left-color: var(--path); padding-left: 4px; }
+.ck-img-th { flex: none; width: 28px; height: 20px; object-fit: cover; border-radius: 3px; background: var(--inset); }
+.ck-img .ck-ref-text { font: 11.5px var(--mono); }
+.ck-img-peek { position: fixed; z-index: 40; padding: 3px; border: 1px solid var(--line-3); border-radius: 7px; background: #1e1d1a;
+  box-shadow: 0 10px 28px rgba(0,0,0,.55); pointer-events: none; }
+.ck-img-peek img { display: block; border-radius: 4px; }
+.ck-user-imgs { display: flex; flex-wrap: wrap; gap: 5px; max-width: 100%; }
+.ck-user-img { flex: none; padding: 0; height: 48px; border: 1px solid var(--line-3); border-radius: 6px; background: var(--inset); overflow: hidden; cursor: zoom-in; }
+.ck-user-img:hover { border-color: var(--accent); }
+.ck-user-img img { display: block; height: 100%; width: auto; max-width: 96px; object-fit: cover; }
+.ck-lightbox { position: fixed; inset: 0; z-index: 50; display: flex; align-items: center; justify-content: center; padding: 24px;
+  background: rgba(8,8,7,.82); cursor: zoom-out; }
+.ck-lightbox img { max-width: 100%; max-height: 100%; object-fit: contain; border-radius: 6px; box-shadow: 0 16px 48px rgba(0,0,0,.6); }
+
+/* ── question and plan cards (AskUserQuestion, ExitPlanMode) ───────────── */
+.ck-card[data-risk="info"] { --risk: var(--path); border-color: rgba(143,179,230,.35); }
+.ck-ask { display: flex; flex-direction: column; gap: 12px; padding: 2px 12px 12px; }
+.ck-q { display: flex; flex-direction: column; gap: 5px; min-width: 0; }
+.ck-q:not(.is-cur):not(.is-done) { opacity: .75; }
+.ck-q-h { font: 600 10px var(--mono); letter-spacing: .06em; text-transform: uppercase; color: var(--faint); }
+.ck-q-t { font-size: 13.5px; color: var(--text); overflow-wrap: anywhere; }
+.ck-q-opts { display: flex; flex-direction: column; gap: 4px; }
+.ck-q-opt { align-items: flex-start; min-height: 30px; padding: 4px 10px; }
+.ck-q-opt .ck-key { margin-top: 1px; }
+/* number keys show only on the current question; the others close the gap */
+.ck-q-opt .ck-key:empty { display: none; }
+/* label and description share a line while they fit; the description drops below at narrow widths */
+.ck-q-opt-main { display: flex; flex-wrap: wrap; align-items: baseline; column-gap: 10px; min-width: 0; flex: 1; padding-top: 1px; }
+.ck-q-opt-l { flex: none; max-width: 100%; overflow-wrap: anywhere; }
+.ck-q-opt-d { flex: 1 1 230px; min-width: 0; font-size: 11.5px; line-height: 1.4; color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ck-q-opt.is-on { border-color: var(--accent); background: color-mix(in srgb, var(--accent) 9%, var(--surface-2)); }
+.ck-q-opt.is-on .ck-q-opt-d { color: var(--text-3); }
+/* selection marks, drawn: a ring with a dot (one choice), a box with a check (several) */
+.ck-radio, .ck-check { flex: none; position: relative; width: 14px; height: 14px; margin-top: 3px; border: 1.5px solid var(--line-3); }
+.ck-radio { border-radius: 50%; }
+.ck-check { border-radius: 4px; }
+.ck-q-opt.is-on .ck-radio, .ck-q-opt.is-on .ck-check { border-color: var(--accent); }
+.ck-q-opt.is-on .ck-radio::after { content: ''; position: absolute; inset: 2.5px; border-radius: 50%; background: var(--accent); }
+.ck-q-opt.is-on .ck-check { background: var(--accent); }
+.ck-q-opt.is-on .ck-check::after { content: ''; position: absolute; left: 3.5px; top: 0.5px; width: 4px; height: 8px; border: solid var(--bg); border-width: 0 1.6px 1.6px 0; transform: rotate(45deg); }
+.ck-q-other { width: 100%; height: 30px; padding: 0 10px; background: var(--inset); color: var(--text); border: 1px solid var(--line-3); border-radius: 8px; font: 13px var(--sans); outline: none; }
+.ck-q-other:focus { border-color: var(--accent); }
+.ck-q-prev.sk-doc { margin: 0; padding: 8px 12px; max-width: none; gap: 6px; max-height: 160px; overflow-y: auto; background: var(--inset);
+  border: 1px solid var(--line); border-radius: 8px; font-size: 12.5px; color: var(--text-3); overscroll-behavior: contain; }
+.ck-ask-foot { display: flex; align-items: center; gap: 8px; }
+.ck-go { border-color: var(--accent); color: var(--text); background: color-mix(in srgb, var(--accent) 16%, transparent); }
+.ck-go:hover:not(:disabled) { background: color-mix(in srgb, var(--accent) 28%, transparent); }
+.ck-go:disabled { opacity: .4; border-color: var(--line-3); background: none; cursor: default; }
+.ck-ask-hint { margin-left: auto; font: 10.5px var(--mono); color: var(--ghost); }
+.ck-answers { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+.ck-answer { overflow-wrap: anywhere; color: var(--text-3); }
+.ck-answer-h { color: var(--faint); }
+.ck-plan-wrap { margin: 0 12px; background: var(--inset); border: 1px solid var(--line); border-radius: 8px; overflow: hidden; }
+.ck-plan-bar { display: flex; align-items: center; gap: 8px; min-height: 30px; padding: 3px 5px 3px 10px; border-bottom: 1px solid var(--line); }
+.ck-plan-k { font: 600 10px var(--mono); letter-spacing: .06em; text-transform: uppercase; color: var(--faint); }
+.ck-plan-wrap.is-big .ck-chg-exp-ic { transform: rotate(180deg); }
+.ck-plan-box.sk-doc { margin: 0; padding: 10px 14px 12px; max-width: none; gap: 8px; max-height: 260px; overflow-y: auto; font-size: 13px; overscroll-behavior: contain; }
+.ck-plan-wrap.is-big .ck-plan-box.sk-doc { max-height: min(72vh, 680px); }
+.ck-plan-also { padding: 8px 12px 0; font-size: 12px; color: var(--muted); display: flex; flex-wrap: wrap; gap: 4px 6px; align-items: baseline; }
+.ck-plan-also-k { color: var(--faint); }
+.ck-plan-cmd { font: 11.5px var(--mono); color: var(--text-3); background: var(--surface-3); border-radius: 4px; padding: 0 5px; overflow-wrap: anywhere; }
+/* an answered plan hides behind a toggle in its outcome line */
+.ck-card.is-resolved .ck-plan-wrap, .ck-card.is-resolved .ck-plan-also { display: none; }
+.ck-card.is-resolved.is-plan-open .ck-plan-wrap { display: block; margin-bottom: 4px; }
+.ck-plan-toggle { flex: none; height: 20px; padding: 0 7px; border: 1px solid var(--line-3); border-radius: 5px; background: transparent; color: var(--text-3); font: 11px var(--mono); cursor: pointer; }
+.ck-plan-toggle:hover { border-color: var(--accent); color: var(--text); }
+
+/* ── the task list: above the status line ──────────────────────────────── */
+.ck-tasks { margin-bottom: 6px; background: var(--surface); border: 1px solid var(--line-2); border-radius: 8px; min-width: 0; }
+.ck-tasks-head { display: flex; align-items: center; gap: 10px; width: 100%; height: 26px; padding: 0 9px; border: 0; background: none; color: var(--muted);
+  font: 11.5px var(--mono); text-align: left; cursor: pointer; }
+.ck-tasks-head:hover { background: var(--surface-3); border-radius: 8px; }
+.ck-tasks-k { flex: none; color: var(--text-3); white-space: nowrap; }
+.ck-tasks-bar { flex: none; width: 56px; height: 3px; border-radius: 2px; background: var(--surface-3); overflow: hidden; }
+.ck-tasks-fill { display: block; height: 100%; border-radius: 2px; background: var(--accent); transition: width .25s; }
+.ck-tasks.is-done .ck-tasks-fill { background: var(--good); }
+.ck-tasks-now { display: flex; align-items: center; gap: 7px; flex: 1; min-width: 0; color: var(--text-3); }
+.ck-tasks-now-t { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-family: var(--sans); font-size: 12px; }
+.ck-task-spin { flex: none; width: 10px; height: 10px; border-radius: 50%; border: 1.5px solid var(--line-3); border-top-color: var(--accent); animation: ck-spin .8s linear infinite; }
+.ck-tasks-caret { flex: none; color: var(--faint); transform: rotate(180deg); }
+.ck-tasks.is-open .ck-tasks-caret { transform: none; color: var(--accent); }
+.ck-tasks-list { max-height: 30vh; overflow-y: auto; padding: 2px 9px 6px; border-top: 1px solid var(--line); overscroll-behavior: contain; }
+.ck-task { display: flex; align-items: flex-start; gap: 9px; padding: 3px 0; font-size: 12.5px; line-height: 1.4; color: var(--text-3); }
+.ck-task-t { min-width: 0; overflow-wrap: anywhere; }
+.ck-task-box { flex: none; position: relative; width: 13px; height: 13px; margin-top: 2px; border-radius: 50%; border: 1.5px solid var(--line-3); }
+.ck-task[data-status="in_progress"] { color: var(--text); }
+.ck-task[data-status="in_progress"] .ck-task-box { border-color: var(--accent); box-shadow: 0 0 0 2px color-mix(in srgb, var(--accent) 18%, transparent); }
+.ck-task[data-status="completed"] { color: var(--faint); }
+.ck-task[data-status="completed"] .ck-task-t { text-decoration: line-through; text-decoration-color: var(--ghost); }
+.ck-task[data-status="completed"] .ck-task-box { background: var(--good); border-color: var(--good); }
+.ck-task[data-status="completed"] .ck-task-box::after { content: ''; position: absolute; left: 3.5px; top: 0.5px; width: 3.5px; height: 7px; border: solid var(--bg); border-width: 0 1.6px 1.6px 0; transform: rotate(45deg); }
+@media (max-width: 560px) {
+  .ck-ask-hint { display: none; }
+  .ck-tasks-bar { width: 36px; }
+}
+
+/* ── a subagent's transcript: a panel over the conversation, above the dock ── */
+.ck-row.is-agent { cursor: pointer; }
+.ck-row.is-agent:hover .ck-name { color: var(--accent); }
+.ck-row.is-agent .ck-meta::after { content: ' ›'; color: var(--faint); }
+.ck-subpanel { position: fixed; top: 0; left: 0; right: 0; bottom: var(--ck-dock-h, 96px); z-index: 4; display: flex; flex-direction: column;
+  background: var(--bg); border-bottom: 1px solid var(--line-2); box-shadow: 0 10px 24px rgba(0,0,0,.35); }
+.ck-subpanel[hidden] { display: none; }
+.ck-sub-head { flex: none; display: flex; align-items: center; gap: 8px; min-width: 0; height: 38px; padding: 0 10px 0 12px;
+  border-bottom: 1px solid var(--line-2); background: var(--surface); font: 12.5px var(--sans); color: var(--text-3); }
+.ck-sub-ic { flex: none; display: flex; color: var(--accent); }
+.ck-sub-type { flex: none; color: var(--text); font-weight: 600; }
+.ck-sub-desc { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ck-sub-state { flex: none; padding: 1px 7px; border-radius: 9px; font: 10.5px var(--mono); background: var(--surface-3); color: var(--muted); }
+.ck-sub-state[data-state="running"] { color: var(--accent); }
+.ck-sub-state[data-state="running"]::before { content: '● '; animation: ck-pulse 1.2s ease-in-out infinite; }
+.ck-sub-state[data-state="done"] { color: var(--good); }
+.ck-sub-state[data-state="error"], .ck-sub-state[data-state="interrupted"] { color: var(--bad); }
+.ck-sub-stats { flex: none; font: 11px var(--mono); color: var(--ghost); }
+.ck-sub-btn { flex: none; position: relative; width: 24px; height: 24px; border: 0; border-radius: 6px; background: none; color: var(--text-3);
+  cursor: pointer; display: flex; align-items: center; justify-content: center; }
+.ck-sub-btn:hover { background: var(--line-2); color: var(--text); }
+.ck-sub-x::before, .ck-sub-x::after { content: ''; position: absolute; left: 7px; top: 11.25px; width: 10px; height: 1.5px; background: currentColor; transform: rotate(45deg); }
+.ck-sub-x::after { transform: rotate(-45deg); }
+.ck-sub-scroll { flex: 1; min-height: 0; overflow: auto; }
+.ck-sub-in { max-width: 860px; margin: 0 auto; padding: 12px 16px 20px; display: flex; flex-direction: column; gap: 14px; }
+.ck-log.ck-sub-log { flex: none; padding: 0; max-width: none; }
+.ck-sub-prompt-h { display: block; width: 100%; padding: 0; border: 0; background: none; text-align: left; cursor: pointer; color: var(--faint);
+  font: 12px var(--sans); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.ck-sub-prompt-h::before { content: '▸ '; display: inline-block; transition: transform var(--m-fast) var(--m-ease); }
+.ck-sub-prompt.is-open .ck-sub-prompt-h::before { transform: rotate(90deg); }
+.ck-sub-prompt-h:hover { color: var(--muted); }
+.ck-sub-prompt-t { margin-top: 6px; padding: 7px 12px; border-left: 2px solid var(--accent); background: var(--surface); border-radius: 0 8px 8px 0;
+  color: var(--text-2); font-size: 12.5px; white-space: pre-wrap; overflow-wrap: anywhere; max-height: 240px; overflow: auto; }
+.ck-sub-foot:empty { display: none; }
+.ck-sub-foot { display: flex; flex-direction: column; gap: 8px; }
+.ck-sub-note { color: var(--faint); font: 12.5px var(--sans); }
+
+/* ── motion: the menus open from their edge; carets turn; "Reduce motion" stops the loops ── */
+.ck-pop { transform-origin: bottom right; }
+.ck-run-caret, .ck-think-caret, .ck-tasks-caret, .ck-chip-caret { transition: transform var(--m-fast) var(--m-ease); }
+@media (prefers-reduced-motion: reduce) {
+  .ck-think.is-live .ck-think-ic, .ck-think.is-live .ck-think-verb, .ck-task-spin, .ck-sub-state[data-state="running"]::before { animation: none; }
+  .ck-think.is-live .ck-think-verb { color: var(--text); }
+  .ck-run-caret, .ck-think-caret, .ck-tasks-caret, .ck-chip-caret, .ck-sub-prompt-h::before { transition: none; }
+}
+
+/* ── a long prompt: folded to its first lines, faded at the bottom ── */
+.ck-user-text.is-folded:not(.is-open):not([data-fits]) { max-height: 9.6em; overflow: hidden; cursor: pointer;
+  -webkit-mask-image: linear-gradient(to bottom, #000 50%, transparent); mask-image: linear-gradient(to bottom, #000 50%, transparent); }
+.ck-user-more { padding: 0 2px; border: 0; background: none; color: var(--faint); font: 11.5px var(--sans); cursor: pointer; }
+.ck-user-more:hover { color: var(--accent); }
+.ck-user-more[hidden] { display: none; }
+
+/* ── how a turn ended: "Stopped", in words, not a diagnostic ── */
+.ck-foot-how { color: var(--muted); }
+.ck-foot[data-status="interrupted"] .ck-foot-how::before { content: ''; display: inline-block; width: 6px; height: 6px; margin-right: 6px; border-radius: 1.5px;
+  background: var(--faint); vertical-align: 1px; }
+.ck-foot[data-status="error"] .ck-foot-how { color: var(--bad); }
+
+/* ── tool calls: a tray per turn (a sticky pill; its panel lists the turn's runs) ── */
+.ck-tray { position: sticky; top: 8px; z-index: 3; align-self: flex-start; max-width: 100%; }
+body.tools-inline .ck-tray, body.tools-inline .ck-run-mark { display: none; }
+.ck-tray-pill { display: inline-flex; align-items: center; gap: 7px; max-width: 100%; min-width: 0; height: 26px; padding: 0 9px 0 8px; border-radius: 13px;
+  border: 1px solid var(--line-3); background: var(--surface-2); color: var(--text-3); font: 11.5px var(--mono); white-space: nowrap; cursor: pointer;
+  box-shadow: 0 4px 14px rgba(0,0,0,.35); }
+.ck-tray-pill:hover, .ck-tray.is-open .ck-tray-pill { border-color: var(--accent); color: var(--text); }
+.ck-tray-ic { flex: none; display: flex; color: var(--faint); }
+.ck-tray[data-state="running"] .ck-tray-ic { color: var(--accent); animation: ck-pulse 1.2s ease-in-out infinite; }
+.ck-tray[data-state="waiting"] .ck-tray-pill { border-color: var(--warn); }
+.ck-tray[data-state="waiting"] .ck-tray-ic { color: var(--warn); }
+.ck-tray[data-state="failed"] .ck-tray-pill { border-color: rgba(236,127,114,.45); }
+.ck-tray-label { flex: none; }
+.ck-tray-live { min-width: 0; display: flex; gap: 6px; overflow: hidden; }
+.ck-tray-live:empty { display: none; }
+.ck-tray-live > span { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+.ck-tray-live > span::before { content: '· '; color: var(--faint); }
+.ck-tray-now { color: var(--text-2); }
+.ck-tray[data-state="waiting"] .ck-tray-now { color: var(--warn); }
+.ck-tray-bad { flex: none; color: var(--bad); }
+.ck-tray-caret { flex: none; color: var(--faint); transition: transform var(--m-fast, 120ms) var(--m-ease, ease); }
+.ck-tray.is-open .ck-tray-caret { transform: rotate(180deg); }
+.ck-tray-panel { position: absolute; top: calc(100% + 6px); left: 0; width: min(680px, calc(100vw - 32px)); max-height: min(60vh, 520px); overflow: auto;
+  padding: 8px; border-radius: 10px; border: 1px solid var(--line-3); background: var(--bg); box-shadow: 0 16px 40px rgba(0,0,0,.5); transform-origin: top left; }
+.ck-tray-panel[hidden] { display: none; }
+.ck-tray-list { display: flex; flex-direction: column; gap: 8px; }
+/* where a run happened in the reply: a faint mark that opens the tray there */
+.ck-run-mark { align-self: flex-start; display: inline-flex; align-items: center; gap: 6px; padding: 1px 6px 1px 0; border: 0; background: none;
+  color: var(--ghost); font: 11px var(--mono); cursor: pointer; }
+.ck-run-mark::before { content: ''; width: 14px; height: 1px; background: var(--line-3); }
+.ck-run-mark:hover { color: var(--muted); }
+.ck-run-mark[data-state="running"] { color: var(--accent); }
+.ck-run-mark[data-state="failed"] { color: var(--bad); }
+@media (prefers-reduced-motion: reduce) { .ck-tray[data-state="running"] .ck-tray-ic { animation: none; } .ck-tray-caret { transition: none; } }
+
+/* ── rewind: a button on each prompt (on hover), a panel above the status line ── */
+.ck-user { position: relative; }
+.ck-rewind-btn { position: absolute; top: 3px; right: 0; width: 24px; height: 24px; border-radius: 6px; border: 1px solid var(--line-3);
+  background: var(--surface-2); color: var(--text-3); display: none; align-items: center; justify-content: center; cursor: pointer; }
+.ck-turn[data-rewind]:hover .ck-rewind-btn, .ck-turn[data-rewind] .ck-rewind-btn:focus-visible { display: flex; }
+.ck-rewind-btn:hover { color: var(--text); border-color: var(--accent); }
+.ck-rewind { margin-bottom: 8px; border: 1px solid var(--line-3); border-radius: 10px; background: var(--surface); overflow: hidden; }
+.ck-rewind[hidden] { display: none; }
+.ck-rw-head { display: flex; align-items: center; gap: 8px; padding: 10px 12px 0; font: 600 12.5px var(--sans); color: var(--text); }
+.ck-rw-ic { display: flex; color: var(--accent); }
+.ck-rw-quote { margin: 8px 12px 0; padding: 5px 10px; border-left: 2px solid var(--accent); background: var(--surface-2); border-radius: 0 6px 6px 0;
+  color: var(--text-2); font-size: 12.5px; white-space: pre-wrap; overflow-wrap: anywhere; max-height: 4.6em; overflow: hidden; }
+.ck-rw-what, .ck-rw-files { padding: 6px 12px 0; color: var(--text-3); font: 12px/1.45 var(--sans); }
+.ck-rw-files-k { color: var(--text-2); }
+.ck-rw-files-n { font-family: var(--mono); color: var(--muted); }
+.ck-rw-files-list { color: var(--path); }
+.ck-rewind .ck-opts { padding-top: 9px; flex-direction: row; flex-wrap: wrap; }
+.ck-rewind .ck-opt { width: auto; flex: 1 1 auto; white-space: nowrap; }
+.ck-rewind .ck-opt:disabled { opacity: .4; cursor: default; border-color: var(--line-3); background: var(--surface-2); }
+.ck-rewind .ck-opt[data-mode="cancel"] .ck-key { width: auto; padding: 0 4px; }
+
+/* ── /btw: a side question, in a panel above the status line (not in the conversation) ── */
+.ck-btw { display: flex; flex-direction: column; max-height: 48vh; margin-bottom: 8px; border: 1px solid var(--line-3); border-left: 2px solid var(--side, var(--accent));
+  border-radius: 10px; background: var(--surface); overflow: hidden; }
+.ck-btw[hidden] { display: none; }
+.ck-btw-head { flex: none; display: flex; align-items: center; gap: 8px; min-width: 0; padding: 7px 8px 7px 12px; border-bottom: 1px solid var(--line-2); }
+.ck-btw-ic { flex: none; display: flex; color: var(--side, var(--accent)); }
+.ck-btw-t { flex: none; font: 600 12.5px var(--sans); color: var(--text); }
+.ck-btw-hint { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font: 11px var(--sans); color: var(--faint); }
+.ck-btw-list { flex: 1; min-height: 0; overflow: auto; padding: 10px 12px; display: flex; flex-direction: column; gap: 8px; }
+.ck-btw-list:empty { display: none; }
+.ck-btw-q { align-self: flex-start; max-width: 100%; padding: 4px 10px; border-left: 2px solid var(--side, var(--accent)); background: var(--surface-2);
+  border-radius: 0 6px 6px 0; color: var(--text); font-size: 13px; white-space: pre-wrap; overflow-wrap: anywhere; }
+.ck-btw-q:not(:first-child) { margin-top: 6px; }
+.ck-btw-a.sk-doc { padding: 0; max-width: none; gap: 8px; font-size: 13.5px; }
+.ck-btw-a.is-wait { color: var(--faint); font: 12.5px var(--sans); }
+.ck-btw-a.is-wait::before { content: '● '; color: var(--side, var(--accent)); animation: ck-pulse 1.2s ease-in-out infinite; }
+.ck-btw-a.is-error { color: var(--bad); font: 12.5px var(--sans); }
+.ck-btw-a.is-synthetic { color: var(--muted); }
+.ck-btw-ask { flex: none; padding: 0 8px 8px; }
+.ck-btw-list:empty + .ck-btw-ask { padding-top: 8px; }
+.ck-btw-field { width: 100%; height: 30px; padding: 0 10px; border: 1px solid var(--line-3); border-radius: 7px; background: var(--inset); color: var(--text);
+  font: 13px var(--sans); outline: none; }
+.ck-btw-field:focus { border-color: var(--side, var(--accent)); }
+@media (prefers-reduced-motion: reduce) { .ck-btw-a.is-wait::before { animation: none; } }
 
 /* Semantic protocol surfaces: details stay with their turn, tool, or session. */
 .ck-session-surfaces { display:flex; flex-direction:column; gap:6px; margin:0 0 12px; }
@@ -450,3 +710,18 @@ body.is-resizing, body.is-resizing * { cursor: ns-resize !important; user-select
 .ck-event-image-dialog { max-width:90vw; max-height:90vh; background:var(--surface); color:var(--text); border:1px solid var(--line-3); border-radius:8px; }
 .ck-event-image-dialog img { display:block; max-width:80vw; max-height:75vh; object-fit:contain; }
 .ck-event-child { padding:10px; }
+
+/* ── a prompt's fate: "Queued" while it waits; "Not sent" / "Refused" when it never ran ── */
+.ck-user-state { align-self: flex-start; padding: 1px 7px; border-radius: 9px; border: 1px solid var(--line-3); background: var(--surface-2);
+  color: var(--muted); font: 10.5px var(--mono); cursor: pointer; }
+.ck-user-state[data-state="queued"] { cursor: default; color: var(--faint); }
+.ck-user-state[data-state="queued"]::before { content: '● '; color: var(--accent); animation: ck-pulse 1.2s ease-in-out infinite; }
+.ck-user-state[data-state="unsent"], .ck-user-state[data-state="discarded"], .ck-user-state[data-state="refused"] { color: var(--warn); border-color: rgba(229,192,123,.35); }
+.ck-user-state:not([disabled]):hover { border-color: var(--accent); color: var(--text); }
+@media (prefers-reduced-motion: reduce) { .ck-user-state[data-state="queued"]::before { animation: none; } }
+
+/* Native Codex voice and managed sign-in controls. */
+.ck-voice-start { align-self: center; border: 1px solid var(--sk-border, #444); border-radius: 7px; padding: 6px 10px; background: transparent; color: inherit; cursor: pointer; white-space: nowrap; }
+.ck-voice-start[aria-pressed="true"] { color: #e19c87; border-color: currentColor; }
+.ck-integration-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 8px; }
+.ck-integration-actions button:disabled { opacity: .5; cursor: wait; }
