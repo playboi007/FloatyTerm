@@ -63,6 +63,10 @@ final class DevtoolsRelay {
     var onAgentEnableCDP: (([String: Any]) async -> [String: Any])?
     var onAgentHost:      (([String: Any]) -> [String: Any])?
     var onAgentSessions:  (([String: Any]) async -> [String: Any])?
+    /// `net`: start/stop a full-fidelity network recording, attach the Dart
+    /// VM-service collector, and export a finished recording. Async because
+    /// attaching talks to the VM before it can honestly report success.
+    var onAgentNet:       (([String: Any]) async -> [String: Any])?
     /// Completion-style, not sync/async-return: `peek --wait` long-polls
     /// until the target session's next command completes, and the relay's
     /// connection queue is SERIAL — blocking it semaphore-style (like
@@ -133,7 +137,12 @@ final class DevtoolsRelay {
                 if response == Self.deferredMarker { return }
                 conn.send(content: response,
                           completion: .contentProcessed { _ in conn.cancel() })
-            } else if complete || buf.count > 2 * 1024 * 1024 {
+            // The cap bounds a runaway client, not a normal one. It was 2 MiB,
+            // which silently cut off any /net batch carrying one large response
+            // body — the connection closed, the collector saw a transport error,
+            // the recording lost the batch. Collectors now keep POSTs near 8 MiB;
+            // a single oversized event still fits here.
+            } else if complete || buf.count > 64 * 1024 * 1024 {
                 conn.cancel()
             } else {
                 self.receive(conn, buffer: buf)
@@ -158,7 +167,24 @@ final class DevtoolsRelay {
             .flatMap { Int($0.dropFirst("content-length:".count)
                 .trimmingCharacters(in: .whitespaces)) } ?? 0
         let body = buf[headerEnd.upperBound...]
-        if body.count < contentLength { return nil }
+
+        // Bodies arrive one of two ways, and honoring only Content-Length was
+        // a silent data loss: a client that streams its body (dart:io's
+        // HttpClientRequest.write + close does, with no Content-Length at all)
+        // sent a perfectly good POST that this relay read as zero bytes and
+        // answered 200 to. De-chunk instead, so any HTTP client works.
+        let chunked = lines.contains {
+            let l = $0.lowercased()
+            return l.hasPrefix("transfer-encoding:") && l.contains("chunked")
+        }
+        let bodyData: Data
+        if chunked {
+            guard let decoded = Self.dechunk(Data(body)) else { return nil }  // wait for more
+            bodyData = decoded
+        } else {
+            if body.count < contentLength { return nil }
+            bodyData = Data(body.prefix(contentLength))
+        }
 
         // Route on the PATH only — the script tag carries ?mode=&label=
         // query params, and matching the full URL string would 404 exactly
@@ -202,18 +228,25 @@ final class DevtoolsRelay {
         case ("GET", "/floaty.js"):
             return response(200, "application/javascript", Self.remoteCaptureJS)
         case ("POST", "/log"):
-            ingest(Data(body.prefix(contentLength)))
+            ingest(bodyData)
+            return response(200, "text/plain", "ok")
+        case ("POST", "/net"):
+            // The recorder's own ingress. Separate from /log on purpose: /log
+            // sanitizes through a key whitelist with 16 KB caps, which is right
+            // for a diagnosis feed and destroys a recording meant to be
+            // replayed. Nothing is written here unless a session is recording.
+            recordIngest(bodyData)
             return response(200, "text/plain", "ok")
         case ("POST", "/diff"):
-            return handleDiff(Data(body.prefix(contentLength)))
-        case ("POST", "/agent/click"):     return actOrDefer("click", onAgentClick,  Data(body.prefix(contentLength)), conn: conn)
-        case ("POST", "/agent/move"):      return agentSync("move", onAgentMove,     Data(body.prefix(contentLength)))
-        case ("POST", "/agent/drag"):      return actOrDefer("drag", onAgentDrag,    Data(body.prefix(contentLength)), conn: conn)
-        case ("POST", "/agent/scroll"):    return actOrDefer("scroll", onAgentScroll, Data(body.prefix(contentLength)), conn: conn)
-        case ("POST", "/agent/type"):      return agentAsync("type", onAgentType,    Data(body.prefix(contentLength)))
-        case ("POST", "/agent/key"):       return actOrDefer("key", onAgentKey,      Data(body.prefix(contentLength)), conn: conn)
+            return handleDiff(bodyData)
+        case ("POST", "/agent/click"):     return actOrDefer("click", onAgentClick,  bodyData, conn: conn)
+        case ("POST", "/agent/move"):      return agentSync("move", onAgentMove,     bodyData)
+        case ("POST", "/agent/drag"):      return actOrDefer("drag", onAgentDrag,    bodyData, conn: conn)
+        case ("POST", "/agent/scroll"):    return actOrDefer("scroll", onAgentScroll, bodyData, conn: conn)
+        case ("POST", "/agent/type"):      return agentAsync("type", onAgentType,    bodyData)
+        case ("POST", "/agent/key"):       return actOrDefer("key", onAgentKey,      bodyData, conn: conn)
         case ("POST", "/agent/capture"):
-            let captureBody = Data(body.prefix(contentLength))
+            let captureBody = bodyData
             // --wait-change long-polls (up to minutes) → deferred bridge, like
             // peek --wait. Plain captures stay on the blocking fast path.
             if let obj = parseBody(captureBody),
@@ -222,33 +255,60 @@ final class DevtoolsRelay {
                 return Self.deferredMarker
             }
             return agentAsync("capture", onAgentCapture, captureBody)
-        case ("POST", "/agent/query-dom"): return agentAsync("query-dom", onAgentQueryDOM, Data(body.prefix(contentLength)))
-        case ("POST", "/agent/eval"):      return agentAsync("eval", onAgentEval,     Data(body.prefix(contentLength)))
-        case ("POST", "/agent/navigate"):  return agentAsync("navigate", onAgentNavigate, Data(body.prefix(contentLength)))
-        case ("POST", "/agent/tabs"):      return agentAsync("tabs", onAgentTabs,     Data(body.prefix(contentLength)))
-        case ("POST", "/agent/focus"):     return agentAsync("focus", onAgentFocus,    Data(body.prefix(contentLength)))
-        case ("POST", "/agent/list-windows"): return agentSync("list-windows", onAgentListWindows, Data(body.prefix(contentLength)))
-        case ("POST", "/agent/mark"):      return agentSync("mark", onAgentMark,     Data(body.prefix(contentLength)))
-        case ("POST", "/agent/click-in-frame"): return agentSync("click-in-frame", onAgentClickInFrame, Data(body.prefix(contentLength)))
-        case ("POST", "/agent/move-in-frame"):  return agentSync("move-in-frame", onAgentMoveInFrame,  Data(body.prefix(contentLength)))
-        case ("POST", "/agent/som"):        return agentAsync("som", onAgentSom,       Data(body.prefix(contentLength)))
-        case ("POST", "/agent/click-mark"): return agentAsync("click-mark", onAgentClickMark, Data(body.prefix(contentLength)))
-        case ("POST", "/agent/query-ax"):   return agentAsync("query-ax", onAgentQueryAX,   Data(body.prefix(contentLength)))
-        case ("POST", "/agent/raise"):      return agentAsync("raise", onAgentRaise,      Data(body.prefix(contentLength)))
-        case ("POST", "/agent/read-text"):  return agentAsync("read-text", onAgentReadText, Data(body.prefix(contentLength)))
-        case ("POST", "/agent/focused"):    return agentAsync("focused", onAgentFocused,   Data(body.prefix(contentLength)))
-        case ("POST", "/agent/set-text"):   return agentAsync("set-text", onAgentSetText,   Data(body.prefix(contentLength)))
-        case ("POST", "/agent/enable-cdp"): return agentAsync("enable-cdp", onAgentEnableCDP, Data(body.prefix(contentLength)))
-        case ("POST", "/agent/host"):       return agentSync("host", onAgentHost,       Data(body.prefix(contentLength)))
-        case ("POST", "/agent/sessions"):   return agentAsync("sessions", onAgentSessions, Data(body.prefix(contentLength)))
+        case ("POST", "/agent/query-dom"): return agentAsync("query-dom", onAgentQueryDOM, bodyData)
+        case ("POST", "/agent/eval"):      return agentAsync("eval", onAgentEval,     bodyData)
+        case ("POST", "/agent/navigate"):  return agentAsync("navigate", onAgentNavigate, bodyData)
+        case ("POST", "/agent/tabs"):      return agentAsync("tabs", onAgentTabs,     bodyData)
+        case ("POST", "/agent/focus"):     return agentAsync("focus", onAgentFocus,    bodyData)
+        case ("POST", "/agent/list-windows"): return agentSync("list-windows", onAgentListWindows, bodyData)
+        case ("POST", "/agent/mark"):      return agentSync("mark", onAgentMark,     bodyData)
+        case ("POST", "/agent/click-in-frame"): return agentSync("click-in-frame", onAgentClickInFrame, bodyData)
+        case ("POST", "/agent/move-in-frame"):  return agentSync("move-in-frame", onAgentMoveInFrame,  bodyData)
+        case ("POST", "/agent/som"):        return agentAsync("som", onAgentSom,       bodyData)
+        case ("POST", "/agent/click-mark"): return agentAsync("click-mark", onAgentClickMark, bodyData)
+        case ("POST", "/agent/query-ax"):   return agentAsync("query-ax", onAgentQueryAX,   bodyData)
+        case ("POST", "/agent/raise"):      return agentAsync("raise", onAgentRaise,      bodyData)
+        case ("POST", "/agent/read-text"):  return agentAsync("read-text", onAgentReadText, bodyData)
+        case ("POST", "/agent/focused"):    return agentAsync("focused", onAgentFocused,   bodyData)
+        case ("POST", "/agent/set-text"):   return agentAsync("set-text", onAgentSetText,   bodyData)
+        case ("POST", "/agent/enable-cdp"): return agentAsync("enable-cdp", onAgentEnableCDP, bodyData)
+        case ("POST", "/agent/host"):       return agentSync("host", onAgentHost,       bodyData)
+        case ("POST", "/agent/sessions"):   return agentAsync("sessions", onAgentSessions, bodyData)
+        case ("POST", "/agent/net"):        return agentAsync("net", onAgentNet, bodyData)
         case ("POST", "/agent/run"):
-            agentDeferred("run", onAgentRun, Data(body.prefix(contentLength)), conn: conn)
+            agentDeferred("run", onAgentRun, bodyData, conn: conn)
             return Self.deferredMarker
         case ("POST", "/agent/peek"):
-            agentDeferred("peek", onAgentPeek, Data(body.prefix(contentLength)), conn: conn)
+            agentDeferred("peek", onAgentPeek, bodyData, conn: conn)
             return Self.deferredMarker
         default:
             return response(404, "text/plain", "not found")
+        }
+    }
+
+    /// Decodes an HTTP/1.1 chunked body. Returns nil while the terminating
+    /// zero-length chunk has not arrived yet — the caller's contract for "this
+    /// request is incomplete, keep reading".
+    static func dechunk(_ raw: Data) -> Data? {
+        var out = Data()
+        var i = raw.startIndex
+        let crlf = Data("\r\n".utf8)
+        while true {
+            guard let lineEnd = raw[i...].range(of: crlf) else { return nil }
+            // A chunk size line may carry extensions after a ";" — ignore them.
+            let sizeLine = String(decoding: raw[i..<lineEnd.lowerBound], as: UTF8.self)
+                .components(separatedBy: ";")[0]
+                .trimmingCharacters(in: .whitespaces)
+            guard let size = Int(sizeLine, radix: 16) else { return nil }
+            let dataStart = lineEnd.upperBound
+            if size == 0 { return out }                       // trailers ignored
+            let dataEnd = raw.index(dataStart, offsetBy: size, limitedBy: raw.endIndex)
+            guard let dataEnd, dataEnd <= raw.endIndex else { return nil }
+            out.append(raw[dataStart..<dataEnd])
+            // Skip the CRLF that closes the chunk.
+            guard let next = raw.index(dataEnd, offsetBy: 2, limitedBy: raw.endIndex)
+            else { return nil }
+            i = next
         }
     }
 
@@ -647,6 +707,22 @@ final class DevtoolsRelay {
         return line
     }
 
+    /// `POST /net` — the Dart package's ingress. Body:
+    /// `{label, source?, events:[…]}`. Events are recorded verbatim: no key
+    /// whitelist, no size cap beyond the session's `max_body`, no redaction.
+    /// Drops everything when no session is recording, so an app left wired up
+    /// costs one rejected POST and writes nothing.
+    private func recordIngest(_ body: Data) {
+        guard let payload = try? JSONSerialization.jsonObject(with: body) as? [String: Any],
+              let label = (payload["label"] as? String) ?? (payload["host"] as? String),
+              NetworkRecorder.shared.isRecording(labelKey: Self.sanitize(label)) else { return }
+        let source = (payload["source"] as? String) ?? "dart-hook"
+        let events = (payload["events"] as? [[String: Any]]) ?? [payload]
+        for e in events {
+            NetworkRecorder.shared.record(e, label: label, source: source)
+        }
+    }
+
     private func ingest(_ body: Data) {
         guard let payload = try? JSONSerialization.jsonObject(with: body) as? [String: Any],
               let host = payload["host"] as? String else { return }
@@ -658,6 +734,18 @@ final class DevtoolsRelay {
         // "localhost_5173" used to build the path below would orphan the
         // aggregator and silently drop every event.
         let key = Self.sanitize(label ?? host)
+
+        // Full-fidelity tap, BEFORE the aggregator. A recording must contain
+        // the 2xx calls the severity filter drops and the repeats it samples
+        // away, so it forks off the raw event here and lets the diagnosis
+        // pipeline carry on filtering as it always has.
+        if NetworkRecorder.shared.isRecording(labelKey: key) {
+            let source = (payload["source"] as? String) ?? "js"
+            for e in (payload["events"] as? [[String: Any]] ?? [])
+            where (e["kind"] as? String) == "network" {
+                NetworkRecorder.shared.record(e, label: label ?? host, source: source)
+            }
+        }
 
         aggQueue.async { [weak self] in
             guard let self else { return }

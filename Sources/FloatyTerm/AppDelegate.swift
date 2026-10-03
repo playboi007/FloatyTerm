@@ -15,6 +15,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var fleetSummaryTimer: Timer?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        EditMenu.install()   // ⌘Z/⌘C/⌘V/⌘A for text fields and web views
         // Loopback relay for remote devtools awareness: external pages that
         // include http://127.0.0.1:7777/floaty.js stream console/network
         // events into agent-tailable logs under App Support/FloatyTerm/Devtools.
@@ -1157,6 +1158,95 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             }
             return ["ok": true, "count": items.count, "sessions": items]
         }
+        // `floaty net …` — full-fidelity network recording for a Dart app.
+        // One route, five actions, because they share one piece of state: a
+        // recording session and the collector feeding it must start and stop
+        // together or the user gets a file that silently holds nothing.
+        DevtoolsRelay.shared.onAgentNet = { b in
+            // A missing action used to fall back to "status", so an installed
+            // floaty that predates `net` (it never sends the action) printed a
+            // status list for start, stop AND export — and recorded nothing.
+            guard let action = (b["action"] as? String)?.lowercased(), !action.isEmpty else {
+                let script = Bundle.main.bundleURL.deletingLastPathComponent()
+                    .appendingPathComponent("scripts/floaty")
+                let fix = FileManager.default.fileExists(atPath: script.path)
+                    ? "ln -sf '\(script.path)' ~/.local/bin/floaty"
+                    : "reinstall floaty from the repo's scripts/floaty"
+                return ["error": "`floaty net` needs an action: start | stop | status | attach | detach | export",
+                        "hint": "If you typed one, your installed floaty is older than `net` and dropped it. Fix: \(fix)"]
+            }
+            let label = (b["label"] as? String).flatMap { $0.isEmpty ? nil : $0 } ?? "app"
+            let vmURI = (b["vm"] as? String).flatMap { $0.isEmpty ? nil : $0 }
+            let maxBody = (b["max_body"] as? NSNumber)?.intValue ?? 5_000_000
+            let poll = (b["poll"] as? NSNumber)?.doubleValue ?? 1.0
+            let chrome = NetworkCapture.ChromeTarget(b["chrome"])
+            let liveTarget = { NetworkCapture.liveTarget(b["label"] as? String) }
+
+            switch action {
+            case "start":
+                return await NetworkCapture.start(label: label, maxBody: maxBody, vmURI: vmURI,
+                                                  poll: poll, chrome: chrome)
+
+            case "stop":
+                return await NetworkCapture.stop(label: b["label"] as? String)
+
+            case "attach":
+                let (target, failure) = liveTarget()
+                guard let target else { return failure }
+                if chrome.wanted {
+                    return await ChromeNetwork.shared.start(label: target, match: chrome.match,
+                                                             maxBody: maxBody)
+                }
+                guard let vmURI else {
+                    return ["error": "attach needs --vm <VM service URI> or --chrome [tab match]"]
+                }
+                return await DartVMNetwork.shared.attach(uri: vmURI, label: target, poll: poll)
+
+            case "detach":
+                if chrome.wanted {
+                    let (target, failure) = liveTarget()
+                    guard let target else { return failure }
+                    return await ChromeNetwork.shared.stop(label: target)
+                        ?? ["error": "Chrome is not recording for '\(target)'"]
+                }
+                return await DartVMNetwork.shared.detach()
+
+            case "status":
+                var result = NetworkRecorder.shared.status()
+                result["vm_service"] = DartVMNetwork.shared.status()
+                result["chrome"] = ChromeNetwork.shared.status()
+                return result
+
+            case "export":
+                guard let record = NetworkRecorder.resolveRecord(b["record"] as? String) else {
+                    return ["error": "no recording found", "records": NetworkRecorder.records()]
+                }
+                let format = ((b["format"] as? String) ?? "md").lowercased()
+                let ext = ["har": "har", "json": "json"][format] ?? "md"
+                // The relay has no working directory of its own, so the CLI
+                // sends the caller's. Without it an export would land somewhere
+                // the user has to be told about instead of next to them.
+                let cwd = (b["cwd"] as? String) ?? NSHomeDirectory()
+                let out: URL
+                if let given = b["out"] as? String, !given.isEmpty {
+                    out = given.hasPrefix("/")
+                        ? URL(fileURLWithPath: given)
+                        : URL(fileURLWithPath: cwd).appendingPathComponent(given)
+                } else {
+                    let name = record.deletingPathExtension().lastPathComponent
+                    out = URL(fileURLWithPath: cwd).appendingPathComponent("\(name).\(ext)")
+                }
+                return NetworkExport.run(
+                    record: record, format: format, out: out,
+                    urlContains: b["url"] as? String,
+                    failedOnly: (b["failed"] as? NSNumber)?.boolValue == true,
+                    fullBodies: (b["full"] as? NSNumber)?.boolValue == true)
+
+            default:
+                return ["error": "unknown action: \(action)",
+                        "actions": ["start", "stop", "status", "attach", "detach", "export"]]
+            }
+        }
         DevtoolsRelay.shared.onAgentPeek = { [weak self] b, reply in
             guard let self else { reply(["error": "no self"]); return }
             let resolved = self.resolvePeekTarget(b)
@@ -1444,16 +1534,42 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         statusItem.onNewTab        = { [weak self] in self?.newTerminalTabInCurrentWindow() }
         statusItem.onNewBrowserTab = { [weak self] in self?.newBrowserTabInCurrentWindow() }
         statusItem.onNewNote       = { [weak self] in self?.newNoteTabInCurrentWindow() }
+        statusItem.onNewClaudeTab  = { [weak self] in self?.newClaudeTabInCurrentWindow() }
+        statusItem.onNewCodexTab   = { [weak self] in self?.newCodexTabInCurrentWindow() }
         statusItem.onMirrorWindow  = { [weak self] in self?.newMirrorTabInCurrentWindow() }
         statusItem.onCompareFiles  = { [weak self] in self?.compareFilesInCurrentWindow() }
         statusItem.onShowRuler     = { [weak self] in self?.ruler.toggle() }
         statusItem.onPreferences   = { [weak self] in self?.settingsWC.show() }
+        // Network recording: the on-screen REC pill and the menu-bar controls.
+        MainActor.assumeIsolated {
+            NetworkRecordingController.shared.install()
+            NetworkRecordingController.shared.onRecordingChanged = { [weak self] on in
+                self?.statusItem.setRecording(on)
+            }
+        }
+        statusItem.recordingProvider = {
+            NetworkRecorder.shared.live().last.map { (label: $0.label, events: $0.events) }
+        }
+        statusItem.onStopRecording = { Task { @MainActor in NetworkRecordingController.shared.stop() } }
+        statusItem.onSaveRecording = { Task { @MainActor in NetworkRecordingController.shared.save() } }
 
         // The `ruler` terminal helper emits a private OSC that TerminalController
         // turns into this notification — summon (toggle) the ruler from any shell.
         NotificationCenter.default.addObserver(
             forName: .floatySummonRuler, object: nil, queue: .main
         ) { [weak self] _ in self?.ruler.toggle() }
+
+        // A display unplug or resolution change leaves frames in the
+        // coordinates of a screen that no longer exists: the window reports
+        // itself visible and renders nowhere, and no reveal path moves it.
+        NotificationCenter.default.addObserver(
+            forName: NSApplication.didChangeScreenParametersNotification,
+            object: nil, queue: .main) { [weak self] _ in
+            // The screen list settles a beat after the notification fires.
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { [weak self] in
+                self?.windows.forEach { $0.reclampToVisibleScreens() }
+            }
+        }
 
         switcher.sessionsProvider = { [weak self] in self?.sessionEntries() ?? [] }
         switcher.onSummon = { [weak self] entry in self?.summon(entry) }
@@ -1781,6 +1897,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
+    private func newClaudeTabInCurrentWindow() {
+        if let wc = currentWindow() {
+            wc.openNewClaudeTab()
+            wc.show()
+        } else {
+            let wc = makeWindow()
+            wc.openNewClaudeTab()
+        }
+    }
+
+    private func newCodexTabInCurrentWindow() {
+        if let wc = currentWindow() {
+            wc.openNewCodexTab()
+            wc.show()
+        } else {
+            let wc = makeWindow()
+            wc.openNewCodexTab()
+        }
+    }
+
     private func newNoteTabInCurrentWindow() {
         if let wc = currentWindow() {
             wc.openNewNote()
@@ -1819,11 +1955,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         wc.addDiffTab(left: left, right: right)
     }
 
-    /// A FloatyTerm window the user can actually see on the CURRENT Space:
-    /// any visible roaming (unpinned, all-Spaces) window, or a pinned window
-    /// that happens to live on the active Space.
+    /// A FloatyTerm window the user can actually see on the CURRENT Space.
+    /// Presence is measured, not read off the pin flag: a roaming window whose
+    /// `.canJoinAllSpaces` the window server dropped is stranded on one Space
+    /// while still reporting itself unpinned. Counting it as "present here" is
+    /// what made the toggle hide it invisibly instead of revealing it.
     private func isPresentOnCurrentSpace(_ wc: TerminalWindowController) -> Bool {
-        wc.isVisible && (!wc.isPinned || wc.isOnActiveSpace)
+        wc.isVisible && wc.isReallyOnActiveSpace
     }
 
     /// ⌥⌘7 — a localized toggle for the CURRENT Space. It only hides or shows
@@ -1852,11 +1990,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // windows tucked away via their own controls (minimize / collapse
         // bubble / ticker strip), which are restored differently. This keeps
         // ⌥⌘7 a symmetric toggle: whatever it hides, it brings back.
+        // A roaming window the window server stranded on another Space is
+        // "visible", so the filter below skips it — yet the user cannot see
+        // it. Free those first, or the toggle can never bring them back.
+        let stranded = windows.filter(\.isStrandedOffActiveSpace)
+        stranded.forEach { $0.recoverToActiveSpace() }
         let toShow = windows.filter {
             !$0.isVisible && !$0.isMinimized && !$0.isCollapsed && !$0.isTicker
         }
         toShow.forEach { $0.show() }
-        return toShow
+        return toShow + stranded
     }
 
     // MARK: - Hold-to-peek (toggle hotkey held = show while held)
@@ -2071,7 +2214,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             // Judge by actual on-screen presence, not the hidden-panel guess.
             return (wc.presenceOnActiveSpace ?? false) ? "pinned here" : "another Space\(app)"
         }
-        return "here"
+        // Roaming windows were reported "here" unconditionally — the one
+        // branch that never measured. When the window server has dropped this
+        // window's `.canJoinAllSpaces` it really is bound elsewhere, and "here"
+        // is a lie that reads identically from every Space.
+        if wc.presenceOnActiveSpace == false { return "another Space" }
+        return isOnUserScreen(wc) ? "here" : "other display"
+    }
+
+    /// True when the window's frame overlaps the screen the user is on (the one
+    /// under the mouse). "here" on the wrong display looks just as broken as
+    /// "here" on the wrong Space, so the switcher names them apart.
+    private func isOnUserScreen(_ wc: TerminalWindowController) -> Bool {
+        let mouse = NSEvent.mouseLocation
+        guard let userScreen = NSScreen.screens.first(where: {
+            NSMouseInRect(mouse, $0.frame, false)
+        }) else { return true }   // can't tell — don't cry wolf
+        let frame = wc.collapsedRepresentativeFrame ?? wc.panel.frame
+        return userScreen.frame.intersects(frame)
     }
 
     /// Brings the chosen session to the user's current Space.
@@ -2089,22 +2249,43 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
               let idx = wc.tabs.firstIndex(where: { $0 === entry.tab }) else { return }
         let tab = entry.tab
 
+        // A roaming window the window server stranded on another Space still
+        // reports itself unpinned, so the old `wc.isPinned && ...` test called
+        // it "not away" and revealed it in place — over there. That is the
+        // "session lost in Space" bug: the row said "here", the click ordered
+        // the panel front on a Space the user was not looking at, and nothing
+        // happened on screen. Free it before deciding, then MEASURE.
+        if wc.isStrandedOffActiveSpace { wc.recoverToActiveSpace() }
+
         // Is the window away on another Space? Judged by whatever is actually
         // on screen (panel, bubble, or ticker strip) — `panel.isOnActiveSpace`
         // lies for hidden panels, which is what broke pinned+collapsed and
         // pinned+tickered windows. Unknown presence (pinned + minimized) is
-        // treated as away: the whole-window path is correct either way.
-        let away = wc.isPinned && !(wc.presenceOnActiveSpace ?? false)
+        // treated as away: the whole-window path is correct either way. A
+        // recovery that failed also lands here, so the tab still reaches the
+        // user by being borrowed.
+        let away = !wc.isReallyOnActiveSpace
 
         if !away {
             // Roaming (joins all Spaces) or pinned right here: reveal + focus.
             wc.selectTab(at: idx)
             if wc.isGhosted { wc.setGhosted(false) }   // summon = interactive again
             if wc.isCollapsed {
-                wc.expandFromAvatar(to: crossScreenSummonTarget(for: wc))
+                wc.expandFromAvatar(to: crossScreenSummonTarget(
+                    currentFrame: wc.collapsedRepresentativeFrame, size: wc.expandedSize))
             } else if wc.isTicker {
-                wc.expandFromTicker(to: crossScreenSummonTarget(for: wc))
+                wc.expandFromTicker(to: crossScreenSummonTarget(
+                    currentFrame: wc.collapsedRepresentativeFrame, size: wc.expandedSize))
             } else {
+                // Reveal in place — unless "in place" is another display, or a
+                // frame whose display is gone. The collapsed and ticker
+                // branches already route through crossScreenSummonTarget; the
+                // expanded panel had no equivalent, so summoning a window
+                // parked on display 2 left the user's screen unchanged.
+                if let target = crossScreenSummonTarget(
+                    currentFrame: wc.panel.frame, size: wc.panel.frame.size) {
+                    wc.panel.setFrame(target, display: false)
+                }
                 wc.show()
             }
             return
@@ -2129,19 +2310,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    /// Expanding a collapsed session normally unfolds it in place, around its
-    /// bubble / ticker strip. But when that representative sits on a DIFFERENT
-    /// screen than the user (roaming bubbles don't follow the mouse across
-    /// displays), in-place expansion would land the window over there — so give
-    /// the expand an explicit destination at the summon grid point instead.
-    /// nil = same screen; expand in place.
-    private func crossScreenSummonTarget(for wc: TerminalWindowController) -> NSRect? {
-        guard let repFrame = wc.collapsedRepresentativeFrame else { return nil }
+    /// Summoning normally reveals a session in place — a panel where it sits, a
+    /// bubble / ticker strip unfolding around itself. But when that thing lives
+    /// on a DIFFERENT screen than the user (roaming windows don't follow the
+    /// mouse across displays), "in place" means over there and the user's
+    /// screen never changes. Give those an explicit destination at the summon
+    /// grid point instead. nil = same screen, or unknown; reveal in place.
+    private func crossScreenSummonTarget(currentFrame: NSRect?,
+                                         size: NSSize) -> NSRect? {
+        guard let currentFrame else { return nil }
         let mouse = NSEvent.mouseLocation
         guard let userScreen = NSScreen.screens.first(where: {
             NSMouseInRect(mouse, $0.frame, false)
-        }), !userScreen.frame.intersects(repFrame) else { return nil }
-        return summonTargetFrame(size: wc.expandedSize)
+        }) else { return nil }
+        // No intersection covers both cases worth relocating: another display,
+        // and a frame stranded in the coordinates of a display that is gone.
+        guard !userScreen.frame.intersects(currentFrame) else { return nil }
+        return summonTargetFrame(size: size)
     }
 
     /// The user's summon grid point on the active screen, sized to `size` —

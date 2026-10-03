@@ -1,0 +1,143 @@
+<!DOCTYPE html>
+<html lang="en"><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Agent renderer DOM checks</title>
+<link rel="stylesheet" href="../fonts.css"><link rel="stylesheet" href="../skim.css"><link rel="stylesheet" href="../chat.css">
+</head><body>
+<script src="../vendor/marked.min.js"></script>
+<script src="../vendor/purify.min.js"></script>
+<script src="../vendor/highlight.min.js"></script>
+<script src="../vendor/hljs-dart.min.js"></script>
+<script src="../skim-classify.js"></script>
+<script src="../skim-render.js"></script>
+<script src="../agent-events.js"></script>
+<script src="../agent-claude.js"></script>
+<script src="../agent-codex.js"></script>
+<script>
+window.__actions = [];
+window.webkit = { messageHandlers: { skim: { postMessage: message => { window.__actions.push(message.action); return Promise.resolve(); } } } };
+</script>
+<script src="../chat.js"></script>
+<script src="session-sample.js"></script>
+<script src="history-sample.js"></script>
+<script src="codex-sample.js"></script>
+<script>
+(() => {
+  const agent = new URLSearchParams(location.search).get('agent') === 'codex' ? 'codex' : 'claude';
+  const results = [];
+  const one = selector => document.querySelector(selector);
+  const all = selector => [...document.querySelectorAll(selector)];
+  const check = (name, good, detail = '') => {
+    const result = { name, pass: !!good, detail };
+    results.push(result);
+    if (!result.pass) console.error('DOM CHECK FAILED:', name, detail);
+  };
+  const canonical = (type, fields = {}) => ({ v: 1, agent, type, t: Date.now(), raw: { type: 'ui-check', name: type }, ...fields });
+  const report = () => {
+    window.__testResults = { agent, passed: results.filter(x => x.pass).length, failed: results.filter(x => !x.pass).length, results };
+    const panel = document.createElement('aside');
+    panel.style.cssText = 'position:fixed;z-index:100;top:8px;right:8px;max-width:340px;padding:8px 12px;background:#171b1b;color:#eee;border:1px solid #888;border-radius:6px;font:12px monospace';
+    panel.textContent = `${agent}: ${window.__testResults.passed} passed, ${window.__testResults.failed} failed`;
+    document.body.append(panel);
+  };
+  AgentChat.boot({ agent, cwd: '/Users/demo/project', home: '/Users/demo' });
+  AgentChat.showUser('Inspect the project and summarize.');
+  if (agent === 'codex') AgentChat.receive(CODEX_SAMPLE);
+  else AgentChat.receive(SESSION_SAMPLE);
+
+  // Let SkimRender finish the final requestAnimationFrame before inspecting DOM text.
+  setTimeout(() => {
+    if (agent === 'codex') {
+      const answer = 'The project contains a README and source directory.\n\nI listed the top level entries.';
+      const blocks = all('.ck-text');
+      check('Codex final answer appears once', blocks.length === 1 && blocks[0].textContent.includes('I listed the top level entries.') && blocks[0].textContent.split('I listed the top level entries.').length === 2,
+        `blocks=${blocks.length}; expected=${answer.length} characters`);
+      check('Codex reasoning remains separate from answer', all('.ck-think').length === 1 && one('.ck-think-peek').textContent.includes('inspect the project files') && !blocks[0].textContent.includes('inspect the project files'));
+      check('Codex completed command', all('.ck-row[data-state="done"]').length === 1 && one('.ck-row .ck-name').textContent.includes('Bash'));
+      check('Codex toolbar controls visible', ['.ck-model', '.ck-mode', '.ck-usage', '.ck-view', '.ck-more'].every(s => { const el = one(s); return el && getComputedStyle(el).display !== 'none'; }));
+      one('.ck-usage').click();
+      check('Usage shows real fixture tokens and limits without invented cost', !one('.ck-usage-panel').hidden && one('.ck-usage-panel').textContent.includes('292') && one('.ck-usage-panel').textContent.includes('23%') && !one('.ck-usage-panel').textContent.includes('$'));
+      one('.ck-usage').click();
+      one('.ck-more').click();
+      check('More menu exposes workspace session and actions', one('.ck-pop').textContent.includes('fixture-model') && one('.ck-pop').textContent.includes('Compact conversation') && one('.ck-pop').textContent.includes('Usage') && one('.ck-pop').textContent.includes('Resume a conversation'));
+      one('.ck-more').click();
+      one('.ck-model').click();
+      check('Model menu exposes models and effort', one('.ck-pop').textContent.includes('Codex fixture model') && !!one('.ck-effort'));
+      one('.ck-model').click();
+      one('.ck-mode').click();
+      check('Codex permission menu describes real policies', one('.ck-pop').textContent.includes('Workspace write') && one('.ck-pop').textContent.includes('Read only') && !one('.ck-pop').textContent.includes('Accept edits'));
+      one('.ck-mode').click();
+      const commandInput = one('.ck-input');
+      commandInput.value = '/'; commandInput.setSelectionRange(1, 1); commandInput.dispatchEvent(new Event('input', { bubbles: true }));
+      check('Slash palette lists actual controls', one('.ck-pop').textContent.includes('/usage') && one('.ck-pop').textContent.includes('/model') && one('.ck-pop').textContent.includes('/compact'));
+      commandInput.value = '/usage'; one('.ck-send').click();
+      check('Usage slash command handled locally', !one('.ck-usage-panel').hidden && !window.__actions.some(a => a.type === 'send' && a.text === '/usage'));
+      one('.ck-usage').click();
+      commandInput.value = '/compact'; one('.ck-send').click();
+      check('Compact invokes host operation', window.__actions.some(a => a.type === 'compact') && !window.__actions.some(a => a.type === 'send' && a.text === '/compact'));
+      commandInput.value = '/not-a-command'; one('.ck-send').click();
+      check('Unknown slash command is never sent as prompt', !window.__actions.some(a => a.type === 'send' && a.text === '/not-a-command'));
+      commandInput.value = ''; commandInput.dispatchEvent(new Event('input', { bubbles: true }));
+      check('Codex status ready after completed turn', one('.ck-status-text').textContent === 'Ready' && one('.ck-send').dataset.mode === 'send');
+      const input = one('.ck-input');
+      const turnsBefore = all('.ck-turn').length;
+      AgentChat.receive([canonical('turn.start')]);
+      input.value = 'Keep this draft'; input.dispatchEvent(new Event('input', { bubbles: true }));
+      input.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true, cancelable: true }));
+      check('Codex mid-turn Enter preserves draft and turn count', input.value === 'Keep this draft' && all('.ck-turn').length === turnsBefore && one('.ck-send').dataset.mode === 'stop');
+      AgentChat.receive([canonical('turn.end', { status: 'cancelled' })]);
+      AgentChat.receive([canonical('approval.request', { request: { id: 'codex-approval', toolUseID: 'test-command', toolName: 'Bash', input: { command: 'pwd' }, suppressAlwaysAllowRule: true } })]);
+      check('Codex approval offers supported decisions without false risk', one('.ck-card:not(.is-resolved)').textContent.includes('Shell · read-only') && !one('.ck-card:not(.is-resolved)').textContent.includes('what to do differently'));
+      one('.ck-card:not(.is-resolved) .ck-opt').click();
+      check('Codex approval routes its request identity', window.__actions.some(a => a.type === 'permission' && a.id === 'codex-approval' && a.decision === 'allow'));
+      AgentChat.receive([canonical('approval.request', { request: { id: 'codex-deny', toolName: 'Bash', input: { command: 'pwd' }, suppressAlwaysAllowRule: true } })]);
+      all('.ck-card:not(.is-resolved) .ck-opt')[1].click();
+      check('Codex decline routes directly without unsupported feedback', window.__actions.some(a => a.type === 'permission' && a.id === 'codex-deny' && a.decision === 'deny' && !a.message));
+      AgentChat.receive([canonical('tool.start', { id: 'file-diff', name: 'File changes', input: { changes: [{ path: 'example.txt', diff: '@@ -1 +1 @@\n-old\n+new' }] } }), canonical('tool.result', { id: 'file-diff', output: 'completed' })]);
+      check('File patches remain inspectable in shared tool rows', one('.ck-file-changes').textContent.includes('example.txt') && one('.ck-file-changes').textContent.includes('+new'));
+      AgentChat.receive([canonical('session', { sessionId: 'history-test' })]);
+      const beforeReplay = window.__actions.filter(a => a.type === 'usage' || a.type === 'git').length;
+      AgentChat.receive([canonical('history.replay', { sessionId: 'history-test', turns: [{ userText: 'An earlier prompt', events: [canonical('content.snapshot', { id: 'history-answer', messageId: 'history-answer', kind: 'text', text: 'Restored Codex answer', final: true }), canonical('turn.end', { status: 'success' })] }] })]);
+      check('Codex history uses shared renderer', one('.ck-user-text').textContent === 'An earlier prompt' && one('.ck-text').textContent.includes('Restored Codex answer') && !!one('.ck-resumed'));
+      check('History replay does not trigger per-turn metadata requests', window.__actions.filter(a => a.type === 'usage' || a.type === 'git').length === beforeReplay);
+    } else {
+      const textBlocks = SESSION_SAMPLE.filter(x => x.msg?.type === 'assistant').flatMap(x => x.msg.message.content).filter(x => x.type === 'text');
+      check('Claude final text appears once', all('.ck-text').length === textBlocks.length && all('.ck-text')[0].textContent.includes('notes.txt does not exist'), `blocks=${all('.ck-text').length}, expected=${textBlocks.length}`);
+      check('Claude thinking remains separate from answer', all('.ck-think').length === 1 && one('.ck-think-peek').textContent === '');
+      check('Claude tools settled', all('.ck-row').length === 3 && all('.ck-row[data-state="running"], .ck-row[data-state="preparing"], .ck-row[data-state="waiting"]').length === 0);
+      check('Claude approval settled by result', all('.ck-card').length === 1 && all('.ck-card.is-resolved').length === 1);
+      check('Claude controls available', ['.ck-model', '.ck-mode', '.ck-usage', '.ck-view'].every(s => getComputedStyle(one(s)).display !== 'none'));
+      check('Claude status ready after completed turn', one('.ck-status-text').textContent === 'Ready');
+      const cards = all('.ck-card').length;
+      AgentChat.receive([{ type: 'permission_request', id: 'check-approval', toolName: 'Bash', input: { command: 'pwd' } }]);
+      check('Claude approval request shown', all('.ck-card').length === cards + 1 && all('.ck-card:not(.is-resolved)').length === 1);
+      AgentChat.receive([{ type: 'permission_cancelled', id: 'check-approval' }]);
+      check('Claude approval cancellation settles card', all('.ck-card:not(.is-resolved)').length === 0);
+      const textBefore = all('.ck-text').length;
+      AgentChat.receive([HISTORY_SAMPLE]);
+      check('Claude history restores distinct assistant text', all('.ck-text').length > textBefore && all('.ck-text').filter(el => el.textContent.includes('refuses every Write')).length === 1);
+      check('Claude history restores user view', all('.ck-user-text').length > 1 && !!one('.ck-resumed'));
+    }
+
+    // Unknown envelopes stay inspectable, bounded, and treated only as text.
+    const danger = '<img src=x onerror="window.__unsafe=1">';
+    const unknowns = Array.from({ length: 105 }, (_, i) => canonical('unknown', { name: 'probe-' + i, raw: { payload: danger, seq: i } }));
+    AgentChat.receive(unknowns);
+    check('Unknown events bounded and inspectable', all('.ck-unknown').length === 100 && one('.ck-unknown summary').textContent.includes('probe-5') && JSON.parse(all('.ck-unknown').at(-1).querySelector('pre').textContent).payload === danger);
+    check('Unknown raw HTML is inert', !window.__unsafe && !one('.ck-unknown img'));
+
+    const before = all('.ck-row').length;
+    AgentChat.receive([
+      canonical('turn.start'),
+      canonical('content.start', { id: 'failure-thought', messageId: 'failure-message', kind: 'thinking', text: 'Still thinking' }),
+      canonical('tool.start', { id: 'failure-tool', name: 'Bash', input: { command: 'sleep 10' } })
+    ]);
+    check('Terminal failure fixture starts live work', all('.ck-row').length === before + 1 && !!one('.ck-think.is-live'));
+    AgentChat.receive([canonical('turn.end', { status: 'error', message: 'Synthetic failure' })]);
+    check('Terminal failure settles tools and thinking', all('.ck-row[data-state="interrupted"]').length >= 1 && !one('.ck-think.is-live') && !one('.ck-run.is-live'));
+    check('Terminal failure returns ready state', one('.ck-status-text').textContent === 'Ready' && !one('.ck-card:not(.is-resolved)'));
+    report();
+  }, 700);
+})();
+</script>
+</body></html>

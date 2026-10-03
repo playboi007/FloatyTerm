@@ -806,6 +806,71 @@ final class TerminalWindowController: NSObject, NSWindowDelegate {
         return nil
     }
 
+    /// Presence MEASURED, never inferred from the pin flag. `isPinned` records
+    /// only our intent; the real Space binding is `.canJoinAllSpaces`, which
+    /// the window server silently drops across display sleep and fullscreen
+    /// transitions (see `FloatingPanel.reassertFloatingBehavior`). A roaming
+    /// window that lost the flag is bound to ONE Space while still reporting
+    /// itself unpinned — treating "unpinned" as "here" is what made summoned
+    /// sessions appear nowhere.
+    ///
+    /// When nothing is on screen there is nothing to measure: a pinned window
+    /// is bound to one Space, so unknown must not read as "here", while a
+    /// hidden roaming window lands wherever it is next shown (ordering in is
+    /// itself the cycle a refreshed flag needs, so `show()` self-heals it).
+    var isReallyOnActiveSpace: Bool {
+        presenceOnActiveSpace ?? !panel.isPinned
+    }
+
+    /// The "lost in Space" state: this window claims to roam every Space, but
+    /// the window server has it displayed on a different one. It is visible,
+    /// so no reveal path considers it hidden, yet the user cannot see it.
+    /// `recoverToActiveSpace()` is what gets it back.
+    var isStrandedOffActiveSpace: Bool {
+        !panel.isPinned && presenceOnActiveSpace == false
+    }
+
+    /// Frees a roaming representative the window server stranded on another
+    /// Space. Re-applying `.canJoinAllSpaces` alone does NOT move it: an
+    /// already ordered-in window keeps its old Space attachment, and the flag
+    /// only takes hold across an orderOut / orderFront cycle. That missing
+    /// cycle is why `reassertFloatingBehavior` on its own could never recover
+    /// a stranded window, however many times it ran.
+    func recoverToActiveSpace() {
+        guard !panel.isPinned else { return }
+        if isCollapsed, let av = avatar, av.isVisible {
+            av.orderOut(nil)
+            av.reassertFloatingBehavior()
+            av.orderFrontRegardless()
+        } else if isTicker, let t = ticker, t.isVisible {
+            t.orderOut(nil)
+            t.reassertFloatingBehavior()
+            t.orderFrontRegardless()
+        } else if panel.isVisible {
+            panel.orderOut(nil)
+            panel.presentOverlay()   // reasserts the flags, then orders back in
+        }
+    }
+
+    /// A display was unplugged or reconfigured: pull every frame this window
+    /// owns back onto a screen that still exists. Without this the window keeps
+    /// a frame in the coordinate space of a monitor that is gone — it reports
+    /// itself visible, renders nowhere, and no summon can undo that because the
+    /// reveal paths only order it front, never move it.
+    func reclampToVisibleScreens() {
+        if isCollapsed, let av = avatar {
+            av.setFrame(panel.clampToVisibleScreen(av.frame), display: false)
+        } else if isTicker, let t = ticker {
+            t.setFrame(panel.clampToVisibleScreen(t.frame), display: false)
+        }
+        // The pre-collapse frame is what an expand restores, so it needs the
+        // same treatment — otherwise expanding lands back on the dead display.
+        if isCollapsed || isTicker {
+            savedFrameForExpand = panel.clampToVisibleScreen(savedFrameForExpand)
+        }
+        panel.setFrame(panel.clampToVisibleScreen(panel.frame), display: false)
+    }
+
     /// Frame of the on-screen collapsed representative (bubble or ticker
     /// strip), if any — lets the summon path detect "the bubble sits on a
     /// different screen than the user" and route the expand elsewhere.
@@ -963,6 +1028,11 @@ final class TerminalWindowController: NSObject, NSWindowDelegate {
     /// Public entry for the menu bar's "New Note".
     func openNewNote() { addNoteTab() }
 
+    /// Public entry for the menu bar's "New Claude Tab".
+    func openNewClaudeTab() { addClaudeTab() }
+
+    func openNewCodexTab() { addClaudeTab(agent: .codex) }
+
     /// Public entry for the menu bar's "Mirror a Window…".
     func openNewMirror() { addMirrorTab() }
 
@@ -1039,6 +1109,10 @@ final class TerminalWindowController: NSObject, NSWindowDelegate {
             }
             if chars.lowercased() == "m" {   // ⇧⌘M — Mirror a Window…
                 addMirrorTab()
+                return true
+            }
+            if chars.lowercased() == "a" {   // ⇧⌘A — New Claude Tab
+                addClaudeTab()
                 return true
             }
         }
@@ -1226,6 +1300,59 @@ final class TerminalWindowController: NSObject, NSWindowDelegate {
     private func installSimpleTab(_ tab: any TabContent) {
         tab.onTitleChanged = { [weak self] in self?.refreshTabStrip() }
         insertTab(tab)
+    }
+
+    /// Opens an agent chat tab in the active
+    /// terminal's directory — the folder the user is working in, whatever the
+    /// "inherit working directory" setting says, since a session is tied to it.
+    func addClaudeTab(agent: ChatAgent = .claude) {
+        guard ClaudeChatController.isAvailable else {
+            let alert = NSAlert()
+            alert.messageText = "The \(agent.rawValue.capitalized) tab is not available"
+            alert.informativeText = "Its renderer files (Resources/SkimRender) are missing from this build. Rebuild FloatyTerm with ./build.sh."
+            alert.runModal()
+            return
+        }
+        let active = tabs.indices.contains(activeIndex) ? tabs[activeIndex] : nil
+        let cwd = (active as? TerminalController)?.currentWorkingDirectory
+            ?? (active as? ClaudeChatController)?.cwd
+            ?? NSHomeDirectory()
+        let tab = ClaudeChatController(cwd: cwd, agent: agent)
+        tab.onOpenTUI = { [weak self] dir, sessionID in self?.openAgentTUI(in: dir, sessionID: sessionID, agent: agent) }
+        tab.onOpenHostFile = { [weak self] url in
+            guard let self else { return false }
+            if let viewer = MarkdownViewerController(path: url.path) {
+                self.installSimpleTab(viewer); return true
+            }
+            if let viewer = ImageViewerController(path: url.path) {
+                self.installSimpleTab(viewer); return true
+            }
+            return false
+        }
+        // /exit or /quit in the tab closes it.
+        tab.onTerminated = { [weak self, weak tab] in
+            guard let self, let tab,
+                  let idx = self.tabs.firstIndex(where: { $0 === tab }) else { return }
+            self.closeTab(idx)
+        }
+        installSimpleTab(tab)
+    }
+
+    /// A terminal tab that continues a Claude tab's session in the TUI.
+    private func openAgentTUI(in dir: String, sessionID: String, agent: ChatAgent) {
+        let tab = TerminalController(startDirectory: dir)
+        tab.onTerminated = { [weak self, weak tab] in
+            guard let self, let tab,
+                  let idx = self.tabs.firstIndex(where: { $0 === tab }) else { return }
+            self.closeTab(idx)
+        }
+        tab.onTitleChanged = { [weak self] in self?.refreshTabStrip() }
+        insertTab(tab)
+        // The pty buffers input, but give the shell a beat to print its prompt.
+        let safeID = sessionID.filter { $0.isHexDigit || $0 == "-" }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) { [weak tab] in
+            tab?.run(command: agent == .claude ? "claude --resume \(safeID)" : "codex resume \(safeID)")
+        }
     }
 
     /// Opens a new markdown note tab, backed by a fresh scratch file in the
@@ -1530,8 +1657,10 @@ final class TerminalWindowController: NSObject, NSWindowDelegate {
     /// (needs-input wins over unseen output wins over running).
     func status(of tab: any TabContent) -> SessionStatus {
         if let tc = tab as? TerminalController, tc.awaitingInput { return .needsInput }
+        if let cc = tab as? ClaudeChatController, cc.awaitingApproval { return .needsInput }
         if tab.hasUnseenOutput { return .unseenOutput }
         if let tc = tab as? TerminalController, tc.hasRunningForegroundJob { return .running }
+        if let cc = tab as? ClaudeChatController, cc.isBusy { return .running }
         return .idle
     }
 

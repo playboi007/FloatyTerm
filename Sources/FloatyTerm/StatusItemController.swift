@@ -12,6 +12,8 @@ final class StatusItemController: NSObject, NSMenuDelegate {
     var onNewTab: () -> Void = {}
     var onNewBrowserTab: () -> Void = {}
     var onNewNote: () -> Void = {}
+    var onNewClaudeTab: () -> Void = {}
+    var onNewCodexTab: () -> Void = {}
     var onMirrorWindow: () -> Void = {}
     var onCompareFiles: () -> Void = {}
     var onNewWindow: () -> Void = {}
@@ -32,6 +34,15 @@ final class StatusItemController: NSObject, NSMenuDelegate {
 
     /// Un-ghosts the window with the given id.
     var onUnghostWindow: (UUID) -> Void = { _ in }
+
+    /// The live network recording, if any — its label and request count.
+    var recordingProvider: () -> (label: String, events: Int)? = { nil }
+    var onStopRecording: () -> Void = {}
+    var onSaveRecording: () -> Void = {}
+
+    private var isRecording = false
+    private var lastWorking = 0
+    private var lastWaiting = 0
 
     override init() {
         super.init()
@@ -58,19 +69,35 @@ final class StatusItemController: NSObject, NSMenuDelegate {
     /// with an agent/job working vs. sessions blocked waiting on the user.
     /// Only nonzero parts are shown; both zero clears the title entirely.
     func updateSummary(working: Int, waiting: Int) {
+        lastWorking = working
+        lastWaiting = waiting
+        renderTitle()
+    }
+
+    /// A red "● REC" beside the icon while any network recording runs — the
+    /// pill can be dragged off-screen or dismissed; the menu bar can't.
+    func setRecording(_ on: Bool) {
+        guard on != isRecording else { return }
+        isRecording = on
+        renderTitle()
+    }
+
+    private func renderTitle() {
         guard let button = item.button else { return }
-        var parts: [String] = []
-        if working > 0 { parts.append("\(working)⚒") }
-        if waiting > 0 { parts.append("\(waiting)⏳") }
-        guard !parts.isEmpty else {
-            button.attributedTitle = NSAttributedString(string: "")
-            return
-        }
         let font = NSFont.monospacedDigitSystemFont(ofSize: 11, weight: .medium)
-        button.attributedTitle = NSAttributedString(
-            string: " " + parts.joined(separator: " "),
-            attributes: [.font: font]
-        )
+        let title = NSMutableAttributedString()
+        if isRecording {
+            title.append(NSAttributedString(string: " ● REC", attributes: [
+                .font: font, .foregroundColor: NSColor.systemRed]))
+        }
+        var parts: [String] = []
+        if lastWorking > 0 { parts.append("\(lastWorking)⚒") }
+        if lastWaiting > 0 { parts.append("\(lastWaiting)⏳") }
+        if !parts.isEmpty {
+            title.append(NSAttributedString(string: " " + parts.joined(separator: " "),
+                                            attributes: [.font: font]))
+        }
+        button.attributedTitle = title
     }
 
     // MARK: - NSMenuDelegate
@@ -89,6 +116,23 @@ final class StatusItemController: NSObject, NSMenuDelegate {
         let (toggleKey, toggleMods) = Self.toggleKeyEquivalent()
         menu.addItem(makeItem("Show / Hide", action: #selector(toggle),
                               key: toggleKey, mods: toggleMods))
+
+        // Section: a live network recording, with its controls.
+        if let rec = recordingProvider() {
+            menu.addItem(.separator())
+            let header = NSMenuItem(title: "● Recording “\(rec.label)” — \(rec.events) requests",
+                                    action: nil, keyEquivalent: "")
+            header.isEnabled = false
+            menu.addItem(header)
+            let stop = NSMenuItem(title: "Stop Recording", action: #selector(stopRecording), keyEquivalent: "")
+            stop.target = self
+            stop.image = NSImage(systemSymbolName: "stop.circle", accessibilityDescription: "Stop recording")
+            menu.addItem(stop)
+            let save = NSMenuItem(title: "Stop and Save…", action: #selector(saveRecording), keyEquivalent: "")
+            save.target = self
+            save.image = NSImage(systemSymbolName: "square.and.arrow.down", accessibilityDescription: "Save recording")
+            menu.addItem(save)
+        }
 
         // Section: individually-minimized windows, each restorable on its own.
         let hidden = hiddenWindowsProvider()
@@ -133,6 +177,10 @@ final class StatusItemController: NSObject, NSMenuDelegate {
                               key: "b", mods: [.command]))
         menu.addItem(makeItem("New Note", action: #selector(newNote),
                               key: "e", mods: [.command]))
+        menu.addItem(makeItem("New Claude Tab", action: #selector(newClaudeTab),
+                              key: "a", mods: [.command, .shift]))
+        menu.addItem(makeItem("New Codex Tab", action: #selector(newCodexTab),
+                              key: "", mods: []))
         menu.addItem(makeItem("Mirror a Window…", action: #selector(mirrorWindow),
                               key: "m", mods: [.command, .shift]))
         menu.addItem(makeItem("Compare Two Files…", action: #selector(compareFiles),
@@ -205,6 +253,8 @@ final class StatusItemController: NSObject, NSMenuDelegate {
     @objc private func newTab()        { onNewTab()          }
     @objc private func newBrowserTab() { onNewBrowserTab()   }
     @objc private func newNote()       { onNewNote()         }
+    @objc private func newClaudeTab()  { onNewClaudeTab()    }
+    @objc private func newCodexTab()   { onNewCodexTab()     }
     @objc private func mirrorWindow()  { onMirrorWindow()    }
     @objc private func compareFiles()  { onCompareFiles()    }
     @objc private func newWindow()     { onNewWindow()       }
@@ -212,6 +262,8 @@ final class StatusItemController: NSObject, NSMenuDelegate {
     @objc private func showRuler()     { onShowRuler()        }
     @objc private func preferences()   { onPreferences()     }
     @objc private func quit()          { NSApp.terminate(nil) }
+    @objc private func stopRecording() { onStopRecording()   }
+    @objc private func saveRecording() { onSaveRecording()   }
 
     @objc private func toggleHideFromCapture() {
         Settings.shared.hideFromScreenCapture.toggle()

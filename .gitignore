@@ -12,3 +12,9 @@ FloatyTerm.app/
 
 # Agent-host skill docs (in flux; not versioned yet)
 docs/floaty-ui-control/
+
+# Dart tool output
+.dart_tool/
+
+# Claude sidecar dependencies (installed by build.sh from package-lock.json)
+Resources/ClaudeSidecar/node_modules/

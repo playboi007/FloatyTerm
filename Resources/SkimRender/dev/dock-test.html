@@ -1,0 +1,1313 @@
+<!DOCTYPE html>
+<html lang="en"><head>
+<meta charset="utf-8">
+<title>Dock Test</title>
+<link rel="stylesheet" href="../fonts.css">
+<link rel="stylesheet" href="../skim.css">
+<link rel="stylesheet" href="../chat.css">
+</head><body>
+<script src="../vendor/marked.min.js"></script>
+<script src="../vendor/purify.min.js"></script>
+<script src="../vendor/highlight.min.js"></script>
+<script src="../skim-classify.js"></script>
+<script src="../skim-render.js"></script>
+<script src="../agent-events.js"></script>
+<script src="../agent-claude.js"></script>
+<script src="../agent-codex.js"></script>
+<script src="../chat.js"></script>
+<script src="dock-sample.js"></script>
+<script src="change-sample.js"></script>
+<script src="history-sample.js"></script>
+<script src="dialog-sample.js"></script>
+<script>
+  // Scripted checks of the dock: slash suggestions, argument choices, menus, keys.
+  //   swift Resources/SkimRender/dev/snapshot.swift Resources/SkimRender/dev/dock-test.html /tmp/dock.png 700 1 420
+  // Failures print as JS errors; the last line says how many checks passed.
+  window.__pending = true;
+  // Motion off for the checks that measure sizes; section 31 turns it on to check the motion itself.
+  document.documentElement.classList.add('no-motion');
+  const posts = [];
+  window.webkit = { messageHandlers: { skim: { postMessage: m => { if (m.type === 'action') posts.push(m.action); return Promise.resolve(); } } } };
+  ClaudeChat.boot({ cwd: '/tmp/demo', home: '' });
+  ClaudeChat.receive([{ type: 'sdk', msg: { type: 'system', subtype: 'init', model: 'claude-opus-5-5[1m]', permissionMode: 'default', session_id: 's1', cwd: '/tmp/demo', terminal_slash_commands: ['color'] } }]);
+  // Menu data only: this page brings its own session (init) and git state.
+  ClaudeChat.receive(window.DOCK_SAMPLE.filter(e => e.type !== 'git' && !(e.msg && e.msg.subtype === 'init')));
+
+  const $ = s => document.querySelector(s);
+  const inp = $('.ck-input');
+  const type = v => { inp.focus(); inp.value = v; inp.setSelectionRange(v.length, v.length); inp.dispatchEvent(new Event('input')); };
+  const key = (k, o = {}) => (o.target || inp).dispatchEvent(new KeyboardEvent('keydown', { key: k, bubbles: true, cancelable: true, ...o }));
+  const items = () => [...document.querySelectorAll('.ck-pop-item .ck-pop-title')].map(e => e.textContent.trim());
+  const sel = () => { const e = $('.ck-pop-item.is-sel .ck-pop-title'); return e && e.textContent.trim(); };
+  const popOpen = () => !$('.ck-pop').hidden;
+  const lastPost = t => posts.filter(p => p.type === t).pop();
+  let pass = 0;
+  const check = (name, ok, got) => { if (ok) pass++; else console.error('FAIL ' + name + (got !== undefined ? ' — got ' + JSON.stringify(got) : '')); };
+
+  // 1 · name suggestions
+  type('/con');
+  check('slash opens', popOpen() && $('.ck-pop').dataset.kind === 'slash');
+  check('closest name first', items()[0].startsWith('/config'), items().slice(0, 3));
+  check('terminal-only command hidden', !items().some(t => t.startsWith('/color')));
+  type('/cost');
+  check('alias finds /usage', items()[0].startsWith('/usage'), items()[0]);
+  type('/con');
+  key('ArrowDown');
+  check('arrow moves selection', sel() && sel().startsWith('/context'), sel());
+  key('Tab');
+  check('Tab completes', inp.value === '/context ', inp.value);
+  check('no hint, no choices: closed', !popOpen());
+
+  // 2 · argument choices
+  type('/effort ');
+  check('effort choices', items().join(',') === 'low,medium,high,xhigh,max,auto', items());
+  type('/effort h');
+  check('choices filter by prefix', items().join(',') === 'high', items());
+  key('Enter');
+  check('Enter picks a choice', inp.value === '/effort high ', inp.value);
+  key('Enter');
+  check('/effort runs here', lastPost('setEffort') && lastPost('setEffort').effort === 'high', lastPost('setEffort'));
+  check('no turn sent for /effort', !lastPost('send'));
+  check('chip shows effort', $('.ck-model').textContent.includes('high'), $('.ck-model').textContent);
+  type('/code-review --fix ');
+  check('used flag not offered again', !items().includes('--fix') && items().includes('low'), items());
+
+  // 3 · Return on a command without arguments sends it
+  type('/cont');
+  key('Enter');
+  check('Enter on /context sends it', lastPost('send') && lastPost('send').text === '/context', lastPost('send'));
+  check('composer cleared', inp.value === '');
+
+  // 4 · Escape closes suggestions first
+  type('/');
+  key('Escape');
+  check('Esc closes suggestions', !popOpen());
+  check('Esc did not interrupt', !lastPost('interrupt'));
+
+  // 5 · model menu
+  $('.ck-model').click();
+  check('model menu opens', popOpen() && $('.ck-pop').dataset.kind === 'model');
+  check('current model checked', $('.ck-pop-item.is-current .ck-pop-title').textContent.startsWith('Default'));
+  key('ArrowRight', { target: document.body });
+  check('→ raises effort', lastPost('setEffort').effort === 'xhigh', lastPost('setEffort'));
+  const sends = posts.filter(p => p.type === 'send').length;
+  inp.focus(); inp.value = 'draft';
+  key('ArrowDown'); key('Enter');
+  check('Enter in the composer picks from the open menu', lastPost('setModel') && lastPost('setModel').model === 'opus[1m]', lastPost('setModel'));
+  check('…and does not send the draft', posts.filter(p => p.type === 'send').length === sends && inp.value === 'draft');
+  inp.value = '';
+  $('.ck-model').click();
+  [...document.querySelectorAll('.ck-pop-item')].find(e => e.textContent.startsWith('Sonnet')).click();
+  check('pick posts setModel', lastPost('setModel') && lastPost('setModel').model === 'sonnet', lastPost('setModel'));
+  check('chip shows Sonnet', $('.ck-model').textContent.startsWith('Sonnet 5'), $('.ck-model').textContent);
+  check('menu closed', !popOpen());
+
+  // 6 · permission modes
+  key('Tab', { shiftKey: true });
+  check('⇧Tab cycles to Accept edits', lastPost('setPermissionMode').mode === 'acceptEdits', lastPost('setPermissionMode'));
+  $('.ck-mode').click();
+  check('mode menu lists Auto', items().some(t => t.includes('Auto')), items());
+  [...document.querySelectorAll('.ck-pop-item')].find(e => e.textContent.includes('Auto')).click();
+  check('pick Auto', lastPost('setPermissionMode').mode === 'auto' && $('.ck-mode').dataset.mode === 'auto');
+  ClaudeChat.receive([{ type: 'mode', mode: 'default' }]);
+  check('a failed change falls back', $('.ck-mode').dataset.mode === 'default');
+
+  // 7 · usage panel
+  $('.ck-usage').click();
+  check('usage panel opens', !$('.ck-usage-panel').hidden);
+  check('asks for plan limits', lastPost('usage') && lastPost('usage').plan === true, lastPost('usage'));
+  check('shows the limits', $('.ck-usage-panel').textContent.includes('74%'));
+  key('Escape');
+  check('Esc closes the panel', $('.ck-usage-panel').hidden);
+
+  // 8 · references from a reply
+  (async () => { try {
+    const tick = () => new Promise(r => setTimeout(r, 30));
+    ClaudeChat.showUser('Plan the cache change');
+    ClaudeChat.receive([
+      { type: 'sdk', msg: { type: 'assistant', parent_tool_use_id: null, message: { id: 'm1', model: 'claude-opus-5-5', content: [{ type: 'text', text: 'Use a write-through cache.\n\nKeep the TTL at 5 minutes, because the feed updates hourly.' }] } } },
+      { type: 'sdk', msg: { type: 'result', subtype: 'success', duration_ms: 1000, num_turns: 1, total_cost_usd: 0.01 } }]);
+    const paras = [...document.querySelectorAll('.ck-turn:last-child .ck-text p')];
+    const select = (a, b) => { const r = document.createRange(); r.setStart(a, 0); r.setEnd(b, b.childNodes.length); const s = getSelection(); s.removeAllRanges(); s.addRange(r); document.dispatchEvent(new MouseEvent('mouseup')); };
+    select(paras[1], paras[1]);
+    await tick();
+    const btn = $('.ck-refbtn');
+    check('button shows on a reply selection', !btn.hidden);
+    const b = btn.getBoundingClientRect(), p = paras[1].getBoundingClientRect();
+    check('button sits by the selection', Math.abs(b.top - p.bottom) < 60 || Math.abs(b.bottom - p.top) < 60, [b.top, p.bottom]);
+    btn.click();
+    check('chip in the composer', document.querySelectorAll('.ck-refs .ck-ref').length === 1 && !$('.ck-refs').hidden);
+    check('chip is a preview', $('.ck-refs .ck-ref-text').textContent.startsWith('Keep the TTL'));
+    check('selection cleared, button hidden', getSelection().isCollapsed && btn.hidden);
+    // a selection in the user's own message is not offered
+    select($('.ck-turn:last-child .ck-user-text'), $('.ck-turn:last-child .ck-user-text'));
+    await tick();
+    check('no button on a user message', btn.hidden);
+    getSelection().removeAllRanges();
+    // two passages, then remove one with the ×, then Backspace removes the other
+    select(paras[0], paras[0]); await tick(); btn.click();
+    check('second reference', document.querySelectorAll('.ck-refs .ck-ref').length === 2);
+    $('.ck-refs .ck-ref-x').click();
+    check('× removes it', document.querySelectorAll('.ck-refs .ck-ref').length === 1 && $('.ck-refs .ck-ref-text').textContent.startsWith('Use a write'));
+    inp.value = ''; key('Backspace');
+    check('⌫ in an empty composer removes the last', $('.ck-refs').hidden);
+    // send one with a message
+    select(paras[1], paras[1]); await tick(); btn.click();
+    type('Make it 10 minutes instead');
+    key('Enter');
+    const sent = lastPost('send').text;
+    check('sent text carries the note', sent.startsWith('The user selected the passage(s) below from your earlier replies in this conversation and referenced them in this message.\n\n<referenced_text'), sent.slice(0, 160));
+    check('sent text carries the passage and its origin', sent.includes('<referenced_text from_reply_to="Plan the cache change">\nKeep the TTL at 5 minutes') , sent);
+    check('message comes last', sent.endsWith('Make it 10 minutes instead'));
+    const u = $('.ck-turn:last-child .ck-user');
+    check('turn shows chip + message, not the note', u.querySelector('.ck-ref') && u.textContent.includes('Make it 10') && !u.textContent.includes('The user selected'), u.textContent);
+    check('composer chips cleared', $('.ck-refs').hidden);
+
+    // 9 · scrolling: typing never moves the view; the down button does
+    ClaudeChat.receive([{ type: 'sdk', msg: { type: 'assistant', parent_tool_use_id: null, message: { id: 'm2', model: 'claude-opus-5-5',
+      content: [{ type: 'text', text: Array.from({ length: 40 }, (_, i) => `Paragraph ${i + 1} of a long reply.`).join('\n\n') }] } } }]);
+    await tick(); await tick();
+    window.scrollTo(0, 0); window.dispatchEvent(new Event('scroll'));
+    await tick();
+    const down = $('.ck-down');
+    check('down button shows away from the bottom', !down.hidden);
+    type('I am typing a long draft'); await tick(); await tick();
+    check('typing does not scroll', window.scrollY === 0, window.scrollY);
+    ClaudeChat.receive([{ type: 'sdk', msg: { type: 'assistant', parent_tool_use_id: null, message: { id: 'm3', model: 'claude-opus-5-5', content: [{ type: 'text', text: 'More output.' }] } } }]);
+    await tick(); await tick();
+    check('new output does not scroll either', window.scrollY === 0, window.scrollY);
+    check('…and dots the down button', down.dataset.fresh === '1');
+    down.click();
+    await new Promise(r => setTimeout(r, 900));
+    check('down button goes to the bottom', window.innerHeight + window.scrollY >= document.documentElement.scrollHeight - 2, [window.scrollY, document.documentElement.scrollHeight]);
+    check('…and hides, dot cleared', down.hidden && !down.dataset.fresh);
+    check('draft kept', inp.value === 'I am typing a long draft');
+    // a small scroll up during a stream is not pulled back down
+    const bottom = () => window.innerHeight + window.scrollY >= document.documentElement.scrollHeight - 2;
+    window.dispatchEvent(new WheelEvent('wheel', { deltaY: -20 }));
+    window.scrollBy(0, -20); await tick();
+    const y0 = window.scrollY;
+    for (let i = 0; i < 3; i++) { ClaudeChat.receive([{ type: 'sdk', msg: { type: 'assistant', parent_tool_use_id: null, message: { id: 'm-s' + i, model: 'claude-opus-5-5', content: [{ type: 'text', text: 'Streamed line ' + i }] } } }]); await tick(); }
+    check('20px up during a stream stays put', window.scrollY === y0 && !bottom(), [y0, window.scrollY]);
+    check('…and the down button shows', !down.hidden && down.dataset.fresh === '1');
+    window.scrollTo(0, document.documentElement.scrollHeight); await tick(); await new Promise(r => setTimeout(r, 320));
+    window.dispatchEvent(new Event('scroll')); await tick();
+    ClaudeChat.receive([{ type: 'sdk', msg: { type: 'assistant', parent_tool_use_id: null, message: { id: 'm-s9', model: 'claude-opus-5-5', content: [{ type: 'text', text: 'Back at the bottom' }] } } }]);
+    // The follow scroll runs in an animation frame: wait for frames, not a fixed time.
+    await Promise.race([new Promise(r => requestAnimationFrame(() => requestAnimationFrame(r))), new Promise(r => setTimeout(r, 500))]); await tick();
+    check('back at the bottom, following again', bottom() && down.hidden, [bottom(), down.hidden, window.scrollY + innerHeight, document.documentElement.scrollHeight]);
+
+    // 10 · file changes: Now first, Diff on request, Expand when it does not fit
+    ClaudeChat.showUser('Raise the TTL');
+    ClaudeChat.receive([
+      { type: 'sdk', msg: { type: 'assistant', parent_tool_use_id: null, message: { id: 'm4', model: 'claude-opus-5-5', content: [{ type: 'tool_use', id: 'tu-e', name: 'Edit', input: CHANGE_SAMPLE.edit }] } } },
+      { type: 'permission_request', id: 'p-e', toolName: 'Edit', input: CHANGE_SAMPLE.edit, toolUseID: 'tu-e', suggestions: [] }]);
+    await tick();
+    const card = [...document.querySelectorAll('.ck-card')].pop();
+    const chg = card.querySelector('.ck-chg');
+    check('card has the change view', !!chg);
+    check('stats from the line diff', chg.querySelector('.ck-chg-stat').textContent === '+5−1', chg.querySelector('.ck-chg-stat').textContent);
+    check('Now is the default', chg.querySelector('.ck-seg-b.is-on').dataset.m === 'now');
+    check('Now shows no removed line, one fold', !chg.querySelector('.ck-ln.is-del') && chg.querySelectorAll('.ck-ln-gap.is-del').length === 1);
+    check('Now shows the new version', chg.querySelector('.ck-chg-body').textContent.includes('10 * 60e3') && !chg.querySelector('.ck-chg-body').textContent.includes('5 * 60e3'));
+    chg.querySelector('.ck-ln-gap.is-del').click();
+    check('the fold opens the removed line', chg.querySelector('.ck-ln.is-del').textContent.includes('5 * 60e3'));
+    chg.querySelector('.ck-seg-b[data-m="diff"]').click();
+    check('Diff shows old and new', chg.querySelectorAll('.ck-ln.is-del').length === 1 && chg.querySelectorAll('.ck-ln.is-add').length === 5);
+    check('Diff folds a long unchanged run', !!chg.querySelector('.ck-ln-gap.is-eq'));
+    const exp = chg.querySelector('.ck-chg-exp');
+    check('Expand shows for a change that does not fit', !exp.hidden);
+    exp.click();
+    check('Expand makes it big (and the card wide)', chg.classList.contains('is-big') && card.classList.contains('is-wide'));
+    check('big body is taller', chg.querySelector('.ck-chg-body').clientHeight > 230, chg.querySelector('.ck-chg-body').clientHeight);
+    exp.click();
+    check('Collapse restores it', !chg.classList.contains('is-big') && !card.classList.contains('is-wide'));
+    // the tool row has the same view (edits can run with no card)
+    const rowLine = [...document.querySelectorAll('.ck-row')].pop();
+    const rowDetail = rowLine.nextElementSibling;
+    check('row detail holds the change view', rowDetail.classList.contains('is-change') && !!rowDetail.querySelector('.ck-chg'));
+    ClaudeChat.receive([{ type: 'sdk', msg: { type: 'user', parent_tool_use_id: null, message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'tu-e', content: 'The file has been updated.' }] } } }]);
+    check('row meta from the line diff', rowLine.querySelector('.ck-meta').textContent === '+5 −1', rowLine.querySelector('.ck-meta').textContent);
+    check('success keeps the view, no result text', !rowDetail.querySelector('.ck-out') && !!rowDetail.querySelector('.ck-chg'));
+    rowLine.click(); await tick();
+    check('row opens to the view', !rowDetail.hidden);
+    // a failed edit shows the error above its change
+    ClaudeChat.receive([
+      { type: 'sdk', msg: { type: 'assistant', parent_tool_use_id: null, message: { id: 'm5', model: 'claude-opus-5-5', content: [{ type: 'tool_use', id: 'tu-w', name: 'Write', input: CHANGE_SAMPLE.write }] } } },
+      { type: 'sdk', msg: { type: 'user', parent_tool_use_id: null, message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'tu-w', is_error: true, content: 'Permission denied' }] } } }]);
+    const wDetail = [...document.querySelectorAll('.ck-row')].pop().nextElementSibling;
+    check('failed write: error first, then the change', wDetail.firstChild.classList.contains('ck-out') && wDetail.firstChild.textContent === 'Permission denied' && !!wDetail.querySelector('.ck-chg'));
+    check('write view is numbered, no Now/Diff', !!wDetail.querySelector('.ck-ln-no') && !wDetail.querySelector('.ck-chg-seg'));
+
+    // 11 · folder, branch and the ⋮ menu
+    const ctx = $('.ck-ctx');
+    check('status shows the folder before git answers', ctx.textContent === 'demo' && !ctx.querySelector('.ck-ctx-branch'), ctx.textContent);
+    ClaudeChat.receive([{ type: 'git', repo: '/tmp/demo', branch: 'feature/cache', detached: false, upstream: 'origin/feature/cache', ahead: 2, behind: 1, changed: 3, staged: 1, untracked: 1, last: { sha: 'abc1234', subject: 'Cache the feed', when: '5 minutes ago' } }]);
+    check('status shows folder + branch', ctx.textContent === 'demofeature/cache', ctx.textContent);
+    check('dirty dot for changes', !!ctx.querySelector('.ck-ctx-dirty'));
+    const gitAsks = posts.filter(p => p.type === 'git').length;
+    $('.ck-more').click();
+    check('⋮ opens the menu', popOpen() && $('.ck-pop').dataset.kind === 'more');
+    check('opening asks git again', posts.filter(p => p.type === 'git').length === gitAsks + 1);
+    const info = $('.ck-info').textContent;
+    check('menu shows branch, changes, commit', info.includes('feature/cache') && info.includes('3 changed · 1 staged · 1 new · ↑2 · ↓1') && info.includes('abc1234 Cache the feed'), info);
+    const pick = t => [...document.querySelectorAll('.ck-pop-item')].find(e => e.textContent === t).click();
+    pick('Copy path');
+    check('Copy path posts the cwd', lastPost('copy') && lastPost('copy').text === '/tmp/demo' && !popOpen(), lastPost('copy'));
+    ctx.click(); pick('Reveal in Finder');
+    check('the status item opens the same menu; Reveal posts', lastPost('reveal') && lastPost('reveal').path === '/tmp/demo');
+    $('.ck-more').click(); pick('Open in TUI');
+    check('Open in TUI', !!lastPost('openTUI'));
+    const pickNew = () => [...document.querySelectorAll('.ck-pop-item')].find(e => e.textContent.startsWith('New…')).click();
+    $('.ck-more').click();
+    check('the "New…" options are one folded item', items().includes('New…') && !items().includes('New conversation') && !items().includes('New side chat'), items());
+    pickNew();
+    check('…which opens in place, the menu still open', popOpen() && items().includes('New side chat') && items().includes('New conversation')
+      && $('.ck-pop-item.is-group').getAttribute('aria-expanded') === 'true' && document.querySelectorAll('.ck-pop-item.is-child').length === 2, items());
+    pickNew();
+    check('…and folds again', popOpen() && !items().includes('New conversation'));
+    pickNew();
+    pick('New conversation');
+    check('New conversation sends /clear', lastPost('send').text === '/clear' && !popOpen());
+    ClaudeChat.receive([{ type: 'git', repo: null }]);
+    check('outside a repository: no branch', ctx.textContent === 'demo');
+    $('.ck-more').click();
+    check('menu says so', $('.ck-info').textContent.includes('not a git repository'));
+    key('Escape', { target: document.body });
+    check('Esc closes it', !popOpen());
+
+    // 12 · side chats: forks of main, one full view at a time
+    const view = $('.ck-view'), viewMore = $('.ck-view-more');
+    const mainLog = $('#ck-log');
+    check('switch offers a side chat', view.textContent.startsWith('Side chat') && viewMore.hidden, view.textContent);
+    ClaudeChat.receive([{ type: 'mode', mode: 'plan' }]);   // main runs in Plan; a side chat still starts on Ask
+    inp.value = 'main draft';
+    view.click();
+    const open1 = lastPost('openSide');
+    check('opens a fork with main\'s model', open1 && open1.channel === 'side-1' && open1.model === 'sonnet', open1);
+    const sideLog = document.querySelector('.ck-log.is-side');
+    check('full view switches to the side', document.body.classList.contains('is-side') && mainLog.hidden && !sideLog.hidden);
+    check('side header says it is a fork', sideLog.querySelector('.ck-side-head').textContent.includes('A fork of main'));
+    check('side starts on Ask (manual)', $('.ck-mode').dataset.mode === 'default', $('.ck-mode').dataset.mode);
+    check('switch now leads back to Main', view.textContent.startsWith('Main') && !viewMore.hidden);
+    check('each view keeps its draft', inp.value === '');
+    type('what does makeCache return?'); key('Enter');
+    check('side sends on its own channel', lastPost('send').channel === 'side-1' && lastPost('send').text === 'what does makeCache return?');
+    check('the turn is drawn in the side log', sideLog.querySelector('.ck-user-text').textContent === 'what does makeCache return?' && ![...mainLog.querySelectorAll('.ck-user-text')].some(e => e.textContent.startsWith('what does makeCache')));
+    ClaudeChat.receive([{ type: 'sdk', msg: { type: 'system', subtype: 'init', session_id: 'fork-1', model: 'claude-sonnet-5', permissionMode: 'default', cwd: '/tmp/demo' } }], 'side-1');
+    type('side draft');
+    view.click();
+    check('back in main: its draft and its mode', !document.body.classList.contains('is-side') && inp.value === 'main draft' && $('.ck-mode').dataset.mode === 'plan');
+    ClaudeChat.receive([{ type: 'sdk', msg: { type: 'assistant', parent_tool_use_id: null, message: { id: 'side-m1', model: 'claude-sonnet-5', content: [{ type: 'text', text: 'It returns get, set and size.' }] } } },
+      { type: 'sdk', msg: { type: 'result', subtype: 'success', duration_ms: 900, num_turns: 1, total_cost_usd: 0.004 } }], 'side-1');
+    check('side output lands in the side log only', sideLog.textContent.includes('It returns get, set and size.') && !mainLog.textContent.includes('It returns get, set'));
+    check('switch shows news from the side', view.dataset.attn === 'unseen', view.dataset.attn);
+    ClaudeChat.receive([{ type: 'permission_request', id: 'p-side', toolName: 'Bash', input: { command: 'ls' }, toolUseID: 'tu-side', suggestions: [] }], 'side-1');
+    check('…and a side approval as waiting', view.dataset.attn === 'waiting');
+    check('the tab dot hears about it', lastPost('state').waiting === true);
+    key('1', { target: document.body });
+    check('main\'s keys do not answer the side card', !posts.some(p => p.type === 'permission' && p.id === 'p-side'));
+    view.click();
+    check('side draft restored', inp.value === 'side draft' && !sideLog.hidden);
+    inp.value = ''; key('1', { target: document.body });
+    check('in view, 1 answers the side card on its channel', posts.some(p => p.type === 'permission' && p.id === 'p-side' && p.channel === 'side-1'));
+    // a second side chat from the menu, then close one
+    viewMore.click();
+    check('menu lists the conversations', items().join('|').includes('Main') && items().join('|').includes('Side 1') && items().join('|').includes('New side chat'), items());
+    [...document.querySelectorAll('.ck-pop-item')].find(e => e.textContent.startsWith('New side chat')).click();
+    check('a second side chat', lastPost('openSide').channel === 'side-2' && document.querySelectorAll('.ck-log.is-side').length === 2);
+    $('.ck-more').click();
+    [...document.querySelectorAll('.ck-pop-item')].find(e => e.textContent === 'Close this side chat').click();
+    check('closing it tells the host and goes back to main', lastPost('closeSide').channel === 'side-2' && !document.body.classList.contains('is-side') && document.querySelectorAll('.ck-log.is-side').length === 1);
+    check('switch leads to the remaining side', view.textContent.startsWith('Side 1'), view.textContent);
+
+    // (the auto-grow the grip builds on)
+    type('line 1\nline 2\nline 3\nline 4'); await tick();
+    check('a long prompt grows the composer', inp.offsetHeight > 60, inp.offsetHeight);
+    type('');
+
+    // 13 · composer height: the grip on the left
+    const grip = $('.ck-grip');
+    const h0 = inp.offsetHeight;
+    grip.dispatchEvent(new PointerEvent('pointerdown', { clientY: 380, bubbles: true }));
+    document.dispatchEvent(new PointerEvent('pointermove', { clientY: 300, bubbles: true }));
+    document.dispatchEvent(new PointerEvent('pointerup', { clientY: 300, bubbles: true }));
+    check('dragging up makes the composer taller', inp.offsetHeight >= h0 + 70, [h0, inp.offsetHeight]);
+    let saved = null; try { saved = localStorage.getItem('ck.composerHeight'); } catch (e) {}
+    check('the height is remembered', saved === null || +saved === inp.offsetHeight, saved);
+    type('short'); await tick();
+    check('typing keeps the height you set', inp.offsetHeight >= h0 + 70);
+    grip.dispatchEvent(new MouseEvent('dblclick', { bubbles: true }));
+    check('double-click resets it', inp.offsetHeight < h0 + 20, inp.offsetHeight);
+
+    // 14 · thinking: a folded line while it thinks, the summary on request
+    if (document.body.classList.contains('is-side')) view.click();   // main in view
+    ClaudeChat.showUser('Is 391 prime?');
+    const t0 = Date.now() - 9000;
+    const sev = (dt, event) => ({ t: t0 + dt, type: 'sdk', msg: { type: 'stream_event', parent_tool_use_id: null, event } });
+    ClaudeChat.receive([sev(0, { type: 'message_start', message: { id: 'th1', model: 'claude-opus-5-5' } }),
+      sev(10, { type: 'content_block_start', index: 0, content_block: { type: 'thinking', thinking: '' } }),
+      sev(2000, { type: 'content_block_delta', index: 0, delta: { type: 'thinking_delta', thinking: '**Checking factors**\n\n391 is odd.\n\n' } }),
+      sev(4000, { type: 'content_block_delta', index: 0, delta: { type: 'thinking_delta', thinking: '17 × 23 = 391.' } })]);
+    const th = [...document.querySelectorAll('.ck-think')].pop();
+    check('a thinking line appears while it thinks', th && th.classList.contains('is-live') && /…$/.test(th.querySelector('.ck-think-verb').textContent), th && th.textContent);
+    check('status line says the same word', $('.ck-status-text').textContent === th.querySelector('.ck-think-verb').textContent, $('.ck-status-text').textContent);
+    check('folded, with the latest line as a preview', th.querySelector('.ck-think-body').hidden && th.querySelector('.ck-think-peek').textContent === '17 × 23 = 391.');
+    ClaudeChat.receive([sev(9000, { type: 'content_block_stop', index: 0 })]);
+    check('done: "Thought for 9s"', !th.classList.contains('is-live') && th.querySelector('.ck-think-head').textContent.startsWith('Thought') && th.querySelector('.ck-think-time').textContent === 'for 9s', th.querySelector('.ck-think-head').textContent);
+    th.querySelector('.ck-think-head').click();
+    check('click opens the summary', !th.querySelector('.ck-think-body').hidden && th.querySelector('.ck-think-body').textContent.includes('391 is odd.') && th.querySelector('.ck-think-body strong'));
+    check('open: no preview in the line', th.querySelector('.ck-think-peek').textContent === '');
+    th.querySelector('.ck-think-head').click();
+    check('click again folds it', th.querySelector('.ck-think-body').hidden);
+    // no text (thinking display "omitted"): a line with its time, nothing to open
+    ClaudeChat.receive([sev(9100, { type: 'content_block_start', index: 1, content_block: { type: 'thinking', thinking: '' } }), sev(11100, { type: 'content_block_stop', index: 1 })]);
+    const empty = [...document.querySelectorAll('.ck-think')].pop();
+    check('empty thinking: no caret', empty !== th && empty.querySelector('.ck-think-caret').hidden && !empty.classList.contains('has-text'));
+    empty.querySelector('.ck-think-head').click();
+    check('…and does not open', empty.querySelector('.ck-think-body').hidden);
+    // only the full message (nothing streamed)
+    ClaudeChat.receive([{ type: 'sdk', msg: { type: 'assistant', parent_tool_use_id: null, message: { id: 'th2', model: 'claude-opus-5-5', content: [{ type: 'thinking', thinking: 'Plan: read the file first.' }, { type: 'text', text: 'Reading it now.' }] } } }]);
+    const full = [...document.querySelectorAll('.ck-think')].pop();
+    check('a full message alone makes the block', full !== empty && full.querySelector('.ck-think-peek').textContent === 'Plan: read the file first.' && !full.classList.contains('is-live'));
+    // an interrupted turn leaves no block live
+    ClaudeChat.receive([sev(12000, { type: 'message_start', message: { id: 'th3', model: 'claude-opus-5-5' } }), sev(12010, { type: 'content_block_start', index: 0, content_block: { type: 'thinking', thinking: '' } }),
+      { type: 'sdk', msg: { type: 'result', subtype: 'error_during_execution', duration_ms: 500, num_turns: 1, total_cost_usd: 0.01 } }]);
+    check('interrupted: no live thinking left', !document.querySelector('.ck-think.is-live'));
+    check('status back to Ready', $('.ck-status-text').textContent === 'Ready', $('.ck-status-text').textContent);
+
+    // 15 · Show thinking: follows the settings, switches here
+    $('.ck-more').click();
+    const thinkItem = () => [...document.querySelectorAll('.ck-pop-item')].find(e => e.textContent.startsWith('Show thinking'));
+    check('⋮ has Show thinking, off by Claude Code default', thinkItem() && thinkItem().textContent.includes('Claude Code default') && !thinkItem().querySelector('.ck-switch.is-on'), thinkItem() && thinkItem().textContent);
+    thinkItem().click();
+    check('switching it on tells the sidecar', lastPost('setThinking') && lastPost('setThinking').on === true && lastPost('setThinking').channel === 'main', lastPost('setThinking'));
+    check('the menu stays open and shows it on', popOpen() && thinkItem().querySelector('.ck-switch.is-on') && thinkItem().textContent.includes('Set in this tab'));
+    key('Escape', { target: document.body });
+    ClaudeChat.receive([{ type: 'thinking', on: true, source: 'settings' }]);
+    $('.ck-more').click();
+    check('a value from /config says so', thinkItem().textContent.includes('From your settings'));
+    key('Escape', { target: document.body });
+    ClaudeChat.receive([{ type: 'thinking', on: true, source: 'user' }]);
+    viewMore.click();
+    [...document.querySelectorAll('.ck-pop-item')].find(e => e.textContent.startsWith('New side chat')).click();
+    check('a new side chat takes main\'s choice', lastPost('openSide').thinking === true, lastPost('openSide'));
+    view.click();
+
+    // 16 · /exit and /quit
+    type('/qui');
+    check('/quit finds exit', items()[0].startsWith('/exit'), items()[0]);
+    viewMore.click();
+    [...document.querySelectorAll('.ck-pop-item')].find(e => e.textContent.startsWith('New side chat')).click();
+    const sidesBefore = document.querySelectorAll('.ck-log.is-side').length;
+    type('/exit'); key('Enter');
+    check('/exit in a side chat closes only that chat', document.querySelectorAll('.ck-log.is-side').length === sidesBefore - 1 && !document.body.classList.contains('is-side') && !lastPost('close'));
+    type('/quit'); key('Enter');
+    check('/quit in main asks the host to close the tab', lastPost('close') && lastPost('close').channel === 'main');
+    check('…and sends nothing to Claude', lastPost('send').text !== '/quit');
+
+    // 17 · /resume: pick a conversation, draw its history, continue it
+    const H = window.HISTORY_SAMPLE;
+    type('/resume ');
+    check('/resume asks for the folder\'s conversations', lastPost('sessions') && popOpen() && $('.ck-pop').textContent.includes('Loading conversations'));
+    const now = Date.now();
+    ClaudeChat.receive([{ type: 'sessions', list: [
+      { id: 's1', title: 'This tab', firstPrompt: 'hello', branch: 'main', modified: now - 5000, size: 2e5 },
+      { id: H.sessionId, title: 'Probe: read, list, write', firstPrompt: 'Do these in order', branch: 'feature/cache', modified: now - 3 * 3600e3, size: 4e5 },
+      { id: 'aaaaaaaa-0000-0000-0000-000000000001', title: 'Something else', firstPrompt: 'other', branch: null, modified: now - 30e3, size: 1e4 }] }]);
+    check('the list shows the others, newest first', items().length === 2 && items()[0].startsWith('Probe'), items());
+    check('this tab\'s own conversation is not in it', !items().some(t => t.startsWith('This tab')));
+    check('a very recent one warns "active now"', [...document.querySelectorAll('.ck-pop-tag.is-warn')].some(e => e.textContent === 'active now'));
+    type('/resume probe');
+    check('typing filters the list', items().length === 1 && items()[0].startsWith('Probe'), items());
+    const beforeTurns = mainLog.querySelectorAll('.ck-turn').length;
+    key('Enter');
+    check('picking one tells the host', lastPost('resume') && lastPost('resume').sessionId === H.sessionId && lastPost('resume').channel === 'main', lastPost('resume'));
+    check('main clears for it', beforeTurns > 0 && mainLog.querySelectorAll('.ck-turn').length === 0 && mainLog.textContent.includes('Resuming'));
+    ClaudeChat.receive([H]);
+    const turnsNow = [...mainLog.querySelectorAll('.ck-turn')];
+    check('the prompts come back as turns', turnsNow.length === 3 && turnsNow[0].querySelector('.ck-user-text').textContent.startsWith('Do these in order'), turnsNow.map(t => (t.querySelector('.ck-user-text') || {}).textContent));
+    check('tool calls come back as rows, done', mainLog.querySelectorAll('.ck-row').length === 3 && !mainLog.querySelector('.ck-row[data-state="running"]'));
+    check('…with real times on the bars', [...mainLog.querySelectorAll('.ck-bar')].some(b => parseFloat(b.style.width) > 2));
+    check('a command comes back as a command', turnsNow[1].querySelector('.ck-user').classList.contains('is-cmd') && turnsNow[1].textContent.includes('/compact'));
+    check('…and its output as a reply', turnsNow[1].textContent.includes('Compacted (ctrl+o to see full summary)') && !turnsNow[1].textContent.includes('\u001b'));
+    check('a referenced passage comes back as a chip', turnsNow[2].querySelector('.ck-ref') && turnsNow[2].querySelector('.ck-user-text').textContent === 'Why did the hook block it?' && !turnsNow[2].textContent.includes('The user selected'));
+    check('the compaction and the omitted part are noted', mainLog.textContent.includes('was compacted') && mainLog.textContent.includes('12 earlier messages'));
+    check('the interrupt is noted as a stop', mainLog.textContent.includes('Stopped'));
+    check('a "Resumed" marker ends it, and main is ready', !!mainLog.querySelector('.ck-resumed') && $('.ck-status-text').textContent === 'Ready');
+    type('and now?'); key('Enter');
+    check('the next message continues it in main', lastPost('send').text === 'and now?' && lastPost('send').channel === 'main' && mainLog.lastElementChild.querySelector('.ck-user-text').textContent === 'and now?');
+    // guard: not while Claude works
+    type('/resume aaaaaaaa');
+    check('the list is read again after a resume', posts.filter(p => p.type === 'sessions').length >= 2);
+    ClaudeChat.receive([{ type: 'sessions', list: [{ id: 'aaaaaaaa-0000-0000-0000-000000000001', title: 'Something else', modified: now - 30e3, size: 1e4 }] }]);
+    key('Enter');
+    check('no resume while Claude is working', lastPost('resume').sessionId === H.sessionId && mainLog.textContent.includes('Stop it (Esc) or answer it first'));
+
+    // ── helpers for the sections below ────────────────────────────────────
+    const wait = ms => new Promise(r => setTimeout(r, ms));
+    // Waits for something asynchronous (a debounce, an image decode) only as long as it takes.
+    const until = async (fn, ms = 2000) => { const t = Date.now(); while (!fn() && Date.now() - t < ms) await wait(10); };
+    const sdkl = msg => ({ type: 'sdk', msg });
+    const settle = () => ClaudeChat.receive([sdkl({ type: 'result', subtype: 'success', duration_ms: 1, num_turns: 1, total_cost_usd: 0 })]);
+    const chips = () => [...document.querySelectorAll('.ck-refs .ck-ref')];
+    const notes = () => [...document.querySelectorAll('.ck-notice')];
+    const unknowns = () => document.querySelectorAll('.ck-unknown').length;
+    const sendCount = () => posts.filter(p => p.type === 'send').length;
+    const filesPosts = () => posts.filter(p => p.type === 'files').length;
+    const popPick = t => [...document.querySelectorAll('.ck-pop-item')].find(e => e.textContent.startsWith(t)).click();
+    const lastTurn = () => [...mainLog.querySelectorAll('.ck-turn')].pop();
+    const cardOf = () => [...mainLog.querySelectorAll('.ck-card')].pop();
+    const unk0 = unknowns();
+    // The 80 ms pause before a files request would only slow this page down: make it 0 while the sections below run.
+    const realTimeout = window.setTimeout;
+    window.setTimeout = (fn, ms, ...a) => realTimeout(fn, ms === 80 ? 0 : ms, ...a);
+    settle(); type('');
+
+    // 18 · @ mentions: subagents first, then Claude Code's own file search
+    const cap = window.DOCK_SAMPLE.find(e => e.type === 'capabilities');
+    const withFeatures = f => ClaudeChat.receive([{ ...cap, agents: [{ name: 'chat-reviewer', description: 'Reviews changes to the chat page' }, { name: 'explorer', description: 'Searches the codebase' }], features: f }]);
+    withFeatures({ mentions: true, images: true });
+    const files0 = filesPosts();
+    type('Look at @');
+    check('@ opens the mention popover', popOpen() && $('.ck-pop').dataset.kind === 'mention', $('.ck-pop').dataset.kind);
+    check('subagents come first, as @agent-<name>', items()[0] === '@agent-chat-reviewer' && items()[1] === '@agent-explorer', items());
+    check('a subagent shows its description and an "agent" tag', $('.ck-pop-item .ck-pop-desc').textContent.startsWith('Reviews changes') && $('.ck-pop-item .ck-pop-tag').textContent === 'agent');
+    check('the popover sits above the composer, like the slash one', $('.ck-pop').getBoundingClientRect().bottom <= $('.ck-composer').getBoundingClientRect().top + 1);
+    await until(() => filesPosts() > files0);
+    const fr = lastPost('files');
+    check('a files request goes out after a pause', filesPosts() === files0 + 1 && fr.query === '' && typeof fr.id === 'number' && fr.channel === 'main', fr);
+    ClaudeChat.receive([{ type: 'files', id: fr.id, query: '', suggestions: [{ path: 'src/' }, { path: 'src/chat.js' }, { path: 'README.md' }] }]);
+    check('the answer lists files after the agents; a folder is tagged', items().join('|') === '@agent-chat-reviewer|@agent-explorer|src/|src/chat.js|README.md'
+      && [...document.querySelectorAll('.ck-pop-tag')].some(e => e.textContent === 'folder'), items());
+    type('Look at @ch'); await until(() => lastPost('files').query === 'ch');
+    const fr2 = lastPost('files');
+    check('typing asks again, with a newer id', fr2.query === 'ch' && fr2.id > fr.id, [fr, fr2]);
+    ClaudeChat.receive([{ type: 'files', id: fr.id, query: 'ch', suggestions: [{ path: 'STALE.txt' }] }]);
+    check('an answer to an older request is ignored', !items().includes('STALE.txt'), items());
+    ClaudeChat.receive([{ type: 'files', id: fr2.id, query: 'ch', suggestions: [{ path: 'src/chat.js' }, { path: 'src/chat.css' }, { path: 'docs/' }, { path: 'my notes/chat log.md' }] }]);
+    check('the latest answer is shown, the agent that matches first', items().join('|') === '@agent-chat-reviewer|src/chat.js|src/chat.css|docs/|my notes/chat log.md', items());
+    check('the matched part is bold', document.querySelectorAll('.ck-pop-item')[1].querySelector('.ck-pop-title b').textContent === 'ch');
+    type('Look at @zz');
+    check('waiting for the answer: "Searching files…"', !items().length && $('.ck-pop-empty') && $('.ck-pop-empty').textContent === 'Searching files…', $('.ck-pop').textContent);
+    await until(() => lastPost('files').query === 'zz');
+    ClaudeChat.receive([{ type: 'files', id: lastPost('files').id, query: 'zz', suggestions: [] }]);
+    check('no match says so', $('.ck-pop-empty').textContent === 'No file matches @zz', $('.ck-pop').textContent);
+    key('Escape');
+    check('Esc closes it', !popOpen());
+    const files1 = filesPosts();
+    type('Look at @ch'); await wait(100);
+    check('a repeated query comes from the cache: no new request', filesPosts() === files1 && items().includes('src/chat.css'), [filesPosts(), files1]);
+    // pick a file: Enter takes it and does not send the draft
+    const sends0 = sendCount();
+    key('ArrowDown'); key('Enter');
+    check('Enter picks the file: @path and a space', inp.value === 'Look at @src/chat.js ', inp.value);
+    check('…and does not send while suggestions show', sendCount() === sends0 && !popOpen());
+    // a folder is inserted without the space, and the popover stays open to go down into it
+    type('Look at @ch');
+    key('ArrowDown'); key('ArrowDown'); key('ArrowDown'); key('Enter');
+    check('a folder keeps its slash, no space', inp.value === 'Look at @docs/', inp.value);
+    check('…and the popover stays open', popOpen() && $('.ck-pop').dataset.kind === 'mention');
+    await until(() => lastPost('files').query === 'docs/');
+    check('…asking for what is inside', lastPost('files').query === 'docs/', lastPost('files'));
+    ClaudeChat.receive([{ type: 'files', id: lastPost('files').id, query: 'docs/', suggestions: [{ path: 'docs/api.md' }, { path: 'docs/guide/' }] }]);
+    check('…and lists it', items().join('|') === 'docs/api.md|docs/guide/', items());
+    key('Escape');
+    // a path with spaces is quoted
+    type('Look at @ch');
+    for (let i = 0; i < 4; i++) key('ArrowDown');
+    key('Tab');
+    check('a path with spaces is quoted', inp.value === 'Look at @"my notes/chat log.md" ', inp.value);
+    type('Look at @"my n'); await until(() => lastPost('files').query === 'my n');
+    check('a quoted query is searched without the quote', lastPost('files').query === 'my n', lastPost('files'));
+    key('Escape');
+    // a subagent
+    type('@agent');
+    check('@agent lists the subagents', items()[0] === '@agent-chat-reviewer' && items()[1] === '@agent-explorer', items());
+    key('Tab');
+    check('a subagent is inserted as @agent-<name>', inp.value === '@agent-chat-reviewer ', inp.value);
+    // Enter with suggestions picks the first, sends nothing
+    type('go @ch'); key('Enter');
+    check('Enter with suggestions picks, does not send', inp.value === 'go @agent-chat-reviewer ' && sendCount() === sends0, [inp.value, sendCount(), sends0]);
+    // inside a slash command's arguments
+    type('/effort @ch');
+    check('a mention works inside command arguments', popOpen() && $('.ck-pop').dataset.kind === 'mention');
+    key('Escape');
+    // in the middle of the text
+    inp.value = 'see @ch and more'; inp.setSelectionRange(7, 7); inp.dispatchEvent(new Event('input'));
+    check('a mention at the caret, in the middle of the text', popOpen() && $('.ck-pop').dataset.kind === 'mention');
+    key('ArrowDown'); key('Enter');
+    check('the rest of the text is kept', inp.value === 'see @src/chat.js and more' && inp.selectionStart === 17, [inp.value, inp.selectionStart]);
+    type('mail a@b.com');
+    check('an email address is not a mention', !popOpen());
+    // the sent text keeps the mention; the bubble marks it
+    type('read @src/chat.js and @"my notes/x.md" please, mail a@b.com'); key('Enter');
+    check('the sent text keeps the mentions', lastPost('send').text === 'read @src/chat.js and @"my notes/x.md" please, mail a@b.com', lastPost('send'));
+    const bubble = lastTurn().querySelector('.ck-user-text');
+    check('the bubble marks both @-tokens', [...bubble.querySelectorAll('.ck-mention')].map(e => e.textContent).join('|') === '@src/chat.js|@"my notes/x.md"', bubble.innerHTML);
+    check('…and the text reads the same', bubble.textContent === 'read @src/chat.js and @"my notes/x.md" please, mail a@b.com');
+    type('<i>hi</i> @f.txt'); key('Enter');
+    check('user text is never markup', !lastTurn().querySelector('.ck-user-text i') && lastTurn().querySelector('.ck-mention').textContent === '@f.txt');
+    check('no "Unrecognized event" for the files answers', unknowns() === unk0, unknowns() - unk0);
+
+    // 19 · files dropped on the tab (the host reads them)
+    type('');
+    ClaudeChat.dropFiles([{ path: '/tmp/demo/src/a.js', rel: 'src/a.js', isDir: false }, { path: '/tmp/demo/my dir', rel: 'my dir/', isDir: true }, { path: '/Users/x/other/b.txt', rel: '/Users/x/other/b.txt', isDir: false }]);
+    check('dropped files become mentions: spaces quoted, folders keep the slash', inp.value === '@src/a.js @"my dir/" @/Users/x/other/b.txt ', inp.value);
+    check('…the composer has the focus', document.activeElement === inp);
+    inp.value = 'compare with and more'; inp.setSelectionRange(13, 13);
+    ClaudeChat.dropFiles([{ path: '/tmp/demo/src/a.js', rel: 'src/a.js', isDir: false }]);
+    check('a drop lands at the caret', inp.value === 'compare with @src/a.js and more', inp.value);
+    type('');
+    ClaudeChat.dropFiles([{ path: '/tmp/shot.png', rel: 'shot.png', isDir: false, image: { mediaType: 'image/png', data: samplePng(64, 48, 'a', 10), name: 'shot.png' } }]);
+    await until(() => chips().length === 1);
+    check('a dropped picture becomes an image chip, not a mention', chips().length === 1 && chips()[0].textContent.startsWith('Image 1 · 64×48') && inp.value === '', [chips().map(c => c.textContent), inp.value]);
+    check('the chip row shows, with a thumbnail 28×20', !$('.ck-refs').hidden && $('.ck-img-th').getBoundingClientRect().width === 28 && $('.ck-img-th').getBoundingClientRect().height === 20);
+
+    // 20 · images: paste, chips, send
+    const png = (w, h, l, hue) => new File([Uint8Array.from(atob(samplePng(w, h, l, hue)), c => c.charCodeAt(0))], l + '.png', { type: 'image/png' });
+    const paste = (files, text = '', types = []) => {
+      const ev = new Event('paste', { bubbles: true, cancelable: true });
+      ev.clipboardData = { items: [...files.map(f => ({ kind: 'file', type: f.type, getAsFile: () => f })), ...(text ? [{ kind: 'string', type: 'text/plain', getAsFile: () => null }] : [])],
+        types: [...(files.length ? ['Files'] : []), ...(text ? ['text/plain'] : []), ...types], getData: t => t === 'text/plain' ? text : '' };
+      inp.dispatchEvent(ev);
+      return ev;
+    };
+    check('a pasted picture is taken, not pasted', paste([png(64, 48, 'p1', 200)]).defaultPrevented);
+    await until(() => chips().length === 2);
+    check('…as a second chip', chips().length === 2 && chips()[1].textContent.startsWith('Image 2 · 64×48'), chips().map(c => c.textContent));
+    check('text paste stays normal', !paste([], 'hello').defaultPrevented);
+    check('rich text that carries a picture pastes as text', !paste([png(8, 8, 'r', 1)], 'a table', ['text/html']).defaultPrevented);
+    // chips keep the order they were added in, whatever they are; ⌫ takes the last one
+    ClaudeChat.receive([sdkl({ type: 'assistant', parent_tool_use_id: null, message: { id: 'ref-t', model: 'claude-opus-5-5', content: [{ type: 'text', text: 'Reference target paragraph.' }] } })]);
+    const refPara = [...document.querySelectorAll('#ck-log .ck-text p')].pop();
+    { const r = document.createRange(); r.selectNodeContents(refPara); getSelection().removeAllRanges(); getSelection().addRange(r); document.dispatchEvent(new MouseEvent('mouseup')); }
+    await tick(); $('.ck-refbtn').click();
+    ClaudeChat.dropFiles([{ path: '/tmp/c.png', rel: 'c.png', isDir: false, image: { mediaType: 'image/png', data: samplePng(64, 48, 'c', 90), name: 'c.png' } }]);
+    await until(() => chips().length === 4);
+    check('a reference sits between the images in the order added', chips().map(c => c.classList.contains('ck-img') ? 'img' : 'ref').join() === 'img,img,ref,img', chips().map(c => c.className));
+    inp.value = ''; key('Backspace');
+    check('⌫ in an empty composer removes the last image', chips().length === 3 && !chips()[2].classList.contains('ck-img'));
+    key('Backspace');
+    check('…then the reference', chips().length === 2 && chips().every(c => c.classList.contains('ck-img')));
+    $('.ck-img .ck-ref-x').click();
+    check('× removes an image; the rest are renumbered', chips().length === 1 && chips()[0].textContent.startsWith('Image 1'), chips().map(c => c.textContent));
+    // hover preview
+    const chip = $('.ck-img');
+    chip.dispatchEvent(new MouseEvent('mouseenter'));
+    const pk = $('.ck-img-peek'), pr = pk && pk.getBoundingClientRect();
+    check('hovering a chip shows a preview inside the window', pk && pr.left >= 0 && pr.top >= 0 && pr.right <= innerWidth && pr.bottom <= innerHeight && pr.width <= 248 && pr.height <= 248, pr);
+    chip.dispatchEvent(new MouseEvent('mouseleave'));
+    check('…and it goes away', !$('.ck-img-peek'));
+    // an image-only message
+    const send1 = sendCount(), int0 = posts.filter(p => p.type === 'interrupt').length;
+    key('Enter');
+    const s1 = lastPost('send');
+    check('an image-only message is sent, with its picture', sendCount() === send1 + 1 && s1.text === '' && s1.images.length === 1 && s1.images[0].mediaType === 'image/png'
+      && /^[A-Za-z0-9+/=]+$/.test(s1.images[0].data) && Object.keys(s1.images[0]).sort().join() === 'data,mediaType', s1);
+    check('the chips are cleared', $('.ck-refs').hidden && !chips().length);
+    const thumb = lastTurn().querySelector('.ck-user-img');
+    check('the turn shows a thumbnail (48 px high) and no text', thumb && thumb.getBoundingClientRect().height <= 50 && !lastTurn().querySelector('.ck-user-text'));
+    thumb.click();
+    check('a click opens the picture larger', !!$('.ck-lightbox img'));
+    key('Escape', { target: document.body });
+    check('Esc closes it (and does not interrupt)', !$('.ck-lightbox') && posts.filter(p => p.type === 'interrupt').length === int0);
+    thumb.click(); $('.ck-lightbox').click();
+    check('a click on it closes it too', !$('.ck-lightbox'));
+    // a slash command never carries images: they wait
+    ClaudeChat.dropFiles([{ path: '/tmp/d.png', rel: 'd.png', isDir: false, image: { mediaType: 'image/png', data: samplePng(40, 30, 'd', 150), name: 'd.png' } }]);
+    await until(() => chips().length === 1);
+    type('/context'); key('Enter');
+    check('a slash command carries no images', lastPost('send').text === '/context' && !('images' in lastPost('send')), lastPost('send'));
+    check('…and the picture stays for the next message', chips().length === 1);
+    type('and this one'); key('Enter');
+    check('the next message carries it', lastPost('send').text === 'and this one' && lastPost('send').images.length === 1);
+    check('the turn shows the text with its thumbnail', lastTurn().querySelector('.ck-user-img') && lastTurn().querySelector('.ck-user-text').textContent === 'and this one');
+    // too big: drawn smaller
+    ClaudeChat.dropFiles([{ path: '/tmp/big.png', rel: 'big.png', isDir: false, image: { mediaType: 'image/png', data: samplePng(2010, 400, 'big', 60), name: 'big.png' } }]);
+    await until(() => chips().length === 1);
+    check('a picture over 2000 px is drawn at 1568 px on its long side', chips().length === 1 && chips()[0].textContent.includes('1568×312'), chips().map(c => c.textContent));
+    type('x'); key('Enter');
+    const big = lastPost('send').images[0], bigImg = new Image();
+    bigImg.src = `data:${big.mediaType};base64,${big.data}`; await bigImg.decode();
+    check('the sent picture is the smaller one (PNG kept: it is small enough)', big.mediaType === 'image/png' && bigImg.naturalWidth === 1568 && bigImg.naturalHeight === 312, [big.mediaType, bigImg.naturalWidth]);
+    // at most 10
+    for (let i = 0; i < 11; i++) ClaudeChat.dropFiles([{ path: '/tmp/n' + i + '.png', rel: 'n' + i + '.png', isDir: false, image: { mediaType: 'image/png', data: samplePng(16, 16, 'n' + i, i * 20), name: 'n' + i + '.png' } }]);
+    await until(() => chips().length === 10);
+    await wait(60);
+    check('at most 10 images go with a message', chips().length === 10 && notes().some(n => n.textContent.includes('At most 10 images')), chips().length);
+    type('');
+    for (let i = 0; i < 10; i++) key('Backspace');
+    check('⌫ clears them', $('.ck-refs').hidden && !chips().length);
+
+    // 21 · AskUserQuestion
+    settle(); type('');
+    ClaudeChat.showUser('Add a cache for the feed');
+    const ask = (id, input = ASK_INPUT) => ClaudeChat.receive([...toolLines('tu-' + id, 'AskUserQuestion', input),
+      { type: 'permission_request', id, toolName: 'AskUserQuestion', input, toolUseID: 'tu-' + id, suggestions: [] }]);
+    ask('p-ask1');
+    let c = cardOf();
+    check('a question card, not the generic one', c.classList.contains('ck-ask-card') && c.querySelector('.ck-risk').textContent === 'Question' && c.querySelector('.ck-card-title').textContent === 'Claude asks' && !c.querySelector('.ck-cmd'), c.textContent.slice(0, 60));
+    check('each question has its header and text', [...c.querySelectorAll('.ck-q-h')].map(e => e.textContent).join() === 'Cache scope,Extras' && c.querySelector('.ck-q-t').textContent === 'Where should the feed cache live?');
+    check('options carry a label and a description', c.querySelector('.ck-q-opt-l').textContent === 'In memory' && c.querySelector('.ck-q-opt-d').textContent.startsWith('Fast and simple'));
+    check('one choice: rings; several: boxes', !!c.querySelectorAll('.ck-q')[0].querySelector('.ck-radio') && !!c.querySelectorAll('.ck-q')[1].querySelector('.ck-check'));
+    const qk = i => [...c.querySelectorAll('.ck-q')[i].querySelectorAll('.ck-key')].map(e => e.textContent).join('');
+    check('number keys show on the current question only', qk(0) === '1234' && qk(1) === '', [qk(0), qk(1)]);
+    check('the tab waits for you; Answer is off', $('.ck-dock').dataset.state === 'waiting' && c.querySelector('.ck-go').disabled);
+    key('1', { target: document.body });
+    check('key 1 picks the first option and moves on to the next question', c.querySelectorAll('.ck-q')[0].querySelector('.ck-q-opt').classList.contains('is-on') && qk(0) === '' && qk(1) === '12345', [qk(0), qk(1)]);
+    key('1', { target: document.body }); key('3', { target: document.body });
+    check('several choices toggle', [...c.querySelectorAll('.ck-q')[1].querySelectorAll('.ck-q-opt.is-on')].length === 2 && !c.querySelector('.ck-go').disabled);
+    key('Enter', { target: document.body });
+    let pm = lastPost('permission');
+    check('Enter answers: the answers go in the tool input', pm.id === 'p-ask1' && pm.decision === 'allow' && pm.channel === 'main' && pm.updatedInput.questions.length === 2
+      && pm.updatedInput.answers['Where should the feed cache live?'] === 'In memory' && pm.updatedInput.answers['Which extras do you want with it?'] === 'Metrics, Tests', pm);
+    check('the card collapses to one line per question', c.classList.contains('is-resolved') && [...c.querySelectorAll('.ck-answer')].map(e => e.textContent).join('|') === 'Cache scope · In memory|Extras · Metrics, Tests' && !c.querySelector('.ck-opt'), c.textContent);
+    check('…and the tab is no longer waiting', $('.ck-dock').dataset.state !== 'waiting');
+    ask('p-ask2'); c = cardOf();
+    c.querySelectorAll('.ck-q')[0].querySelector('.is-other').click();
+    const oi = c.querySelector('.ck-q-other');
+    check('Other reveals a one-line input, focused', !oi.hidden && document.activeElement === oi);
+    check('an empty Other is not an answer', c.querySelector('.ck-go').disabled);
+    key('2', { target: oi });
+    check('digits typed in the field stay in the field', c.querySelectorAll('.ck-q')[0].querySelectorAll('.ck-q-opt.is-on').length === 1);
+    oi.value = 'Redis'; oi.dispatchEvent(new Event('input'));
+    c.querySelectorAll('.ck-q')[1].querySelectorAll('.ck-q-opt')[3].click();
+    check('every question answered: Answer is on', !c.querySelector('.ck-go').disabled);
+    c.querySelector('.ck-go').click();
+    pm = lastPost('permission');
+    check('Other sends its text', pm.id === 'p-ask2' && pm.updatedInput.answers['Where should the feed cache live?'] === 'Redis' && pm.updatedInput.answers['Which extras do you want with it?'] === 'Docs', pm.updatedInput.answers);
+    ask('p-ask3'); c = cardOf();
+    const o1 = c.querySelector('.ck-q-opt');
+    o1.dispatchEvent(new MouseEvent('mouseenter'));
+    check('an option with a preview shows it in a box', !c.querySelector('.ck-q-prev').hidden && c.querySelector('.ck-q-prev').textContent.includes('new Map()') && c.querySelector('.ck-q-prev').getBoundingClientRect().height <= 162);
+    o1.dispatchEvent(new MouseEvent('mouseleave'));
+    check('…and hides it again', c.querySelector('.ck-q-prev').hidden);
+    c.querySelectorAll('.ck-q-opt')[2].dispatchEvent(new MouseEvent('mouseenter'));
+    check('an option without one shows nothing', c.querySelector('.ck-q-prev').hidden);
+    [...c.querySelectorAll('.sk-btn')].find(b => b.textContent === 'Skip').click();
+    pm = lastPost('permission');
+    check('Skip declines with the message', pm.id === 'p-ask3' && pm.decision === 'deny' && pm.message === 'The user chose not to answer these questions.' && !pm.updatedInput, pm);
+    check('…and collapses to "Skipped"', c.classList.contains('is-resolved') && c.querySelector('.ck-outcome').textContent.trim() === 'Skipped' && c.querySelector('.ck-outcome').dataset.outcome === 'denied');
+
+    // 22 · plan approval
+    settle();
+    ClaudeChat.showUser('Plan a cache for the feed');
+    const plan = id => ClaudeChat.receive([...toolLines('tu-' + id, 'ExitPlanMode', PLAN_INPUT),
+      { type: 'permission_request', id, toolName: 'ExitPlanMode', input: PLAN_INPUT, toolUseID: 'tu-' + id, suggestions: [] }]);
+    plan('p-plan1'); c = cardOf(); await until(() => !c.querySelector('.ck-chg-exp').hidden, 500);
+    check('a plan card: chip and title', c.classList.contains('ck-plan-card') && c.querySelector('.ck-risk').textContent === 'Plan' && c.querySelector('.ck-card-title').textContent === 'Ready to code?');
+    const pbox = c.querySelector('.ck-plan-box');
+    check('the plan is Markdown in a box that scrolls (260 px)', pbox.textContent.includes('Plan: add a feed cache') && !!pbox.querySelector('li') && pbox.clientHeight <= 262 && pbox.scrollHeight > pbox.clientHeight, [pbox.clientHeight, pbox.scrollHeight]);
+    check('allowed prompts are listed', c.querySelector('.ck-plan-also').textContent === 'Also asks to run: run the test suiteinstall dependencies', c.querySelector('.ck-plan-also').textContent);
+    const pex = c.querySelector('.ck-chg-exp');
+    check('Expand shows for a long plan', !pex.hidden);
+    pex.click();
+    check('Expand makes the box taller', c.querySelector('.ck-plan-wrap').classList.contains('is-big') && pbox.clientHeight > 265 && pex.textContent.includes('Collapse'), pbox.clientHeight);
+    pex.click();
+    check('Collapse puts it back', pbox.clientHeight <= 262 && pex.textContent.includes('Expand'));
+    check('three options with keys', [...c.querySelectorAll('.ck-opt .ck-key')].map(e => e.textContent).join('') === '123' && c.querySelector('.ck-card-title') && c.querySelectorAll('.ck-opt')[0].textContent.includes('auto-accept edits'));
+    key('1', { target: document.body });
+    pm = lastPost('permission');
+    check('1: allow, switch to accept edits for the session', pm.id === 'p-plan1' && pm.decision === 'allow' && JSON.stringify(pm.updatedPermissions) === JSON.stringify([{ type: 'setMode', mode: 'acceptEdits', destination: 'session' }]), pm);
+    check('the outcome line says so', c.classList.contains('is-resolved') && c.querySelector('.ck-outcome').textContent.includes('Approved · auto-accept edits'), c.querySelector('.ck-outcome').textContent);
+    check('the plan hides behind "Show plan"', getComputedStyle(c.querySelector('.ck-plan-wrap')).display === 'none' && c.querySelector('.ck-plan-toggle').textContent === 'Show plan');
+    c.querySelector('.ck-plan-toggle').click();
+    check('…and comes back on request', getComputedStyle(c.querySelector('.ck-plan-wrap')).display !== 'none' && c.querySelector('.ck-plan-toggle').textContent === 'Hide plan');
+    plan('p-plan2'); c = cardOf();
+    key('2', { target: document.body });
+    pm = lastPost('permission');
+    check('2: allow, keep asking before each edit', pm.id === 'p-plan2' && pm.decision === 'allow' && pm.updatedPermissions[0].mode === 'default' && pm.updatedPermissions[0].type === 'setMode' && pm.updatedPermissions[0].destination === 'session'
+      && c.querySelector('.ck-outcome').textContent.includes('Approved · ask before each edit'), pm);
+    plan('p-plan3'); c = cardOf();
+    check('the feedback box is hidden at first', c.querySelector('.ck-no').hidden);
+    key('3', { target: document.body });
+    check('3 opens the feedback box', !c.querySelector('.ck-no').hidden && !lastPost('permission').id.endsWith('plan3'));
+    c.querySelector('.ck-no-input').value = 'Use a Map, no disk';
+    [...c.querySelectorAll('.sk-btn')].find(b => b.textContent === 'Keep planning').click();
+    pm = lastPost('permission');
+    check('Keep planning: deny, with the feedback', pm.id === 'p-plan3' && pm.decision === 'deny' && pm.message === 'The user wants to keep planning. Feedback: Use a Map, no disk' && !pm.updatedPermissions, pm);
+    check('…and the outcome', c.classList.contains('is-resolved') && c.querySelector('.ck-outcome').textContent.includes('Kept planning'));
+    plan('p-plan4'); c = cardOf();
+    c.querySelectorAll('.ck-opt')[2].click();
+    [...c.querySelectorAll('.sk-btn')].find(b => b.textContent === 'Keep planning').click();
+    check('without feedback the message is short', lastPost('permission').message === 'The user wants to keep planning.', lastPost('permission'));
+
+    // 23 · status notices
+    settle(); type('');
+    ClaudeChat.showUser('Write notes.txt and run the tests');
+    const retryNotes = () => notes().filter(n => /^Retr/.test(n.textContent));
+    const retry = (attempt, delay, status) => ClaudeChat.receive([sdkl({ type: 'system', subtype: 'api_retry', attempt, max_retries: 10, retry_delay_ms: delay, error_status: status })]);
+    retry(1, 5000, 529);
+    check('retry: one notice', retryNotes().length === 1 && retryNotes()[0].textContent === 'Retrying in 5 s · attempt 1 of 10 · overloaded (529)' && retryNotes()[0].dataset.kind === 'warn', retryNotes().map(n => n.textContent));
+    check('…and the status line says Retrying…', $('.ck-status-text').textContent === 'Retrying…', $('.ck-status-text').textContent);
+    retry(2, 8000, 429);
+    check('the next retry updates it in place', retryNotes().length === 1 && retryNotes()[0].textContent === 'Retrying in 8 s · attempt 2 of 10 · rate limited (429)', retryNotes().map(n => n.textContent));
+    retry(3, 1000, null);
+    check('no status: a connection problem', retryNotes()[0].textContent === 'Retrying in 1 s · attempt 3 of 10 · connection problem');
+    retry(4, 2000, 503);
+    check('5xx: a server error', retryNotes().length === 1 && retryNotes()[0].textContent === 'Retrying in 2 s · attempt 4 of 10 · server error (503)');
+    ClaudeChat.receive([sdkl({ type: 'assistant', parent_tool_use_id: null, message: { id: 'rt1', model: 'claude-opus-5-5', content: [{ type: 'text', text: 'Done.' }] } })]);
+    check('the next content turns it into "Retried 4×", faded', retryNotes()[0].textContent === 'Retried 4×' && retryNotes()[0].classList.contains('is-faded') && retryNotes()[0].dataset.kind === 'info', retryNotes()[0].textContent);
+    check('…and the status line no longer says Retrying…', $('.ck-status-text').textContent !== 'Retrying…');
+    retry(1, 3000, 529);
+    check('a later retry in the same turn is a new notice', retryNotes().length === 2 && retryNotes()[1].textContent.startsWith('Retrying in 3 s'));
+    ClaudeChat.receive([...toolLines('tu-rt', 'Bash', { command: 'ls' })]);
+    check('a tool event settles it as well', retryNotes()[1].textContent === 'Retried 1×');
+    const usage0 = posts.filter(p => p.type === 'usage').length;
+    const lim = (status, type, util, at) => sdkl({ type: 'rate_limit_event', rate_limit_info: { status, resetsAt: at, rateLimitType: type, utilization: util } });
+    const limNotes = () => notes().filter(n => /limit/.test(n.textContent) && !/^Retr/.test(n.textContent));
+    const inTwoHours = Math.floor(Date.now() / 1000) + 2 * 3600;
+    ClaudeChat.receive([lim('allowed_warning', 'five_hour', 0.85, inTwoHours)]);
+    check('limit warning: used, limit name, reset time', limNotes().length === 1 && /^You have used 85% of your 5-hour limit · resets \S+/.test(limNotes()[0].textContent) && limNotes()[0].dataset.kind === 'warn', limNotes().map(n => n.textContent));
+    check('…and the usage chip is refreshed', posts.filter(p => p.type === 'usage').length === usage0 + 1);
+    ClaudeChat.receive([lim('allowed_warning', 'five_hour', 0.9, inTwoHours), lim('allowed', 'five_hour', 0.5, inTwoHours)]);
+    check('the same limit and state shows once; "allowed" shows nothing', limNotes().length === 1);
+    ClaudeChat.receive([lim('allowed_warning', 'seven_day_opus', 72, inTwoHours * 1000)]);
+    check('another limit shows; milliseconds and percent work too', limNotes().length === 2 && limNotes()[1].textContent.startsWith('You have used 72% of your weekly Opus limit · resets ')
+      && limNotes()[1].textContent.split('resets ')[1] === limNotes()[0].textContent.split('resets ')[1], limNotes().map(n => n.textContent));
+    ClaudeChat.receive([lim('rejected', 'five_hour', 1, inTwoHours)]);
+    check('a refusal is an error notice', limNotes().length === 3 && limNotes()[2].dataset.kind === 'error' && limNotes()[2].textContent.startsWith('Rate limit reached for your 5-hour limit · resets '), limNotes().map(n => n.textContent));
+    const hook = (o, sub = 'hook_response') => ClaudeChat.receive([sdkl({ type: 'system', subtype: sub, hook_name: 'PreToolUse:Bash', hook_event: 'PreToolUse', ...o })]);
+    let n0 = notes().length;
+    hook({ stdout: '', stderr: 'blocked by policy', exit_code: 2, outcome: 'error' });
+    check('a hook that blocked: name, exit code, output', notes().length === n0 + 1 && notes()[n0].textContent === 'Hook PreToolUse:Bash · exit 2 — blocked by policy' && notes()[n0].dataset.kind === 'warn', notes()[n0] && notes()[n0].textContent);
+    hook({ stdout: '', stderr: '', exit_code: 0, outcome: 'success' });
+    hook({ hook_name: 'PreToolUse:Bash' }, 'hook_started');
+    check('a quiet success and a start show nothing', notes().length === n0 + 1);
+    hook({ hook_name: 'PostToolUse:Edit', hook_event: 'PostToolUse', stdout: 'formatted 2 files', exit_code: 0, outcome: 'success' });
+    check('a success with output is an info notice', notes().length === n0 + 2 && notes()[n0 + 1].textContent === 'Hook PostToolUse:Edit — formatted 2 files' && notes()[n0 + 1].dataset.kind === 'info', notes()[n0 + 1] && notes()[n0 + 1].textContent);
+    hook({ stderr: 'x'.repeat(400), exit_code: 1, outcome: 'error' });
+    check('long hook output is cut at 300 characters', notes()[n0 + 2].textContent.endsWith('x'.repeat(300) + '…'));
+    n0 = notes().length;
+    const sysNote = (subtype, f) => ClaudeChat.receive([sdkl({ type: 'system', subtype, ...f })]);
+    sysNote('permission_denied', { tool_name: 'Bash', message: 'curl to an unlisted host' });
+    check('permission denied: "Blocked Bash: …"', notes()[n0].textContent === 'Blocked Bash: curl to an unlisted host' && notes()[n0].dataset.kind === 'warn');
+    sysNote('notification', { text: 'Disk almost full', priority: 'high' });
+    sysNote('notification', { text: 'Build finished', priority: 'low' });
+    check('notifications: warn when urgent, info otherwise', notes()[n0 + 1].dataset.kind === 'warn' && notes()[n0 + 2].dataset.kind === 'info' && notes()[n0 + 2].textContent === 'Build finished');
+    sysNote('informational', { content: 'Heads up', level: 'warning' });
+    check('informational: warn for a warning', notes()[n0 + 3].textContent === 'Heads up' && notes()[n0 + 3].dataset.kind === 'warn');
+    sysNote('model_refusal_fallback', { original_model: 'opus', fallback_model: 'sonnet' });
+    check('model refusal fallback is an info notice', notes()[n0 + 4].textContent === 'opus declined; retried with sonnet' && notes()[n0 + 4].dataset.kind === 'info');
+    check('none of them is an "Unrecognized event"', unknowns() === unk0, unknowns() - unk0);
+    check('the notice kind "warn" is amber', getComputedStyle(notes()[n0]).color !== getComputedStyle(notes()[n0 + 2]).color);
+
+    // 24 · the task list
+    settle();
+    const tasksEl = $('.ck-tasks');
+    check('no tasks: no panel', tasksEl.hidden);
+    ClaudeChat.showUser('Add a cache for the feed');
+    const todos = [['Read the feed code', 'Reading the feed code', 'completed'], ['Write src/cache.js', 'Writing src/cache.js', 'completed'], ['Wrap fetchFeed in the cache', 'Wrapping fetchFeed in the cache', 'in_progress'],
+      ['Read the TTL from the config', 'Reading the TTL', 'pending'], ['Add tests', 'Adding tests', 'pending']].map(([content, activeForm, status]) => ({ content, activeForm, status }));
+    ClaudeChat.receive(toolLines('tu-todo', 'TodoWrite', { todos }, 'Todos have been modified successfully'));
+    check('TodoWrite: the panel shows, folded: count and the task in progress', !tasksEl.hidden && $('.ck-tasks-k').textContent === 'Tasks 2/5' && $('.ck-tasks-now-t').textContent === 'Wrapping fetchFeed in the cache' && !$('.ck-tasks-list') && !!$('.ck-task-spin'), tasksEl.textContent);
+    check('…with a thin progress meter at 40%', $('.ck-tasks-fill').style.width === '40%' && $('.ck-tasks-bar').getBoundingClientRect().height <= 4);
+    check('the panel sits above the status line', tasksEl.getBoundingClientRect().bottom <= $('.ck-status').getBoundingClientRect().top + 1);
+    $('.ck-tasks-head').click();
+    check('a click opens the list: 5 rows with their states', [...document.querySelectorAll('.ck-task')].map(e => e.dataset.status).join() === 'completed,completed,in_progress,pending,pending' && $('.ck-tasks-list').getBoundingClientRect().height <= innerHeight * 0.3 + 1);
+    check('…done rows are struck through, the one in progress shows its activeForm', getComputedStyle(document.querySelector('.ck-task .ck-task-t')).textDecorationLine === 'line-through' && document.querySelectorAll('.ck-task .ck-task-t')[2].textContent === 'Wrapping fetchFeed in the cache');
+    $('.ck-tasks-head').click();
+    check('another click folds it', !$('.ck-tasks-list'));
+    // a subagent's TodoWrite does not touch the list
+    ClaudeChat.receive([sdkl({ type: 'assistant', parent_tool_use_id: 'sub-1', message: { id: 'sub-td', content: [{ type: 'tool_use', id: 'tu-sub-td', name: 'TodoWrite', input: { todos: [{ content: 'Sub task', activeForm: 'Sub tasking', status: 'pending' }] } }] } })]);
+    check('a subagent\'s todos are ignored', $('.ck-tasks-k').textContent === 'Tasks 2/5');
+    // a side chat has its own list: TaskCreate, the id from the result, TaskUpdate
+    $('.ck-more').click(); popPick('New…'); popPick('New side chat');
+    const sc = lastPost('openSide').channel;
+    check('the side chat starts with no panel', tasksEl.hidden);
+    const tc = (id, subject, active, result) => ClaudeChat.receive(toolLines(id, 'TaskCreate', { subject, description: subject + '.', ...(active ? { activeForm: active } : {}) }, result), sc);
+    const tu = (id, input) => ClaudeChat.receive(toolLines(id, 'TaskUpdate', input, 'Updated task'), sc);
+    tc('tc1', 'Write tests', 'Writing tests', 'Task #7 created successfully: Write tests');
+    tc('tc2', 'Update docs', null, '{"task":{"id":"8","subject":"Update docs"}}');
+    check('TaskCreate adds tasks (the side chat\'s own list)', !tasksEl.hidden && $('.ck-tasks-k').textContent === 'Tasks 0/2' && !$('.ck-tasks-now-t'), tasksEl.textContent);
+    tu('tu1', { taskId: '7', status: 'in_progress' });
+    check('TaskUpdate by the id from the result: in progress', $('.ck-tasks-now-t').textContent === 'Writing tests', tasksEl.textContent);
+    tu('tu2', { taskId: '8', status: 'deleted' });
+    check('"deleted" removes the task', $('.ck-tasks-k').textContent === 'Tasks 0/1');
+    ClaudeChat.receive([sdkl({ type: 'assistant', parent_tool_use_id: 'sub-2', message: { id: 'sub-tc', content: [{ type: 'tool_use', id: 'tu-sub-tc', name: 'TaskCreate', input: { subject: 'Sub' } }] } })], sc);
+    tu('tu3', { taskId: '7', status: 'completed' });
+    check('completed: 1/1, not "done" while the turn runs', $('.ck-tasks-k').textContent === 'Tasks 1/1', $('.ck-tasks-k').textContent);
+    ClaudeChat.receive([sdkl({ type: 'result', subtype: 'success', duration_ms: 1, num_turns: 1, total_cost_usd: 0 })], sc);
+    check('the turn ends: "Tasks 1/1 · done"', $('.ck-tasks-k').textContent === 'Tasks 1/1 · done' && !$('.ck-task-spin'), $('.ck-tasks-k').textContent);
+    type('next question'); key('Enter');
+    check('the next message hides a finished list', tasksEl.hidden && lastPost('send').channel === sc);
+    $('.ck-view').click();
+    check('back in main: its own list, untouched', !tasksEl.hidden && $('.ck-tasks-k').textContent === 'Tasks 2/5', tasksEl.textContent);
+    ClaudeChat.receive([{ type: 'end' }], sc);
+
+    // 25 · the flags a runner switches off (Codex): no @ popover, no image paste
+    withFeatures({ mentions: false, images: false });
+    const files2 = filesPosts();
+    type('Look at @ch'); await wait(100);
+    check('mentions off: no popover and no request', !popOpen() && filesPosts() === files2);
+    const pev2 = paste([png(8, 8, 'z', 5)]);
+    check('images off: a paste is left alone', !pev2.defaultPrevented);
+    ClaudeChat.dropFiles([{ path: '/tmp/z.png', rel: 'z.png', isDir: false, image: { mediaType: 'image/png', data: samplePng(8, 8, 'z', 5), name: 'z.png' } }]);
+    await wait(50);
+    check('…a dropped picture becomes a mention instead', chips().length === 0 && inp.value.endsWith('@z.png '), [chips().length, inp.value]);
+    type('read @a.txt'); key('Enter');
+    check('…and the bubble does not mark mentions', !lastTurn().querySelector('.ck-mention'));
+    withFeatures({ mentions: true, images: true });
+    type('@'); check('back on: the popover opens again', popOpen() && $('.ck-pop').dataset.kind === 'mention'); key('Escape'); type('');
+
+    const mnotes = () => [...mainLog.querySelectorAll('.ck-notice')], mrows = () => [...mainLog.querySelectorAll('.ck-row')];
+    // 26 · the mic: dictation from the host goes where the caret was
+    const mic = $('.ck-mic'), voicePost = () => lastPost('voice');
+    check('no voice from the host: no mic', mic.hidden);
+    withFeatures({ mentions: true, images: true, voice: true });
+    check('voice on: the mic shows above send', !mic.hidden && mic.nextElementSibling === $('.ck-send'));
+    type('Fix the ');
+    mic.click();
+    check('a click starts it', voicePost() && voicePost().on === true && mic.dataset.state === 'starting', [voicePost(), mic.dataset.state]);
+    ClaudeChat.voice({ state: 'listening' });
+    check('listening', mic.dataset.state === 'listening' && mic.getAttribute('aria-pressed') === 'true');
+    ClaudeChat.voice({ state: 'listening', text: 'login bug', final: false });
+    check('partial words at the caret', inp.value === 'Fix the login bug', inp.value);
+    ClaudeChat.voice({ state: 'listening', text: 'login bug now', final: false });
+    check('…replaced as it hears more', inp.value === 'Fix the login bug now', inp.value);
+    mic.click();
+    check('a second click stops it', voicePost().on === false && mic.dataset.state === 'stopping');
+    ClaudeChat.voice({ state: 'idle', text: 'login bug now.', final: true });
+    check('the final words, then idle', inp.value === 'Fix the login bug now.' && mic.dataset.state === 'idle', [inp.value, mic.dataset.state]);
+    type('A B'); inp.setSelectionRange(1, 1);
+    mic.click(); ClaudeChat.voice({ state: 'listening' }); ClaudeChat.voice({ state: 'listening', text: 'and', final: false });
+    check('in the middle: a space on each side', inp.value === 'A and B' && inp.selectionStart === 5, [inp.value, inp.selectionStart]);
+    inp.value = 'A and Bz'; inp.dispatchEvent(new Event('input'));
+    check('typing while it listens stops it', voicePost().on === false);
+    ClaudeChat.voice({ state: 'listening', text: 'and more', final: false });
+    check('…and your text wins', inp.value === 'A and Bz', inp.value);
+    ClaudeChat.voice({ state: 'idle' });
+    type('');
+    mic.click(); ClaudeChat.voice({ state: 'error', message: 'Speech recognition is off for FloatyTerm.' });
+    check('an error: a notice, and idle', mic.dataset.state === 'idle' && mnotes().pop().textContent === 'Speech recognition is off for FloatyTerm.');
+    const sendsV = sendCount();
+    mic.click(); ClaudeChat.voice({ state: 'listening' }); ClaudeChat.voice({ state: 'listening', text: 'hello there', final: false });
+    key('Enter');
+    check('Return sends what it heard and stops', sendCount() === sendsV + 1 && lastPost('send').text === 'hello there' && voicePost().on === false, lastPost('send'));
+    ClaudeChat.voice({ state: 'idle', text: 'hello there!', final: true });
+    check('…the late final text stays out of the empty composer', inp.value === '', inp.value);
+    settle();
+    type('/voice'); key('Enter');
+    check('/voice starts it too', voicePost().on === true && !lastPost('send').text.startsWith('/voice'));
+    ClaudeChat.voice({ state: 'listening' });
+    key('Escape');
+    check('Esc stops it', voicePost().on === false);
+    ClaudeChat.voice({ state: 'idle' });
+
+    // 27 · the session name: in the ⋮ menu, /rename
+    const nameRow = () => [...document.querySelectorAll('.ck-info-row')].find(r => r.textContent.startsWith('Name'));
+    const titlePosts = () => posts.filter(p => p.type === 'title').length;
+    const titles0 = titlePosts();
+    $('.ck-more').click();
+    check('the menu asks for the name', titlePosts() === titles0 + 1);
+    check('…and says it is loading', nameRow() && nameRow().textContent.includes('Loading'), nameRow() && nameRow().textContent);
+    ClaudeChat.receive([{ type: 'title', title: 'Reply with ok', custom: false }]);
+    check('an automatic name is marked', nameRow().textContent.includes('Reply with ok') && nameRow().textContent.includes('from the first prompt'), nameRow().textContent);
+    check('"Name this conversation…" item', items().includes('Name this conversation…'), items());
+    ClaudeChat.receive([{ type: 'title', sessionId: 'other', title: 'Nope', custom: true }]);
+    check('a name for another session is ignored', !nameRow().textContent.includes('Nope'));
+    popPick('Name this conversation');
+    check('the item starts /rename in the composer', inp.value === '/rename ' && document.activeElement === inp, inp.value);
+    type('/rename Parser fix'); key('Escape'); key('Enter');
+    check('/rename <name> renames here', lastPost('rename') && lastPost('rename').title === 'Parser fix' && !lastPost('send').text.startsWith('/rename'), lastPost('rename'));
+    check('…and says so', mnotes().pop().textContent.includes('Parser fix'));
+    $('.ck-more').click();
+    check('the menu shows the new name', nameRow().textContent === 'NameParser fix' && items().includes('Rename…'), [nameRow().textContent, items()]);
+    popPick('Rename');
+    check('Rename… selects the name to type over', inp.value === '/rename Parser fix' && inp.selectionStart === 8 && inp.selectionEnd === inp.value.length, [inp.value, inp.selectionStart, inp.selectionEnd]);
+    type('/name'); check('/name is its alias', items()[0].startsWith('/rename'), items()[0]);
+    key('Escape'); type('');
+
+    // 28 · subagents and background commands: progress on the row, a notice when a background one ends
+    const unkT = unknowns();
+    const sysl = (subtype, f) => sdkl({ type: 'system', subtype, ...f });
+    ClaudeChat.receive([sdkl({ type: 'stream_event', event: { type: 'message_start', message: { id: 'm-task' } } }), ...toolLines('tu-ag', 'Agent', { description: 'Explore the code', prompt: 'Find it', subagent_type: 'Explore' })]);
+    ClaudeChat.receive([sysl('task_started', { task_id: 'a1', tool_use_id: 'tu-ag', description: 'Explore the code', task_type: 'local_agent', subagent_type: 'Explore' }),
+      sysl('task_progress', { task_id: 'a1', tool_use_id: 'tu-ag', description: 'Explore', summary: 'Reading chat.js', last_tool_name: 'Read', usage: { total_tokens: 12000, tool_uses: 4, duration_ms: 900 } })]);
+    const agRow = mrows().pop();
+    check('progress on the agent row', agRow.querySelector('.ck-meta').textContent === '4 tools · 12k tokens' && agRow.title.includes('Reading chat.js'), [agRow.querySelector('.ck-meta').textContent, agRow.title]);
+    ClaudeChat.receive([...toolLines('tu-bg', 'Bash', { command: 'npm run build', run_in_background: true }, 'Command running in background with ID: b1'),
+      sysl('task_started', { task_id: 'b1', tool_use_id: 'tu-bg', description: 'npm run build', task_type: 'local_bash', is_backgrounded: true }),
+      sysl('background_tasks_changed', { tasks: [{ task_id: 'b1', task_type: 'local_bash', description: 'npm run build' }, { task_id: 'w', task_type: 'x', description: 'watch', ambient: true }] }),
+      sysl('task_started', { task_id: 'w', description: 'watch', skip_transcript: true })]);
+    const bgRow = mrows().pop();
+    check('a background command is badged', !bgRow.querySelector('.ck-badge').hidden && bgRow.querySelector('.ck-badge').textContent === 'background', bgRow.querySelector('.ck-badge').textContent);
+    settle();
+    check('idle: the status line counts the background work', $('.ck-status-text').textContent === 'Ready · 1 in the background', $('.ck-status-text').textContent);
+    const notesT = mnotes().length;
+    ClaudeChat.receive([sysl('task_notification', { task_id: 'w', status: 'completed', output_file: '', summary: 'x', skip_transcript: true }),
+      sysl('task_notification', { task_id: 'b1', tool_use_id: 'tu-bg', status: 'completed', output_file: '/tmp/b1', summary: 'Build ok' }),
+      sysl('task_notification', { task_id: 'b1', tool_use_id: 'tu-bg', status: 'completed', output_file: '/tmp/b1', summary: 'Build ok' }),
+      sysl('background_tasks_changed', { tasks: [] })]);
+    check('a background end: one notice (not for ambient tasks)', mnotes().length === notesT + 1 && mnotes().pop().textContent === 'Background command “npm run build” finished — Build ok', mnotes().slice(notesT).map(n => n.textContent));
+    check('…the badge says done', bgRow.querySelector('.ck-badge').textContent === 'background · done');
+    check('…and the count goes', $('.ck-status-text').textContent === 'Ready', $('.ck-status-text').textContent);
+
+    // 29 · thinking tokens: an estimate on the live thinking line
+    ClaudeChat.receive([sdkl({ type: 'stream_event', event: { type: 'message_start', message: { id: 'm-th' } } }),
+      sdkl({ type: 'stream_event', event: { type: 'content_block_start', index: 0, content_block: { type: 'thinking', thinking: '' } } }),
+      sysl('thinking_tokens', { estimated_tokens: 1500, estimated_tokens_delta: 60 })]);
+    const thTime = [...document.querySelectorAll('.ck-think-time')].pop();
+    check('the live line shows the estimate', thTime.textContent.endsWith(' · ~1.5k tokens'), thTime.textContent);
+    ClaudeChat.receive([sdkl({ type: 'stream_event', event: { type: 'content_block_stop', index: 0 } })]);
+    settle();
+    check('…and keeps it when done', thTime.textContent.endsWith('~1.5k tokens'), thTime.textContent);
+    check('no task or thinking event is unknown', unknowns() === unkT, unknowns() - unkT);
+
+
+    // 30 · a subagent's transcript: in a panel from its Agent row, not in the conversation
+    const unkA = unknowns(), panel = $('.ck-subpanel');
+    const subMsg = (parent, uuid, content) => sdkl({ type: 'assistant', uuid, parent_tool_use_id: parent, message: { id: 'sm-' + uuid, content } });
+    const subRes = (parent, id, content, is_error) => sdkl({ type: 'user', parent_tool_use_id: parent, message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: id, content, is_error }] } });
+    type('Find the retry code'); key('Enter');
+    ClaudeChat.receive([sdkl({ type: 'stream_event', event: { type: 'message_start', message: { id: 'm-ag' } } }),
+      ...toolLines('tu-A', 'Agent', { description: 'Find the retry code', prompt: 'Look in the sidecar for retry handling.\nReport the file and line.', subagent_type: 'Explore' })]);
+    const rowsA = mrows().length;
+    ClaudeChat.receive([subMsg('tu-A', 's1', [{ type: 'thinking', thinking: 'Where would retries live?' }]),
+      subMsg('tu-A', 's2', [{ type: 'text', text: 'I will search the sidecar.' }]),
+      subMsg('tu-A', 's3', [{ type: 'tool_use', id: 'tu-s1', name: 'Grep', input: { pattern: 'api_retry', path: 'Resources' } }]),
+      subRes('tu-A', 'tu-s1', 'Resources/SkimRender/agent-claude.js:113')]);
+    const agRowA = mrows().find(r => r.classList.contains('is-agent') && r.textContent.includes('Find the retry code'));
+    check('the conversation keeps one Agent row', mrows().length === rowsA && !!agRowA, mrows().length - rowsA);
+    check('…and none of the subagent\'s words', !mainLog.textContent.includes('I will search the sidecar') && !mainLog.textContent.includes('api_retry'));
+    check('…the row counts its tools', agRowA.querySelector('.ck-meta').textContent === '1 tool', agRowA.querySelector('.ck-meta').textContent);
+    check('the panel is closed', panel.hidden);
+    agRowA.click();
+    check('a click opens the panel', !panel.hidden);
+    const ph = () => panel.querySelector('.ck-sub-head').textContent;
+    check('its head: type, description, running', ph().startsWith('Explore') && ph().includes('Find the retry code') && panel.querySelector('.ck-sub-state').dataset.state === 'running', ph());
+    check('the prompt, folded', panel.querySelector('.ck-sub-prompt-h').textContent.startsWith('Prompt · Look in the sidecar') && panel.querySelector('.ck-sub-prompt-t').hidden);
+    panel.querySelector('.ck-sub-prompt-h').click();
+    check('…a click opens it', !panel.querySelector('.ck-sub-prompt-t').hidden && panel.querySelector('.ck-sub-prompt').classList.contains('is-open'));
+    const pl = () => panel.querySelector('.ck-sub-log');
+    check('its text, thinking and tool rows', pl().textContent.includes('I will search the sidecar.') && pl().querySelector('.ck-think') && [...pl().querySelectorAll('.ck-row')].some(r => r.textContent.includes('Grep')), pl().textContent.slice(0, 200));
+    ClaudeChat.receive([subMsg('tu-A', 's4', [{ type: 'tool_use', id: 'tu-s2', name: 'Read', input: { file_path: '/tmp/demo/agent-claude.js' } }])]);
+    check('new steps appear while it is open', [...pl().querySelectorAll('.ck-row')].some(r => r.textContent.includes('agent-claude.js')));
+    // a subagent's approval: the card is in the conversation, the result settles it
+    ClaudeChat.receive([{ type: 'permission_request', id: 'p-sub', toolName: 'Read', input: { file_path: '/tmp/demo/agent-claude.js' }, toolUseID: 'tu-s2', suggestions: [] }]);
+    const subCard = cardOf();
+    check('the card for a subagent\'s tool is in the conversation', !!subCard && mainLog.contains(subCard));
+    ClaudeChat.receive([subRes('tu-A', 'tu-s2', 'line 1')]);
+    check('…and its result settles the card', subCard.classList.contains('is-resolved'));
+    // nested: an agent started by the subagent opens from the panel, with a way back
+    ClaudeChat.receive([subMsg('tu-A', 's5', [{ type: 'tool_use', id: 'tu-N', name: 'Agent', input: { description: 'Check the tests', prompt: 'p', subagent_type: 'general-purpose' } }]),
+      subMsg('tu-N', 'n1', [{ type: 'text', text: 'Nested agent here.' }])]);
+    check('the nested agent\'s words stay in its own transcript', !pl().textContent.includes('Nested agent here.'));
+    [...pl().querySelectorAll('.ck-row.is-agent')].pop().click();
+    check('its row opens it, with a back button', ph().includes('Check the tests') && pl().textContent.includes('Nested agent here.') && panel.querySelector('.ck-sub-head .ck-sub-btn:not(.ck-sub-x)'), ph());
+    panel.querySelector('.ck-sub-head .ck-sub-btn:not(.ck-sub-x)').click();
+    check('back: the first agent again', ph().includes('Find the retry code'));
+    ClaudeChat.receive([subRes('tu-A', 'tu-N', 'tests ok'), subMsg('tu-A', 's6', [{ type: 'text', text: 'It is in agent-claude.js.' }]),
+      sdkl({ type: 'user', parent_tool_use_id: null, message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'tu-A', content: 'It is in agent-claude.js.' }] } })]);
+    check('the agent ends: done, with its count', panel.querySelector('.ck-sub-state').dataset.state === 'done' && agRowA.querySelector('.ck-meta').textContent === '3 tools', [panel.querySelector('.ck-sub-state').dataset.state, agRowA.querySelector('.ck-meta').textContent]);
+    key('Escape');
+    check('Esc closes the panel', panel.hidden);
+    settle();
+    // a resumed chat has no subagent messages: the panel shows the result and says why
+    ClaudeChat.receive([sdkl({ type: 'stream_event', event: { type: 'message_start', message: { id: 'm-ag2' } } }),
+      ...toolLines('tu-H', 'Agent', { description: 'Old agent', prompt: 'p', subagent_type: 'Explore' }, 'The **answer** was 42.')]);
+    mrows().pop().click();
+    check('no steps: the result, and why', panel.querySelector('.ck-sub-note').textContent.startsWith('Its steps are not in this view') && panel.querySelector('.ck-sub-foot').textContent.includes('answer was 42'), panel.textContent.slice(0, 160));
+    panel.querySelector('.ck-sub-x').click();
+    check('× closes it', panel.hidden);
+    settle();
+    check('no subagent event is unknown', unknowns() === unkA, unknowns() - unkA);
+
+
+    // 31a · tool calls: a tray per turn; the reply keeps a faint mark where they ran
+    const atext = (id, text) => sdkl({ type: 'assistant', parent_tool_use_id: null, message: { id, content: [{ type: 'text', text }] } });
+    const tres = (id, content, is_error) => sdkl({ type: 'user', parent_tool_use_id: null, message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: id, content, is_error }] } });
+    type('Run the checks'); key('Enter');
+    ClaudeChat.receive([sdkl({ type: 'stream_event', event: { type: 'message_start', message: { id: 'm-tr' } } }), atext('m-tr1', 'I will look first.'),
+      ...toolLines('tu-t1', 'Read', { file_path: '/tmp/demo/a.js' }, 'one\ntwo'), ...toolLines('tu-t2', 'Bash', { command: 'npm test' })]);
+    const tt = lastTurn(), tray = tt.querySelector('.ck-tray'), tpanel = () => tray.querySelector('.ck-tray-panel');
+    check('a turn with tools gets a tray under the prompt', !!tray && tray.previousElementSibling === tt.querySelector('.ck-user') && getComputedStyle(tray).position === 'sticky');
+    check('…its rows are in the tray, not in the reply', !tt.querySelector('.ck-body .ck-row') && tray.querySelectorAll('.ck-row').length === 2 && tpanel().hidden);
+    check('the pill counts them, and says what runs now', tray.querySelector('.ck-tray-label').textContent === '2 tools · Explore 1 · Verify 1'
+      && tray.querySelector('.ck-tray-now').textContent.startsWith('Bash npm test') && tray.dataset.state === 'running', [tray.querySelector('.ck-tray-label').textContent, tray.textContent]);
+    const marks = () => [...tt.querySelectorAll('.ck-body .ck-run-mark')];
+    check('a mark stays where the run happened', marks().length === 1 && marks()[0].textContent === '2 tools' && marks()[0].dataset.state === 'running', marks().map(m => m.textContent));
+    ClaudeChat.receive([tres('tu-t2', 'ok'), atext('m-tr2', 'Tests pass. One more check.'), ...toolLines('tu-t3', 'Bash', { command: 'npm run lint' })]);
+    const bodyText = tt.querySelector('.ck-body').textContent;
+    check('the next run: a second mark after the text', marks().length === 2 && marks()[0].dataset.state === 'done' && bodyText.indexOf('Tests pass') < bodyText.lastIndexOf('1 tool'), bodyText);
+    check('…the pill counts the whole turn', tray.querySelector('.ck-tray-label').textContent.startsWith('3 tools'));
+    tray.querySelector('.ck-tray-pill').click();
+    check('the pill opens the turn\'s whole tool history', !tpanel().hidden && tray.classList.contains('is-open') && tray.querySelector('.ck-tray-pill').getAttribute('aria-expanded') === 'true' && tray.querySelectorAll('.ck-run').length === 2);
+    check('…runs stay open in the tray', ![...tray.querySelectorAll('.ck-run')].some(r => r.classList.contains('is-folded')));
+    key('Escape');
+    check('Esc closes it', tpanel().hidden && !tray.classList.contains('is-open'));
+    marks()[1].click();
+    check('a mark opens the tray', !tpanel().hidden);
+    document.body.dispatchEvent(new MouseEvent('mousedown', { bubbles: true }));
+    check('a click outside closes it', tpanel().hidden);
+    ClaudeChat.receive([{ type: 'permission_request', id: 'p-tr', toolName: 'Bash', input: { command: 'npm run lint' }, toolUseID: 'tu-t3', suggestions: [] }]);
+    check('an approval stays in the reply; the pill waits for you', cardOf().closest('.ck-body') === tt.querySelector('.ck-body') && tray.dataset.state === 'waiting' && tray.querySelector('.ck-tray-now').textContent.startsWith('waiting for you'), tray.textContent);
+    ClaudeChat.receive([tres('tu-t3', 'lint failed', true)]);
+    check('a failed call shows on the pill', tray.querySelector('.ck-tray-bad').textContent === '1 failed' && marks()[1].dataset.state === 'failed');
+    settle();
+    check('the turn ends: failed, with nothing running', tray.dataset.state === 'failed' && !tray.querySelector('.ck-tray-now'));
+    $('.ck-more').click(); popPick('Tool calls inline');
+    check('⋮ "Tool calls inline": the runs go back into the reply, after their marks', document.body.classList.contains('tools-inline')
+      && marks().every(m => m.nextElementSibling && m.nextElementSibling.classList.contains('ck-run')) && !tray.querySelector('.ck-run') && getComputedStyle(tray).display === 'none');
+    popPick('Tool calls inline');
+    check('…and off again: back in the tray', !document.body.classList.contains('tools-inline') && tray.querySelectorAll('.ck-run').length === 2 && !tt.querySelector('.ck-body .ck-run'));
+    key('Escape'); type('');
+    check('a subagent\'s transcript keeps its runs inline', !document.querySelector('.ck-sub-log .ck-tray'));
+
+    // 31b · a stop: "Stopped", not an error with a diagnostic
+    type('Write a story'); key('Enter');
+    ClaudeChat.receive([sdkl({ type: 'stream_event', event: { type: 'message_start', message: { id: 'm-st' } } }), ...toolLines('tu-st', 'Bash', { command: 'sleep 9' })]);
+    ClaudeChat.receive([sdkl({ type: 'user', parent_tool_use_id: null, message: { role: 'user', content: [{ type: 'text', text: '[Request interrupted by user]' }] } }),
+      sdkl({ type: 'result', subtype: 'error_during_execution', is_error: true, terminal_reason: 'aborted_tools', duration_ms: 1900, num_turns: 2,
+        errors: ['[ede_diagnostic] result_type=user last_content_type=n/a stop_reason=null'] })]);
+    const sf = lastTurn().querySelector('.ck-foot');
+    check('the footer says "Stopped"', sf.dataset.status === 'interrupted' && sf.textContent === 'Stopped · 1.9s · 2 steps', sf.textContent);
+    check('…no diagnostic and no error notice', !mainLog.textContent.includes('ede_diagnostic') && !lastTurn().textContent.includes('error during execution') && !lastTurn().querySelector('.ck-notice[data-kind="error"]'));
+    check('…the running call says "stopped"', mrows().pop().querySelector('.ck-meta').textContent === 'stopped');
+    type('again'); key('Enter');
+    ClaudeChat.receive([sdkl({ type: 'result', subtype: 'error_max_turns', is_error: true, errors: [], duration_ms: 500, num_turns: 30 })]);
+    check('a limit says which, in words', lastTurn().querySelector('.ck-foot').textContent.startsWith('Stopped at the turn limit'), lastTurn().querySelector('.ck-foot').textContent);
+
+    // 31c · a long prompt folds, faded at the bottom; a click opens it
+    const longP = Array.from({ length: 24 }, (_, i) => 'Line ' + (i + 1) + ' of a long pasted prompt with details.').join('\n');
+    type(longP); key('Enter'); settle();
+    const ut = lastTurn().querySelector('.ck-user-text'), more = lastTurn().querySelector('.ck-user-more');
+    await until(() => ut.offsetHeight > 0);
+    check('a long prompt is folded', ut.classList.contains('is-folded') && ut.scrollHeight > ut.clientHeight + 40 && ut.clientHeight < 160, [ut.scrollHeight, ut.clientHeight]);
+    check('…faded at the bottom', /gradient/.test(getComputedStyle(ut).webkitMaskImage || getComputedStyle(ut).maskImage || ''));
+    check('…with "Show all"', more && !more.hidden && more.textContent === 'Show all');
+    more.click();
+    check('"Show all" opens it whole', ut.classList.contains('is-open') && ut.clientHeight >= ut.scrollHeight - 2 && more.textContent === 'Show less' && !/gradient/.test(getComputedStyle(ut).webkitMaskImage || ''));
+    more.click();
+    check('"Show less" folds it again', !ut.classList.contains('is-open') && ut.scrollHeight > ut.clientHeight + 40);
+    ut.click();
+    check('a click on the folded text opens it', ut.classList.contains('is-open'));
+    type('A short prompt'); key('Enter'); settle();
+    check('a short prompt does not fold', !lastTurn().querySelector('.ck-user-more') && !lastTurn().querySelector('.ck-user-text').classList.contains('is-folded'));
+    type('x'.repeat(430)); key('Enter'); settle();
+    const fitT = lastTurn().querySelector('.ck-user-text');
+    await until(() => fitT.dataset.fits === '1', 1000);
+    check('a long one that fits loses the fold', fitT.dataset.fits === '1' && lastTurn().querySelector('.ck-user-more').hidden, [fitT.scrollHeight, fitT.clientHeight]);
+
+    // 31d · rewind: each prompt has an ID; files, conversation, or both go back to before it
+    const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
+    const said = (uuid, text) => sdkl({ type: 'assistant', uuid, parent_tool_use_id: null, message: { id: 'm-' + uuid, content: [{ type: 'text', text }] } });
+    const rwPanel = $('.ck-rewind');
+    // (A history drawn earlier ended with no known entry: a live message, as the SDK always sends, gives one.)
+    ClaudeChat.receive([said('a-0', 'Zero.')]); settle();
+    type('First prompt'); key('Enter');
+    const u1 = lastPost('send').uuid;
+    check('a prompt is sent with its own ID', UUID.test(u1 || ''), u1);
+    ClaudeChat.receive([said('a-1', 'One.')]); settle();
+    type('Second prompt'); key('Enter');
+    const u2 = lastPost('send').uuid, t2 = lastTurn();
+    ClaudeChat.receive([said('a-2', 'Two.')]); settle();
+    check('a prompt that can be rewound has the button', t2.dataset.rewind === '1' && !!t2.querySelector('.ck-rewind-btn') && u2 !== u1);
+    t2.querySelector('.ck-rewind-btn').click();
+    const dry = lastPost('rewindFiles');
+    check('the button opens the panel and asks what the files would do', !rwPanel.hidden && dry.uuid === u2 && dry.dryRun === true && rwPanel.textContent.includes('Second prompt'), dry);
+    check('…the code choices wait for that answer', rwPanel.querySelector('[data-mode="both"]').disabled && rwPanel.querySelector('[data-mode="code"]').disabled && !rwPanel.querySelector('[data-mode="conversation"]').disabled);
+    ClaudeChat.receive([{ type: 'rewind', id: dry.id, uuid: u2, dryRun: true, canRewind: true, filesChanged: ['/tmp/demo/src/a.js'], insertions: 3, deletions: 1 }]);
+    check('the files: count, lines, names', rwPanel.querySelector('.ck-rw-files').textContent === 'Files: 1 file changed +3 −1 · src/a.js' && !rwPanel.querySelector('[data-mode="both"]').disabled, rwPanel.querySelector('.ck-rw-files').textContent);
+    const rwTurns = mainLog.querySelectorAll('.ck-turn').length;
+    type(''); key('1');
+    const real = lastPost('rewindFiles');
+    check('1: code and conversation — the files first', real.uuid === u2 && !real.dryRun && real.id !== dry.id);
+    ClaudeChat.receive([{ type: 'rewind', id: real.id, uuid: u2, dryRun: false, canRewind: true }]);
+    await wait(0);
+    const rs = lastPost('restartAt');
+    check('…then the conversation: the session restarts at the entry before the prompt', rs && rs.resumeAt === 'a-1' && rs.dropsTurn === u2, rs);
+    check('…the prompt and its reply are gone', !t2.isConnected && mainLog.querySelectorAll('.ck-turn').length === rwTurns - 1 && !mainLog.textContent.includes('Two.'));
+    check('…its text is back in the composer', inp.value === 'Second prompt' && rwPanel.hidden, inp.value);
+    check('…and a short notice says so', mnotes().pop().textContent === 'Rewound · 1 file put back');
+    // Esc Esc: the picker; "Conversation only" when no file changed
+    type('');
+    key('Escape'); key('Escape');
+    check('Esc Esc opens the list of prompts', popOpen() && $('.ck-pop').dataset.kind === 'rewind' && items()[0] === 'First prompt', items().slice(0, 3));
+    key('Enter');
+    const dry1 = lastPost('rewindFiles');
+    ClaudeChat.receive([{ type: 'rewind', id: dry1.id, uuid: u1, dryRun: true, canRewind: true, filesChanged: [] }]);
+    check('no file changes: says so, code choices stay off', rwPanel.querySelector('.ck-rw-files').textContent === 'No file changes since this prompt.' && rwPanel.querySelector('[data-mode="code"]').disabled);
+    const posts0 = posts.length;
+    key('Enter');
+    await wait(0);
+    check('Return: conversation only (no files request)', lastPost('restartAt').dropsTurn === u1 && !posts.slice(posts0).some(p => p.type === 'rewindFiles') && inp.value === 'First prompt', inp.value);
+    // code only: the conversation stays
+    type('Third prompt'); key('Enter');
+    const u3 = lastPost('send').uuid, t3 = lastTurn();
+    ClaudeChat.receive([said('a-3', 'Three.')]); settle();
+    t3.querySelector('.ck-rewind-btn').click();
+    ClaudeChat.receive([{ type: 'rewind', id: lastPost('rewindFiles').id, uuid: u3, dryRun: true, canRewind: true, filesChanged: ['/tmp/demo/b.js', '/tmp/demo/c.js'], insertions: 9, deletions: 2 }]);
+    const restarts = posts.filter(p => p.type === 'restartAt').length;
+    type(''); key('3');
+    ClaudeChat.receive([{ type: 'rewind', id: lastPost('rewindFiles').id, uuid: u3, dryRun: false, canRewind: true }]);
+    await wait(0);
+    check('3: code only — the files go back, the conversation stays', t3.isConnected && posts.filter(p => p.type === 'restartAt').length === restarts && mnotes().pop().textContent.startsWith('Files put back as they were before “Third prompt” · 2 files'), mnotes().pop().textContent);
+    // no checkpoint: only the conversation can go back
+    t3.querySelector('.ck-rewind-btn').click();
+    ClaudeChat.receive([{ type: 'rewind', id: lastPost('rewindFiles').id, uuid: u3, dryRun: true, canRewind: false, error: 'No file checkpoint found for this message' }]);
+    check('no checkpoint: says why; code choices off', rwPanel.querySelector('.ck-rw-files').textContent === 'The files cannot be put back: No file checkpoint found for this message.' && rwPanel.querySelector('[data-mode="both"]').disabled);
+    const before1 = posts.length;
+    type(''); key('1');
+    check('…a disabled choice does nothing', posts.length === before1 && !rwPanel.hidden);
+    key('Escape');
+    check('Esc closes the panel', rwPanel.hidden && t3.isConnected);
+    // while it works: not now
+    type('Busy prompt'); key('Enter');
+    lastTurn().querySelector('.ck-rewind-btn').click();
+    check('while a turn runs: not now', rwPanel.hidden && mnotes().pop().textContent.startsWith('Stop the current turn'));
+    settle();
+    // after the cut to before "First prompt", the next prompt's rewind resumes where that one did
+    t3.querySelector('.ck-rewind-btn').click();
+    ClaudeChat.receive([{ type: 'rewind', id: lastPost('rewindFiles').id, uuid: u3, dryRun: true, canRewind: true, filesChanged: [] }]);
+    type(''); key('2'); await wait(0);
+    check('a prompt sent after a cut resumes from the cut point', lastPost('restartAt').resumeAt === 'a-0' && lastPost('restartAt').dropsTurn === u3, lastPost('restartAt'));
+    type('Busy prompt'); key('Enter');
+    // a cut Claude Code refuses: go on from the whole session
+    ClaudeChat.receive([sdkl({ type: 'result', subtype: 'error_during_execution', is_error: true, errors: ['Resume rejected by --resume-drops-turn: a queued message is in the dropped range'] })]);
+    check('a refused cut: restart plainly, and say so', lastPost('restartAt').plain === true && mnotes().pop().textContent.startsWith('Claude Code could not cut'));
+
+    // 31e · /btw: a side question in a panel; follow-ups carry the thread; nothing goes into the conversation
+    const btwP = $('.ck-btw'), bfield = () => btwP.querySelector('.ck-btw-field');
+    type('/bt');
+    check('/btw is offered', items()[0] && items()[0].startsWith('/btw'), items().slice(0, 2));
+    key('Escape');
+    const turnsB = mainLog.querySelectorAll('.ck-turn').length, sendsB = sendCount();
+    type('/btw what is the cat called?'); key('Enter');
+    const q1 = lastPost('btw');
+    check('/btw <question> asks it as a side question', q1 && q1.question === 'what is the cat called?' && Array.isArray(q1.history) && q1.history.length === 0 && q1.channel === 'main', q1);
+    check('…not as a message: no turn, nothing sent', mainLog.querySelectorAll('.ck-turn').length === turnsB && sendCount() === sendsB && inp.value === '');
+    check('the panel shows the question and waits', !btwP.hidden && btwP.querySelector('.ck-btw-q').textContent === 'what is the cat called?' && btwP.querySelector('.ck-btw-a').classList.contains('is-wait'));
+    check('…its field takes the follow-up', document.activeElement === bfield());
+    ClaudeChat.receive([{ type: 'btw', id: q1.id, response: 'Your cat is called **Miso**.', synthetic: false }]);
+    check('the answer, as Markdown', btwP.querySelector('.ck-btw-a strong') && btwP.querySelector('.ck-btw-a').textContent.trim() === 'Your cat is called Miso.', btwP.querySelector('.ck-btw-a').textContent);
+    bfield().value = 'and its colour?';
+    bfield().dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true, cancelable: true }));
+    const q2 = lastPost('btw');
+    check('a follow-up sends the thread as history', q2.question === 'and its colour?' && q2.history.length === 1 && q2.history[0].question === 'what is the cat called?' && q2.history[0].response === 'Your cat is called **Miso**.', q2.history);
+    bfield().value = 'too soon';
+    bfield().dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true, cancelable: true }));
+    check('…one at a time: no new question while one waits', lastPost('btw') === q2 && bfield().value === 'too soon');
+    ClaudeChat.receive([{ type: 'btw', id: 'stale', response: 'old answer' }]);
+    check('an answer to another question is ignored', !btwP.textContent.includes('old answer'));
+    ClaudeChat.receive([{ type: 'btw', id: q2.id, error: 'the session is not running here' }]);
+    check('an error says so, in the thread', btwP.querySelectorAll('.ck-btw-a')[1].classList.contains('is-error') && btwP.querySelectorAll('.ck-btw-a')[1].textContent.startsWith('No answer: the session is not running'));
+    bfield().value = 'third';
+    bfield().dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true, cancelable: true }));
+    check('…and the failed one stays out of the history', lastPost('btw').history.length === 1);
+    ClaudeChat.receive([{ type: 'btw', id: lastPost('btw').id, response: 'Three.' }]);
+    check('the conversation stays as it was', mainLog.querySelectorAll('.ck-turn').length === turnsB && !mainLog.textContent.includes('Miso'));
+    bfield().dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true, cancelable: true }));
+    check('Esc closes the panel and drops the thread', btwP.hidden && !btwP.querySelector('.ck-btw-q') && document.activeElement === inp);
+    type('/btw'); key('Enter');
+    check('Return on "/btw" completes it first (it takes a question)', inp.value === '/btw ' && btwP.hidden, inp.value);
+    key('Enter');
+    check('/btw alone: an empty panel, ready for a question', !btwP.hidden && !btwP.querySelector('.ck-btw-q') && document.activeElement === bfield());
+    bfield().value = 'new thread';
+    bfield().dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true, cancelable: true }));
+    check('…a new thread starts with no history', lastPost('btw').history.length === 0);
+    btwP.querySelector('.ck-sub-x').click();
+    check('× closes it', btwP.hidden);
+    type('Busy turn'); key('Enter');
+    const stops0 = posts.filter(p => p.type === 'interrupt').length;
+    type('/btw while you work?'); key('Enter');
+    check('it works while a turn runs', lastPost('btw').question === 'while you work?' && !btwP.hidden);
+    inp.focus(); key('Escape');
+    check('Esc in the composer closes it first (does not stop the turn)', btwP.hidden && posts.filter(p => p.type === 'interrupt').length === stops0);
+    settle();
+
+    // 31f · a prompt's fate: "Queued" while it waits, "Not sent" if it never ran; vcs and live phrase signals
+    const life = (id, state) => sdkl({ type: 'command_lifecycle', command_uuid: id, state, uuid: 'x', session_id: 's' });
+    const badge = t => t.querySelector('.ck-user-state');
+    type('Long job'); key('Enter');
+    const uA = lastPost('send').uuid, tA = lastTurn();
+    ClaudeChat.receive([life(uA, 'queued'), life(uA, 'started')]);
+    await wait(700);
+    check('a quick queued → started shows no badge', !badge(tA));
+    type('And then this'); key('Enter');
+    const uB = lastPost('send').uuid, tB = lastTurn();
+    ClaudeChat.receive([life(uB, 'queued')]);
+    check('…not at once (it may start in a moment)', !badge(tB));
+    await wait(700);
+    check('a message that waits says "Queued"', badge(tB) && badge(tB).textContent === 'Queued' && badge(tB).disabled, badge(tB) && badge(tB).textContent);
+    ClaudeChat.receive([life(uB, 'started')]);
+    check('…and the badge goes when it starts', !badge(tB));
+    type('One more'); key('Enter');
+    const uC = lastPost('send').uuid, tC = lastTurn();
+    ClaudeChat.receive([life(uC, 'queued'), life(uC, 'cancelled'), life(uA, 'completed'), life(uB, 'cancelled')]);
+    check('cancelled before it ran: "Not sent"', badge(tC) && badge(tC).textContent === 'Not sent' && !badge(tC).disabled);
+    check('cancelled after it started: no badge (the turn says "Stopped")', !badge(tB) && !badge(tA));
+    settle();
+    type('');
+    badge(tC).click();
+    check('a click on "Not sent" puts the text back', inp.value === 'One more', inp.value);
+    type('Odd one'); key('Enter');
+    const uD = lastPost('send').uuid, tD = lastTurn();
+    ClaudeChat.receive([life(uD, 'refused')]);
+    check('refused: says so', badge(tD) && badge(tD).textContent === 'Refused');
+    ClaudeChat.receive([sdkl({ type: 'system', subtype: 'task_summary', detail: 'Running the test suite' })]);
+    check('the live phrase shows in the status line', $('.ck-status-text').textContent === 'Running the test suite', $('.ck-status-text').textContent);
+    settle();
+    check('…and goes when the turn ends', $('.ck-status-text').textContent.startsWith('Ready'), $('.ck-status-text').textContent);
+    const gits = posts.filter(p => p.type === 'git').length;
+    ClaudeChat.receive([sdkl({ type: 'system', subtype: 'vcs_state_changed', kind: 'commit', branch: 'main' })]);
+    check('a commit or push re-reads git (the branch chip)', posts.filter(p => p.type === 'git').length === gits + 1);
+
+    // 31 · motion: new words fade in, new things rise in, folds slide, menus open softly
+    window.setTimeout = realTimeout;
+    document.documentElement.classList.remove('no-motion');
+    const anims = el => el && el.getAnimations ? el.getAnimations().length : 0;
+    const frames = () => new Promise(r => requestAnimationFrame(() => requestAnimationFrame(r)));
+    const se = ev => sdkl({ type: 'stream_event', event: ev });
+    type('Say something'); key('Enter');
+    ClaudeChat.receive([se({ type: 'message_start', message: { id: 'm-rv' } }), se({ type: 'content_block_start', index: 0, content_block: { type: 'text', text: '' } }),
+      se({ type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: 'First words arrive. ' } })]);
+    await frames();
+    const rvText = () => [...mainLog.querySelectorAll('.ck-text')].pop();
+    const fresh = () => [...rvText().querySelectorAll('.sk-fresh')];
+    check('new words fade in', fresh().length > 0 && fresh().map(f => f.textContent).join('') === 'First words arrive. ', fresh().map(f => f.textContent));
+    await wait(60);
+    ClaudeChat.receive([se({ type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: 'Then more.' } })]);
+    await frames();
+    const frs = fresh();
+    check('…the earlier words keep fading (their fade is under way), the new ones start',
+      frs.length === 2 && frs[0].textContent === 'First words arrive. ' && parseInt(frs[0].style.animationDelay) <= -50 && frs[1].textContent === 'Then more.' && parseInt(frs[1].style.animationDelay) > -40,
+      frs.map(f => [f.textContent, f.style.animationDelay]));
+    await wait(320);
+    ClaudeChat.receive([se({ type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: '\n\nA new paragraph.' } })]);
+    await frames();
+    check('…a finished fade is not wrapped again', fresh().every(f => !f.textContent.includes('First words')) && fresh().some(f => f.textContent === 'A new paragraph.'), fresh().map(f => f.textContent));
+    ClaudeChat.receive([se({ type: 'content_block_stop', index: 0 }), ...toolLines('tu-mo1', 'Bash', { command: 'ls' }), ...toolLines('tu-mo2', 'Bash', { command: 'pwd' })]);
+    const moRow = mrows().pop();
+    check('a new tool row rises in', anims(moRow) > 0);
+    ClaudeChat.receive([sdkl({ type: 'user', parent_tool_use_id: null, message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'tu-mo2', content: '/tmp/demo' }] } })]);
+    await wait(250);
+    const moDetail = moRow.nextElementSibling;
+    const moPill = moRow.closest('.ck-tray').querySelector('.ck-tray-pill');
+    moPill.click();   // the rows are in the turn's tray: open it to see them
+    moRow.click();
+    check('a row opens with a slide', !moDetail.hidden && anims(moDetail) > 0);
+    await wait(250);
+    moRow.click();
+    check('…and closes: hidden at once, drawn until the slide ends', moDetail.hidden && moDetail.style.display !== '' && anims(moDetail) > 0);
+    await wait(260);
+    check('…then gone', moDetail.style.display === '' && getComputedStyle(moDetail).display === 'none');
+    moRow.click(); moRow.click();
+    check('a quick second click takes over the slide', moDetail.hidden && anims(moDetail) === 1);
+    await wait(260);
+    moPill.click();
+    $('.ck-model').click();
+    check('a menu opens softly', popOpen() && anims($('.ck-pop')) > 0);
+    key('Escape');
+    settle();
+    document.documentElement.classList.add('no-motion');
+    ClaudeChat.receive([...toolLines('tu-mo3', 'Bash', { command: 'date' })]);
+    check('no-motion: nothing moves', anims(mrows().pop()) === 0 && anims(mrows().pop().closest('.ck-run')) === 0);
+    settle();
+
+    console.error(`dock-test: ${pass} passed`);
+    window.__pending = false;
+  } catch (e) { console.error('dock-test threw: ' + e.message + ' ' + (e.stack || '').split('\n')[0]); window.__pending = false; } })();
+</script>
+</body></html>

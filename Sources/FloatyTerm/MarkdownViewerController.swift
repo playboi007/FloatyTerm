@@ -5,14 +5,16 @@ import WebKit
 /// selection via the right-click "Open in Markdown Viewer" action.
 ///
 /// Two modes, toggled from an expandable icon toolbar pinned top-left:
-///   • **Preview** — rendered HTML in a `WKWebView` via vendored marked.js
-///     (`MarkdownAssets.swift`); dark/transparent theme, GFM tables + code.
+///   • **Preview** — rendered in a `WKWebView` by SkimRender (`SkimAssets`):
+///     option cards, phase tracks, diagrams, trees, callouts, tables and the
+///     other skimmable patterns. Falls back to plain marked.js
+///     (`MarkdownAssets.swift`) when the renderer's files are missing.
 ///     Loaded with the file's directory as `baseURL` so relative images resolve.
 ///   • **Edit** — the raw source in an editable `NSTextView`.
 /// Save writes the editor's contents back to the file. Switching to preview
 /// re-renders from the *current* editor text, so unsaved edits preview live.
 ///
-/// Fully offline (the renderer JS is embedded, not an SPM resource). Ephemeral
+/// Fully offline (the renderer ships in the app bundle). Ephemeral
 /// across launches in v1 (`restorableRecord` = nil), but edits flush to disk on
 /// close so nothing is lost.
 final class MarkdownViewerController: NSObject, TabContent, NSTextViewDelegate {
@@ -59,6 +61,7 @@ final class MarkdownViewerController: NSObject, TabContent, NSTextViewDelegate {
         self.fileName = (path as NSString).lastPathComponent
 
         let config = WKWebViewConfiguration()
+        if SkimAssets.isAvailable { SkimAssets.install(in: config) }
         self.webView = WKWebView(frame: .zero, configuration: config)
         super.init()
 
@@ -237,7 +240,10 @@ final class MarkdownViewerController: NSObject, TabContent, NSTextViewDelegate {
 
     private func render(_ markdown: String) {
         let baseURL = URL(fileURLWithPath: filePath).deletingLastPathComponent()
-        webView.loadHTMLString(Self.htmlDocument(forMarkdown: markdown), baseURL: baseURL)
+        let html = SkimAssets.isAvailable
+            ? SkimAssets.document(markdown: markdown)
+            : Self.htmlDocument(forMarkdown: markdown)
+        webView.loadHTMLString(html, baseURL: baseURL)
     }
 
     // MARK: - TabContent
@@ -265,12 +271,13 @@ final class MarkdownViewerController: NSObject, TabContent, NSTextViewDelegate {
         textView.delegate = nil
         webView.stopLoading()
         webView.navigationDelegate = nil
+        SkimAssets.uninstall(from: webView.configuration)
         editorScroll.documentView = nil
     }
 
     // MARK: - HTML assembly
 
-    /// Builds a self-contained HTML document. The raw Markdown is passed to the
+    /// The plain fallback page. The raw Markdown is passed to the
     /// page as base64 (sidesteps all HTML/JS escaping issues) and rendered by
     /// marked.js client-side.
     private static func htmlDocument(forMarkdown markdown: String) -> String {

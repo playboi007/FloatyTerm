@@ -26,6 +26,13 @@ worker resolves `match` → a tab, attaches `chrome.debugger`, runs `sendCommand
 and replies `{id, result}` — the exact JSON-RPC shape `AgentDOM` already speaks.
 It's a transport swap, not new protocol work.
 
+One exception to "just a transport": **network recording**. The worker answers
+three synthetic methods itself — `Floaty.netStart`, `Floaty.netStop`,
+`Floaty.netStatus` — and assembles `Network.*` events into complete request
+records in `netrecord.js`. That file is pure (no `chrome.*`), so it also runs
+under node for tests. Records go to FloatyTerm over HTTP (`POST /net`), not
+over this socket.
+
 ## Install (load unpacked — no Web Store)
 
 1. Open `chrome://extensions`.
@@ -48,11 +55,42 @@ floaty som       --via-extension --match console.cloud    # numbered marks over 
 `--match` picks a tab by url/title substring (same semantics as the port path);
 omit it to drive the active tab.
 
+## Network recording
+
+```sh
+floaty net start --label shop --chrome shop.example.com   # record that tab (bare --chrome = active tab)
+# … use the site …
+floaty net stop
+floaty net export --format md          # or json / har — each HTTP request gets a runnable curl
+```
+
+Captures every request the tab makes, **unredacted**: raw headers with
+cookies, request and response bodies, each redirect hop, out-of-process
+iframes and workers, WebSocket frames and SSE messages. The export holds live
+session tokens — treat it like a password. Full detail:
+`docs/network-recording.md`.
+
+**After you update these files, reload the extension once** in
+`chrome://extensions`. An old build does not know `Floaty.netStart`, and
+FloatyTerm then tells you to reload.
+
 ## What to expect / limits
 
 - **Yellow banner.** While a tab is attached Chrome shows *"FloatyTerm CDP Bridge
   started debugging this browser."* The worker auto-detaches ~8s after the last
-  command, which clears it. Unavoidable while attached.
+  command, which clears it. Unavoidable while attached. **A recording tab stays
+  attached for the whole session**, so the banner stays too — and dismissing it
+  ends the recording (`net stop` then reports `ended_early`).
+- **Several Chrome profiles are fine.** Each profile that loads the extension
+  keeps its own connection. A command goes to the profile that has the tab:
+  `--match` picks by tab, a pinned tab goes to its owner, and "no match" means
+  the active tab of the window you are looking at. `floaty tabs
+  --via-extension` labels every tab with its `profile`. To give a profile a
+  readable name instead of `profile-xxxx`, run this once in that profile's
+  service-worker console: `chrome.storage.local.set({floatyProfileLabel: "work"})`.
+  **After updating the extension, reload it in every profile.** An older build
+  has no profile id, so its copies evict each other every ~2s and requests
+  fail "mid-request"; FloatyTerm detects this and says so in the error.
 - **Chrome only.** Electron apps (Slack, VS Code, Cursor) can't load a Chrome
   extension — keep using `floaty enable-cdp --app …` for those.
 - **No `chrome://`, Web Store, or other-extension pages** — `chrome.debugger`
@@ -61,7 +99,9 @@ omit it to drive the active tab.
   a 20s keepalive ping respawn/hold it, and it auto-reconnects, so the bridge
   self-heals within ~30s of going cold.
 - **DevTools open on a tab** blocks attaching to that same tab
-  ("Another debugger is already attached").
+  ("Another debugger is already attached"). You get that exact error back,
+  and a retry works once DevTools is closed. The worker tells this case apart
+  from its own session surviving a worker restart, which it re-adopts.
 
 ## Security
 

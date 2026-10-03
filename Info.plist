@@ -22,5 +22,9 @@
     <true/>
     <key>NSHighResolutionCapable</key>
     <true/>
+    <key>NSMicrophoneUsageDescription</key>
+    <string>FloatyTerm uses the microphone for dictation and, when you start Codex voice, sends audio to Codex for a voice conversation.</string>
+    <key>NSSpeechRecognitionUsageDescription</key>
+    <string>FloatyTerm turns your speech into text in the Claude tab's message field.</string>
 </dict>
 </plist>
