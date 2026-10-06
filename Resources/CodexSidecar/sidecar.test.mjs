@@ -158,6 +158,14 @@ rl.on('line', line => {
     ], nextCursor: null, backwardsCursor: 'history-new' }); return;
     case 'thread/items/list': respond(request, { data: [], nextCursor: null, backwardsCursor: null }); return;
     case 'thread/compact/start': respond(request, {}); notify('thread/compacted', { threadId: request.params.threadId, turnId: 'compact-turn' }); return;
+    case 'skills/list': respond(request, { data: [{ cwd: process.cwd(), errors: [], skills: [
+      { name: 'imagegen', description: 'Make images', enabled: true, path: '/skills/imagegen/SKILL.md', scope: 'user', interface: { shortDescription: 'Generate images' } },
+      { name: 'off', description: 'Disabled', enabled: false, path: '/skills/off/SKILL.md', scope: 'user' }] }] }); return;
+    case 'app/list': respond(request, { data: [{ id: 'connector_1', name: 'Google Drive', description: 'Files', isEnabled: true, isAccessible: true }], nextCursor: null }); return;
+    case 'plugin/installed': respond(request, { marketplaces: [{ name: 'official', plugins: [
+      { id: 'github@official', name: 'github', installed: true, enabled: true, interface: { displayName: 'GitHub', shortDescription: 'Repos' } },
+      { id: 'idle@official', name: 'idle', installed: true, enabled: false }] }] }); return;
+    case 'mcpServerStatus/list': respond(request, { data: [{ name: 'docs', authStatus: 'oAuth', runtimeStatus: 'connected', tools: { search: {} }, resources: [], resourceTemplates: [] }], nextCursor: null }); return;
     default: respond(request, {}); return;
   }
 });
@@ -420,4 +428,27 @@ test('oversized app-server output settles the session and kills the protocol chi
     assert.ok(Number.isInteger(pid) && pid > 0);
     assert.throws(() => process.kill(pid, 0), error => error.code === 'ESRCH');
   }, { FAKE_OVERSIZED_AFTER_START: '1' });
+});
+
+test('catalog lists enabled skills, apps, plugins and MCP servers; $mentions and images go out as structured input', async () => {
+  await harness(async ({ lines, send, until, calls }) => {
+    await until(xs => xs.some(event => event.type === 'catalog'));
+    const catalog = lines.find(event => event.type === 'catalog');
+    assert.deepEqual(catalog.skills.map(skill => skill.name), ['imagegen']);
+    assert.equal(catalog.skills[0].description, 'Generate images');
+    assert.deepEqual(catalog.apps.map(app => app.path), ['app://connector_1']);
+    assert.deepEqual(catalog.plugins.map(plugin => plugin.name), ['GitHub']);
+    assert.deepEqual(catalog.mcp.map(server => [server.name, server.status, server.tools]), [['docs', 'connected', ['search']]]);
+    send({ type: 'user', text: 'make a logo $imagegen and read $google-drive then $github', images: [{ mediaType: 'image/png', data: 'AAAA' }, { mediaType: 'text/plain', data: 'x' }] });
+    await until(xs => xs.some(event => event.type === 'turn.end'));
+    const input = (await calls()).find(request => request.method === 'turn/start').params.input;
+    assert.equal(input[0].type, 'image');
+    assert.equal(input[0].url, 'data:image/png;base64,AAAA');
+    assert.equal(input[1].type, 'text');
+    assert.deepEqual(input.slice(2), [
+      { type: 'skill', name: 'imagegen', path: '/skills/imagegen/SKILL.md' },
+      { type: 'mention', name: 'Google Drive', path: 'app://connector_1' },
+      { type: 'mention', name: 'GitHub', path: 'plugin://github@official' },
+    ]);
+  });
 });

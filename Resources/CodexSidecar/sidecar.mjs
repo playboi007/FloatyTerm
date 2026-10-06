@@ -35,7 +35,7 @@ const COMMANDS = [
 const featureSet = {
   approvals: true, fork: true, history: true, models: true, effort: true,
   permissionMode: true, thinking: true, usage: true, git: true, tui: true,
-  slashCommands: true, midTurnInput: false,
+  slashCommands: true, midTurnInput: false, images: true,
 };
 
 const output = value => {
@@ -203,6 +203,7 @@ class CodexBridge {
     this.threadId = null;
     this.thread = null;
     this.models = [];
+    this.catalog = { skills: [], apps: [], plugins: [], mcp: [] };
     this.modelsById = new Map();
     this.model = null;
     this.effort = null;
@@ -290,6 +291,7 @@ class CodexBridge {
       await this.readRateLimits(false);
       await this.openThread(message);
       await this.readAccount(false);
+      void this.loadCatalog();
       this.started = true;
       this.starting = false;
       for (const pending of this.startQueue.splice(0)) this.handleControl(pending);
@@ -468,11 +470,55 @@ class CodexBridge {
     this.emit('usage', value, { type: 'usage.snapshot', source: unavailable ? 'unavailable' : 'app-server' });
   }
 
-  async user(text) {
+  /** Skills, apps, plugins and MCP servers: what `/` and `$` offer, and what the integrations panel lists. */
+  async loadCatalog() {
+    if (!this.rpc || this.rpc.dead || !this.config) return;
+    const cwd = this.config.cwd;
+    const [skills, apps, plugins, mcp] = await Promise.allSettled([
+      this.rpc.request('skills/list', { cwds: [cwd] }),
+      this.rpc.request('app/list', { limit: 100, ...(this.threadId ? { threadId: this.threadId } : {}) }),
+      this.rpc.request('plugin/installed', { cwds: [cwd] }),
+      this.rpc.request('mcpServerStatus/list', { limit: 100 }),
+    ]);
+    const ok = r => r.status === 'fulfilled' ? r.value || {} : {};
+    this.catalog = {
+      skills: (ok(skills).data || []).flatMap(entry => entry.skills || []).filter(skill => skill?.name && skill.path && skill.enabled !== false)
+        .map(skill => ({ name: skill.name, description: skill.interface?.shortDescription || skill.shortDescription || skill.description || '',
+          displayName: skill.interface?.displayName || null, path: skill.path, scope: skill.scope || null, pluginId: skill.pluginId || null })),
+      apps: (ok(apps).data || []).filter(app => app?.id && app.isEnabled !== false && app.isAccessible !== false)
+        .map(app => ({ id: app.id, name: app.name, description: app.description || '', path: 'app://' + app.id })),
+      plugins: (ok(plugins).marketplaces || []).flatMap(market => (market.plugins || []).filter(plugin => plugin.installed && plugin.enabled)
+        .map(plugin => ({ id: plugin.id, name: plugin.interface?.displayName || plugin.name, description: plugin.interface?.shortDescription || '',
+          marketplace: market.name, path: 'plugin://' + plugin.id }))),
+      mcp: (ok(mcp).data || []).map(server => ({ name: server.name, status: server.runtimeStatus || 'notStarted', auth: server.authStatus || null,
+        tools: Object.keys(server.tools || {}), resources: (server.resources || []).length, error: server.toolsError || null, pluginId: server.pluginId || null })),
+    };
+    this.emit('catalog', this.catalog, { type: 'catalog.snapshot' });
+  }
+
+  /** `$name` in the text becomes a structured skill, app or plugin input, as the Codex TUI does. */
+  mentionInputs(text) {
+    const out = [], seen = new Set();
+    for (const match of text.matchAll(/(^|\s)\$([A-Za-z0-9][\w.:-]*)/g)) {
+      const name = match[2].toLowerCase();
+      if (seen.has(name)) continue;
+      seen.add(name);
+      const skill = this.catalog.skills.find(item => item.name.toLowerCase() === name);
+      if (skill) { out.push({ type: 'skill', name: skill.name, path: skill.path }); continue; }
+      const slug = value => String(value || '').toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '');
+      const hit = this.catalog.apps.find(item => slug(item.name) === name) || this.catalog.plugins.find(item => slug(item.name) === name);
+      if (hit) out.push({ type: 'mention', name: hit.name, path: hit.path });
+    }
+    return out;
+  }
+
+  async user(text, images = []) {
     if (!this.started || !this.threadId) { this.notice('error', 'Codex app-server is not ready.', true); return; }
     if (this.transitioning) { this.notice('info', 'Wait for the conversation operation to finish.'); return; }
     if (this.active) { this.notice('info', 'Codex is already working on a turn.'); return; }
-    if (typeof text !== 'string' || !text.trim()) return;
+    const pictures = (Array.isArray(images) ? images : []).filter(image => image && /^image\/(png|jpeg|gif|webp)$/.test(image.mediaType) && typeof image.data === 'string' && image.data)
+      .map(image => ({ type: 'image', url: `data:${image.mediaType};base64,${image.data}` }));
+    if (typeof text !== 'string' || (!text.trim() && !pictures.length)) return;
     this.items.clear();
     const turn = { id: null, started: false, ended: false, interruptRequested: false, usage: null };
     this.active = turn;
@@ -482,7 +528,7 @@ class CodexBridge {
       const summary = this.thinkingOn ? (this.configSummary && this.configSummary !== 'none' ? this.configSummary : 'detailed') : 'none';
       const params = {
         threadId: this.threadId,
-        input: [{ type: 'text', text, text_elements: [] }],
+        input: [...pictures, ...(text.trim() ? [{ type: 'text', text, text_elements: [] }] : []), ...this.mentionInputs(text)],
         sandboxPolicy: { type: 'workspaceWrite', writableRoots: [], networkAccess: false, excludeTmpdirEnvVar: false, excludeSlashTmp: false },
         approvalPolicy: 'on-request',
         ...(this.permissionMode === 'plan' ? { sandboxPolicy: { type: 'readOnly', networkAccess: false } } : {}),
@@ -1185,7 +1231,14 @@ class CodexBridge {
       default:
         this.surfaceEvent(method || 'unnamed notification', params);
         if (method === 'thread/queue/changed' || method === 'thread/attachment/updated') void this.refreshSurface(method, params);
+        if (['skills/changed', 'app/list/updated', 'mcpServer/startupStatus/updated'].includes(method)) this.refreshCatalogSoon();
     }
+  }
+
+  refreshCatalogSoon() {
+    clearTimeout(this.catalogTimer);
+    this.catalogTimer = setTimeout(() => void this.loadCatalog(), 400);
+    this.catalogTimer.unref?.();
   }
 
   mergeRateLimit(plan, snapshot) {
@@ -1352,7 +1405,8 @@ class CodexBridge {
     if (!this.started && !['user'].includes(message.type)) return;
     try {
       switch (message.type) {
-        case 'user': return this.user(message.text);
+        case 'user': return this.user(message.text, message.images);
+        case 'catalog': return this.loadCatalog();
         case 'interrupt': return this.interruptActive();
         case 'permission': return this.permission(message);
         case 'realtimeStart': return this.startRealtime(message);

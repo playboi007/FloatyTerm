@@ -3,7 +3,7 @@
   'use strict';
   const VERSION = 1;
   const factories = new Map();
-  const controls = new Set(['capabilities', 'model', 'mode', 'effort', 'git', 'sessions', 'history', 'thinking', 'usage', 'files', 'title', 'rewind', 'btw', 'shell', 'promptHistory']);
+  const controls = new Set(['capabilities', 'model', 'mode', 'effort', 'git', 'sessions', 'history', 'thinking', 'usage', 'files', 'title', 'rewind', 'btw', 'shell', 'promptHistory', 'catalog']);
   function envelope(agent, raw, event) {
     return { ...event, v: VERSION, agent, t: raw.t || 0, raw };
   }

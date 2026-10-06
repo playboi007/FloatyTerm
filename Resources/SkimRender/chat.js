@@ -29,7 +29,7 @@
     mentions: true, images: true, rename: true, rewind: true, btw: true, shell: true, promptHistory: true, background: true, agentTalk: true, priority: true, quietContext: true };
   const CODEX_FEATURES = { approvals: true, fork: true, history: true, models: true, effort: true,
     permissionMode: true, thinking: true, usage: true, git: true, tui: true, slashCommands: true, midTurnInput: false,
-    mentions: false, images: false };
+    mentions: false, images: true };
   let agent = 'claude';
   let features = { ...CLAUDE_FEATURES };
   const supports = name => !!features[name];
@@ -41,7 +41,8 @@
     git: null,              // the sidecar's git state for the session's folder
     info: {},               // from init: Claude Code version, MCP servers, output style
     sessions: null,         // { at, list }: the folder's conversations, for /resume
-    agents: []              // subagents the session offers, for @agent-… mentions
+    agents: [],             // subagents the session offers, for @agent-… mentions
+    catalog: { skills: [], apps: [], plugins: [], mcp: [] }   // Codex: skills, apps, plugins and MCP servers
   };
 
   /**
@@ -1565,6 +1566,10 @@
     { name: 'new', aliases: ['clear'], description: 'Start a new conversation' },
     { name: 'compact', description: 'Compact this conversation' },
     { name: 'fork', description: 'Open a side chat from this conversation' },
+    { name: 'skills', description: 'List the skills you can call with $name' },
+    { name: 'mcp', description: 'MCP servers and their tools' },
+    { name: 'plugins', description: 'Installed plugins' },
+    { name: 'apps', description: 'Connected apps (use $name to call one)' },
     { name: 'help', description: 'Show the available commands' }
   ].map(c => ({ ...c, local: true }));
   const HIDDEN_CMD = c => c.name.startsWith('__') || /^\((removed)\)|^Renamed to /.test(c.description || '') || S.terminalCmds.has(c.name);
@@ -1710,6 +1715,7 @@
     if (agent === 'codex') {
       if (name === 'help') { localOutput(commandList().map(c => `- **/${c.name}** — ${c.description}`).join('\n')); return true; }
       if (name === 'status') { toggleUsage(true); openMoreMenu(); return true; }
+      if (['skills', 'mcp', 'plugins', 'apps'].includes(name)) { post({ type: 'catalog' }); localOutput(catalogText(name)); return true; }
       if (name === 'permissions') { openModeMenu(); return true; }
       if (name === 'fork') { newSide(); return true; }
       if (name === 'new' || name === 'compact') {
@@ -1823,7 +1829,69 @@
     grow(); updateStatus(); updateSuggest();
   }
 
+  // ── $ mentions (Codex): skills, apps and plugins ─────────────────────
+
+  const DOLLAR_RE = /(^|\s)\$([\w.:-]*)$/;
+  function dollarState() {
+    if (agent !== 'codex' || !input || input.selectionStart !== input.selectionEnd) return null;
+    const caret = input.selectionStart, m = input.value.slice(0, caret).match(DOLLAR_RE);
+    return m ? { query: m[2], start: caret - m[2].length - 1, caret } : null;
+  }
+  const mentionSlug = v => String(v || '').toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '');
+  /** Everything `$` can call: a skill by name; an app or plugin by its dashed name. */
+  function dollarItems() {
+    const c = S.catalog || {};
+    return [
+      ...(c.skills || []).map(x => ({ name: x.name, desc: x.description, tag: x.pluginId ? 'plugin skill' : 'skill' })),
+      ...(c.apps || []).map(x => ({ name: mentionSlug(x.name), desc: x.description, tag: 'app' })),
+      ...(c.plugins || []).map(x => ({ name: mentionSlug(x.name), desc: x.description, tag: 'plugin' }))
+    ];
+  }
+  function buildDollar() {
+    const st = dollarState();
+    if (!st) return { items: [] };
+    const q = st.query.toLowerCase(), seen = new Set();
+    const items = dollarItems().filter(x => {
+      if (seen.has(x.tag + x.name) || !x.name) return false;
+      seen.add(x.tag + x.name);
+      return !q || x.name.toLowerCase().includes(q) || (x.desc || '').toLowerCase().includes(q);
+    }).sort((a, b) => (b.name.toLowerCase().startsWith(q) - a.name.toLowerCase().startsWith(q)) || a.name.localeCompare(b.name)).slice(0, 40);
+    return {
+      keep: true, empty: dollarItems().length ? `Nothing matches $${st.query}` : 'No skills, apps or plugins found for this folder.',
+      items: items.map(x => ({
+        mono: true, title: ['$', mark(x.name, st.query)], desc: x.desc || null,
+        side: h('span', { class: 'ck-pop-tag', text: x.tag }),
+        run: () => {
+          const v = input.value, rest = v.slice(st.caret), gap = /^\s/.test(rest) ? '' : ' ';
+          input.value = v.slice(0, st.start) + '$' + x.name + gap + rest;
+          const at = st.start + x.name.length + 1 + gap.length;
+          input.setSelectionRange(at, at);
+          grow(); updateStatus(); updateSuggest();
+        }
+      }))
+    };
+  }
+  /** /skills, /mcp, /plugins and /apps: the catalog as a short list. */
+  function catalogText(name) {
+    const c = S.catalog || {};
+    const lines = {
+      skills: (c.skills || []).map(x => `- **$${x.name}** — ${x.description || 'No description'}`),
+      apps: (c.apps || []).map(x => `- **$${mentionSlug(x.name)}** — ${x.description || x.name}`),
+      plugins: (c.plugins || []).map(x => `- **${x.name}** — ${x.description || x.marketplace || 'Installed'}`),
+      mcp: (c.mcp || []).map(x => `- **${x.name}** · ${x.status}${x.auth && x.auth !== 'unsupported' ? ' · auth ' + x.auth : ''}${x.tools.length ? ' · ' + x.tools.length + (x.tools.length === 1 ? ' tool' : ' tools') : ''}${x.error ? ' — ' + x.error : ''}`)
+    }[name] || [];
+    const none = { skills: 'No skills found for this folder.', apps: 'No apps connected.', plugins: 'No plugins installed.', mcp: 'No MCP servers configured.' }[name];
+    return lines.length ? lines.join('\n') : none;
+  }
+
   function updateMention() {
+    const dollar = dollarState();
+    if (dollar) {
+      if (P.kind !== 'mention' || P.build !== buildDollar) openPop('mention', composer, buildDollar);
+      else { P.sel = -1; refreshPop(); }
+      return true;
+    }
+    if (P.kind === 'mention' && P.build === buildDollar) closePop();
     const st = mentionState();
     if (!st) { if (P.kind === 'mention') closePop(); return false; }
     wantFiles(st.query);
@@ -4419,6 +4487,7 @@
       case 'tasks.background': S.bgTasks = e.tasks || []; updateStatus(); break;
       case 'thinking.tokens': onThinkTokens(e); break;
       case 'files': onFiles(e); break;
+      case 'catalog': SHARED.catalog = { skills: e.skills || [], apps: e.apps || [], plugins: e.plugins || [], mcp: e.mcp || [] }; if (P.kind === 'mention' && P.build === buildDollar) refreshPop(); break;
       case 'unknown': showUnknown(e); break;
       case 'local.output': localOutput(e.content ?? e.text); break;
       case 'capabilities':
