@@ -1138,9 +1138,9 @@ class CodexBridge {
     const types = { '.png': 'image/png', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.gif': 'image/gif', '.webp': 'image/webp' };
     let url = null, error = null;
     try {
-      if (path && types[extname(path).toLowerCase()] && (await stat(path)).size <= 4 * 1024 * 1024) {
+      if (path && types[extname(path).toLowerCase()] && (await stat(path)).size <= 8 * 1024 * 1024) {
         url = `data:${types[extname(path).toLowerCase()]};base64,${(await readFile(path)).toString('base64')}`;
-      } else if (item.result && /^[A-Za-z0-9+/=]+$/.test(item.result) && item.result.length <= 6 * 1024 * 1024) url = 'data:image/png;base64,' + item.result;
+      } else if (item.result && /^[A-Za-z0-9+/=]+$/.test(item.result) && item.result.length <= 11 * 1024 * 1024) url = 'data:image/png;base64,' + item.result;
       else error = 'Image preview is not available.';
     } catch { error = 'Image could not be loaded.'; }
     this.emit('media.snapshot', { id: state.id, threadId: state.threadId, turnId: state.turnId, parentId: state.parentId,
