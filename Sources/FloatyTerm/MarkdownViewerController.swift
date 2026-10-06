@@ -26,6 +26,7 @@ final class MarkdownViewerController: NSObject, TabContent, NSTextViewDelegate {
 
     private let container = LayoutForwardingView()
     private let webView: WKWebView
+    private var appearanceToken: NSObjectProtocol?
     private let editorScroll = NSScrollView()
     private let textView = NSTextView()
 
@@ -64,6 +65,7 @@ final class MarkdownViewerController: NSObject, TabContent, NSTextViewDelegate {
         if SkimAssets.isAvailable { SkimAssets.install(in: config) }
         self.webView = WKWebView(frame: .zero, configuration: config)
         super.init()
+        appearanceToken = SkimAssets.followAppearance(webView)
 
         setUpPreview(source: source)
         setUpEditor(source: source)
@@ -267,6 +269,7 @@ final class MarkdownViewerController: NSObject, TabContent, NSTextViewDelegate {
     }
 
     func cleanup() {
+        if let appearanceToken { NotificationCenter.default.removeObserver(appearanceToken) }
         writeToDisk()                 // flush unsaved edits so nothing is lost
         textView.delegate = nil
         webView.stopLoading()

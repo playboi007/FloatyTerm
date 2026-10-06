@@ -58,6 +58,8 @@ final class Shot: NSObject, WKNavigationDelegate {
         if pageFile.pathExtension == "md" { SkimAssets.install(in: config) }
         #endif
         web = WKWebView(frame: NSRect(x: 0, y: 0, width: width, height: fixedHeight ?? 1000), configuration: config)
+        // SNAPSHOT_APPEARANCE=light|dark: the page's colour scheme, as the app sets it per web view.
+        if let a = ProcessInfo.processInfo.environment["SNAPSHOT_APPEARANCE"] { web.appearance = NSAppearance(named: a == "light" ? .aqua : .darkAqua) }
         window = NSWindow(contentRect: web.frame, styleMask: [.borderless], backing: .buffered, defer: false)
         super.init()
         window.contentView = web

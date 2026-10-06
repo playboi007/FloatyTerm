@@ -8,8 +8,15 @@
     const blocks = new Map();
     const messageBlocks = new Map(), confirmations = new Map();
     const stringify = value => typeof value === 'string' ? value : JSON.stringify(value == null ? '' : value);
+    // An image block reads as a label (its pixels go to a media event), never as base64.
+    const imageLabel = c => {
+      const src = c.source || {}, kind = String(src.media_type || '').replace(/^image\//, '') || 'image';
+      const kb = typeof src.data === 'string' ? Math.round(src.data.length * 3 / 4 / 1024) : 0;
+      return `[Image · ${kind}${kb ? ' · ' + kb + ' KB' : ''}]`;
+    };
     const resultText = value => typeof value === 'string' ? value : Array.isArray(value)
-      ? value.map(c => c.text || stringify(c)).join('\n') : stringify(value);
+      ? value.map(c => c && c.type === 'image' ? imageLabel(c) : c.text || stringify(c)).join('\n') : stringify(value);
+    const IMAGE_OK = /^image\/(png|jpeg|gif|webp)$/;
     const notice = (kind, message) => message ? [{ type: 'notice', kind, message: String(message) }] : [];
     const identity = (messageId, index, kind, redacted = false) => ({ id: messageId + ':' + index, messageId, kind, redacted });
     const unknown = raw => [{ type: 'unknown', name: raw.msg?.event?.type || raw.msg?.subtype || raw.msg?.type || raw.type }];
@@ -108,8 +115,15 @@
         if (!msg.parent_tool_use_id && texts.some(t => STOP_TEXT.test(t))) stopSeen = true;
       }
       if (msg.type === 'user') return (Array.isArray(msg.message?.content) ? msg.message.content : [])
-        .filter(c => c.type === 'tool_result').map(c => ({ type: 'tool.result', id: c.tool_use_id,
-          output: resultText(c.content), isError: !!c.is_error, parentId: msg.parent_tool_use_id || null }));
+        .filter(c => c.type === 'tool_result').flatMap(c => {
+          const parentId = msg.parent_tool_use_id || null;
+          const images = (Array.isArray(c.content) ? c.content : [])
+            .filter(b => b && b.type === 'image' && b.source && b.source.type === 'base64' && IMAGE_OK.test(b.source.media_type || ''));
+          return [{ type: 'tool.result', id: c.tool_use_id, output: resultText(c.content), isError: !!c.is_error, parentId },
+            // A Read of a picture (or a screenshot tool): shown in the tool's row.
+            ...images.map((b, i) => ({ type: 'media.snapshot', id: i ? c.tool_use_id + '#' + i : c.tool_use_id, ownerId: c.tool_use_id,
+              url: `data:${b.source.media_type};base64,${b.source.data}`, caption: imageLabel(b).slice(1, -1), parentId }))];
+        });
       if (msg.type === 'result') {
         // A stop is not an error: Claude Code reports it as error_during_execution, with an "aborted_…" terminal reason.
         const stopped = /^aborted/.test(msg.terminal_reason || '') || (stopSeen && msg.subtype === 'error_during_execution');

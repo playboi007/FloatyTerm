@@ -184,7 +184,7 @@ final class TerminalWindowController: NSObject, NSWindowDelegate {
     init(initialDirectory: String? = nil, startEmpty: Bool = false) {
         self.pendingInitialDirectory = initialDirectory
         self._startEmpty = startEmpty
-        let initial = NSRect(x: 0, y: 0, width: 720, height: 460)
+        let initial = NSRect(origin: .zero, size: FloatingPanel.newWindowSize)
         panel = FloatingPanel(contentRect: initial)
         super.init()
 

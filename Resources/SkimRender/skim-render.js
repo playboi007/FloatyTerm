@@ -270,9 +270,17 @@
   function initMermaid(m) {
     if (mermaidInited) return;
     mermaidInited = true;
+    // Diagrams take the page's appearance when Mermaid first loads.
+    const light = !!(root.matchMedia && root.matchMedia('(prefers-color-scheme: light)').matches);
     m.initialize({
       startOnLoad: false, theme: 'base', securityLevel: 'strict', fontFamily: 'Rubik, system-ui, sans-serif',
-      themeVariables: {
+      themeVariables: light ? {
+        darkMode: false, background: '#efece5', fontSize: '13px', primaryColor: '#ffffff', primaryTextColor: '#1d1b17',
+        primaryBorderColor: '#cbc5b9', lineColor: '#5d584e', secondaryColor: '#f3f1ec', tertiaryColor: '#f7f5f1',
+        actorBkg: '#ffffff', actorBorder: '#cbc5b9', actorTextColor: '#1d1b17', actorLineColor: '#cbc5b9',
+        signalColor: '#35312b', signalTextColor: '#35312b', noteBkgColor: '#fbe9dd', noteBorderColor: '#bf5a2b',
+        noteTextColor: '#6b2f12', labelBoxBkgColor: '#ffffff', labelTextColor: '#1d1b17', sequenceNumberColor: '#ffffff'
+      } : {
         darkMode: true, background: '#0e0e0d', fontSize: '13px', primaryColor: '#211f1c', primaryTextColor: '#ebe7de',
         primaryBorderColor: '#3a3732', lineColor: '#a8a397', secondaryColor: '#1a1917', tertiaryColor: '#161614',
         actorBkg: '#211f1c', actorBorder: '#3a3732', actorTextColor: '#ebe7de', actorLineColor: '#3a3732',

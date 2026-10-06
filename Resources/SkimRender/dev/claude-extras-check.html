@@ -1,0 +1,132 @@
+<!DOCTYPE html>
+<html lang="en"><head>
+<meta charset="utf-8">
+<link rel="stylesheet" href="../fonts.css">
+<link rel="stylesheet" href="../skim.css">
+<link rel="stylesheet" href="../chat.css">
+</head><body>
+<script src="../vendor/marked.min.js"></script>
+<script src="../vendor/purify.min.js"></script>
+<script src="../vendor/highlight.min.js"></script>
+<script src="../skim-classify.js"></script>
+<script src="../skim-render.js"></script>
+<script src="../agent-events.js"></script>
+<script src="../agent-claude.js"></script>
+<script src="../agent-codex.js"></script>
+<script src="../chat.js"></script>
+<script>
+  // Claude tab extras: MCP input forms, images in tool results, prompt history (↑ ↓, Ctrl+R), ! commands, Ctrl+B.
+  //   swift Resources/SkimRender/dev/snapshot.swift Resources/SkimRender/dev/claude-extras-check.html /tmp/extras.png 700 2 900
+  window.__pending = true;
+  document.documentElement.classList.add('no-motion');
+  const posts = [];
+  window.webkit = { messageHandlers: { skim: { postMessage: m => { if (m.type === 'action') posts.push(m.action); return Promise.resolve(); } } } };
+  ClaudeChat.boot({ cwd: '/tmp/demo', home: '' });
+  ClaudeChat.receive([{ type: 'sdk', msg: { type: 'system', subtype: 'init', model: 'claude-opus-5-5', permissionMode: 'default', session_id: 's1', cwd: '/tmp/demo' } },
+    { type: 'capabilities', commands: [], models: [], mode: 'default', features: { mentions: true, images: true } }]);
+  const $ = s => document.querySelector(s), $$ = s => [...document.querySelectorAll(s)];
+  const inp = $('.ck-input');
+  const tick = () => new Promise(r => setTimeout(r, 30));
+  const type = v => { inp.focus(); inp.value = v; inp.setSelectionRange(v.length, v.length); inp.dispatchEvent(new Event('input')); };
+  const key = (k, o = {}, el = inp) => el.dispatchEvent(new KeyboardEvent('keydown', { key: k, bubbles: true, cancelable: true, ...o }));
+  const of = t => posts.filter(p => p.type === t);
+  const PNG = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==';
+  let pass = 0;
+  const check = (name, ok, got) => { if (ok) pass++; else console.error('FAIL ' + name + (got !== undefined ? ' got: ' + JSON.stringify(got) : '')); };
+  (async () => { try {
+    // prompt history: asked for at capabilities
+    check('history requested', of('promptHistory').length === 1);
+    ClaudeChat.receive([{ type: 'promptHistory', list: [{ text: 'run the tests' }, { text: 'explain the cache\nin two lines' }, { text: 'fix the build' }] }]);
+
+    // 2 · an image in a tool result: a label in the text, the picture in the row
+    ClaudeChat.showUser('Look at the screenshot');
+    ClaudeChat.receive([{ type: 'sdk', msg: { type: 'assistant', parent_tool_use_id: null, message: { id: 'm1', model: 'claude-opus-5-5', content: [{ type: 'tool_use', id: 'tu-img', name: 'Read', input: { file_path: '/tmp/shot.png' } }] } } },
+      { type: 'sdk', msg: { type: 'user', parent_tool_use_id: null, message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'tu-img', content: [{ type: 'image', source: { type: 'base64', media_type: 'image/png', data: PNG } }] }] } } }]);
+    await tick();
+    const fig = $('.ck-media img');
+    check('image drawn', !!fig && fig.src.startsWith('data:image/png;base64,'));
+    check('image in the tool row', !!fig && !!fig.closest('.ck-detail'));
+    check('no base64 in the output text', !$$('.ck-out').some(o => o.textContent.includes(PNG.slice(0, 20))));
+
+    // 1 · an MCP server asks for input
+    ClaudeChat.receive([{ type: 'permission_request', id: 'elicit-1', kind: 'elicitation', toolName: 'jira', input: { serverName: 'jira', message: 'Which project?',
+      mode: 'form', requestedSchema: { type: 'object', properties: { project: { type: 'string', title: 'Project key' }, notify: { type: 'boolean', title: 'Notify' } }, required: ['project'] } } }]);
+    await tick();
+    const card = $('.ck-native-card[data-kind="elicitation"]');
+    check('elicitation card', !!card && card.textContent.includes('jira needs input'), card && card.textContent);
+    card.querySelector('input[type="text"]').value = 'FT';
+    [...card.querySelectorAll('button')].find(b => b.textContent === 'Submit').click();
+    const ans = of('permission').pop();
+    check('answer carries the MCP result', ans && ans.id === 'elicit-1' && ans.response.action === 'accept' && ans.response.content.project === 'FT' && ans.response.content.notify === false, ans);
+    ClaudeChat.receive([{ type: 'sdk', msg: { type: 'result', subtype: 'success', duration_ms: 1000, num_turns: 1, total_cost_usd: 0.01 } }]);
+
+    // 3 · history: ↑ ↓ and Ctrl+R
+    type('my draft');
+    key('ArrowUp'); check('↑ recalls the newest prompt', inp.value === 'run the tests', inp.value);
+    key('ArrowUp'); check('↑ again: the one before', inp.value === 'explain the cache\nin two lines', inp.value);
+    key('ArrowDown'); check('↓ on the first of two lines stays in the prompt', inp.value === 'explain the cache\nin two lines');
+    inp.setSelectionRange(inp.value.length, inp.value.length);
+    key('ArrowDown'); key('ArrowDown'); check('↓ back to the draft', inp.value === 'my draft', inp.value);
+    type('cache'); key('r', { ctrlKey: true }); await tick();
+    const items = $$('.ck-pop-item .ck-pop-title').map(e => e.textContent);
+    check('Ctrl+R filters by the composer', items.length === 1 && items[0].startsWith('explain the cache'), items);
+    key('Enter'); check('↩ uses it', inp.value === 'explain the cache\nin two lines', inp.value);
+    type('');
+
+    // 4 · ! commands
+    type('!ls -la'); check('shell look', $('.ck-field').classList.contains('is-shell'));
+    key('Enter');
+    const sh = of('shell').pop();
+    check('shell posted', sh && sh.command === 'ls -la', sh);
+    check('not sent as a message', of('send').length === 0);
+    const block = $('.ck-shell');
+    check('block shows running', block && block.dataset.status === 'running');
+    ClaudeChat.receive([{ type: 'shell', id: sh.id, stream: 'stdout', chunk: 'total 8\n\x1b[34mREADME.md\x1b[0m\n' }, { type: 'shell', id: sh.id, stream: 'stderr', chunk: 'ls: warn\n' }]);
+    check('output streams, colours stripped', block.querySelector('.ck-shell-out').textContent === 'total 8\nREADME.md\nls: warn\n', block.querySelector('.ck-shell-out').textContent);
+    ClaudeChat.receive([{ type: 'shell', id: sh.id, done: true, code: 0 }]);
+    check('done: exit 0', block.dataset.status === 'ok' && block.textContent.includes('exit 0'));
+    const quiet = of('send').pop();
+    check('the output goes into the conversation at once, without a turn', quiet && quiet.shouldQuery === false && quiet.text.startsWith('<bash-input>ls -la</bash-input>') && quiet.text.includes('<bash-stdout>total 8\nREADME.md\n</bash-stdout>'), quiet);
+    const footsBefore = $$('.ck-foot').length;
+    ClaudeChat.receive([{ type: 'sdk', msg: { type: 'result', subtype: 'success', num_turns: 0, duration_ms: 58, duration_api_ms: 0, total_cost_usd: 0, result: '' } }]);
+    check('its own empty result is not a turn', $$('.ck-foot').length === footsBefore);
+    check('…no chip, no turn drawn', $('.ck-refs').hidden && !$$('.ck-user-text').some(u => u.textContent.includes('bash-input')) && block.textContent.includes('Claude has it'));
+    type('what is in README?'); key('Enter');
+    const sent = of('send').pop();
+    check('the next message is just what you typed', sent.text === 'what is in README?' && sent.display === 'what is in README?' && !sent.priority, sent);
+    // a stopped command
+    type('!sleep 30'); key('Enter');
+    const sh2 = of('shell').pop();
+    $$('.ck-shell-stop').pop().click();
+    check('Stop posts shellKill', of('shellKill').pop().id === sh2.id);
+    ClaudeChat.receive([{ type: 'shell', id: sh2.id, done: true, code: null, signal: 'SIGINT' }]);
+    check('stopped shows', $$('.ck-shell').pop().dataset.status === 'stopped');
+    check('stopped with no output: nothing sent', of('send').filter(p => p.shouldQuery === false).length === 1);
+    check('form card says Sent', $('.ck-native-card[data-kind="elicitation"]').textContent.includes('Sent'));
+
+    // 6 · Ctrl+B while a Bash command runs
+    ClaudeChat.receive([{ type: 'sdk', msg: { type: 'assistant', parent_tool_use_id: null, message: { id: 'm2', model: 'claude-opus-5-5', content: [{ type: 'tool_use', id: 'tu-b', name: 'Bash', input: { command: 'npm run build' } }] } } }]);
+    await tick();
+    check('status hint', $('.ck-status-text').textContent.includes('⌃B'), $('.ck-status-text').textContent);
+    key('b', { ctrlKey: true }, document.body);
+    check('Ctrl+B posts background', of('background').length === 1);
+    // priority: ↩ joins the turn, ⌘↩ redirects after this step
+    check('busy: the hint names ⌘↩', inp.placeholder.includes('⌘↩ redirect'), inp.placeholder);
+    type('also print the size'); key('Enter');
+    check('↩ while busy: no priority (joins this turn)', of('send').pop().priority === undefined);
+    type('stop that, use the faster build'); key('Enter', { metaKey: true });
+    const redirect = of('send').pop();
+    check('⌘↩ while busy: priority now', redirect.priority === 'now' && redirect.text === 'stop that, use the faster build', redirect);
+    check('…marked as a redirect', $$('.ck-user-to').some(e => e.textContent.includes('redirect')));
+    ClaudeChat.receive([{ type: 'sdk', msg: { type: 'result', subtype: 'success', duration_ms: 500, num_turns: 1, total_cost_usd: 0.01, result: '' } }]);
+    check('the cut-short turn ends: still working on the redirect', $('.ck-status-text').textContent !== 'Ready', $('.ck-status-text').textContent);
+    ClaudeChat.receive([{ type: 'sdk', msg: { type: 'user', parent_tool_use_id: null, message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'tu-b', content: 'Command running in background with ID: b1' }] } } }]);
+    key('b', { ctrlKey: true }, document.body);
+    check('no Ctrl+B when nothing runs', of('background').length === 1);
+    ClaudeChat.receive([{ type: 'sdk', msg: { type: 'result', subtype: 'success', duration_ms: 1000, num_turns: 1, total_cost_usd: 0.01 } }]);
+    type('!git status');
+    console.error(`extras-check: ${pass} passed`);
+  } catch (e) { console.error('extras-check threw: ' + e.message + ' ' + (e.stack || '').split('\n')[0]); }
+  window.__pending = false; })();
+</script>
+</body></html>

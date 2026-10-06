@@ -8,7 +8,7 @@ final class ClaudeSidecar {
         case missingSidecar, missingNode, missingClaude, launch(Error)
         var description: String {
             switch self {
-            case .missingSidecar: return "The Claude sidecar files are missing (Resources/ClaudeSidecar with node_modules). Rebuild with ./build.sh."
+            case .missingSidecar: return "Claude rich rendering is an optional extra. Install a Claude-enabled FloatyTerm build, or rebuild with ./build.sh --RichRenderer-claude (or --all)."
             case .missingNode:    return "Node.js was not found. Install it (brew install node) to use the Claude tab."
             case .missingClaude:  return "The claude command was not found. Install Claude Code to use the Claude tab."
             case .launch(let e):  return "The Claude sidecar did not start: \(e.localizedDescription)"
@@ -38,6 +38,14 @@ final class ClaudeSidecar {
         let ok = { (u: URL) in
             fm.fileExists(atPath: u.appendingPathComponent("sidecar.mjs").path)
                 && fm.fileExists(atPath: u.appendingPathComponent("node_modules/@anthropic-ai/claude-agent-sdk").path)
+        }
+        // Packaged builds explicitly select their extras. Never load an omitted
+        // component from the developer's source checkout on this machine.
+        if Bundle.main.object(forInfoDictionaryKey: "FloatyRichRendererClaudeEnabled") != nil {
+            guard Bundle.main.object(forInfoDictionaryKey: "FloatyRichRendererClaudeEnabled") as? Bool == true,
+                  let bundled = Bundle.main.resourceURL?.appendingPathComponent("ClaudeSidecar"),
+                  ok(bundled) else { return nil }
+            return bundled
         }
         if let bundled = Bundle.main.resourceURL?.appendingPathComponent("ClaudeSidecar"), ok(bundled) { return bundled }
         let dev = URL(fileURLWithPath: #filePath)

@@ -26,7 +26,7 @@
   /** Facts of the folder and account, the same for every conversation. */
   const CLAUDE_FEATURES = { approvals: true, fork: true, history: true, models: true, effort: true,
     permissionMode: true, thinking: true, usage: true, git: true, tui: true, slashCommands: true, midTurnInput: true,
-    mentions: true, images: true, rename: true, rewind: true, btw: true };
+    mentions: true, images: true, rename: true, rewind: true, btw: true, shell: true, promptHistory: true, background: true, agentTalk: true, priority: true, quietContext: true };
   const CODEX_FEATURES = { approvals: true, fork: true, history: true, models: true, effort: true,
     permissionMode: true, thinking: true, usage: true, git: true, tui: true, slashCommands: true, midTurnInput: false,
     mentions: false, images: false };
@@ -67,6 +67,7 @@
       ctx: null, tokens: null, usageUnavailable: null,
       refs: [],               // text referenced from Claude's replies, sent with the next message
       images: [],             // pasted or dropped images { mediaType, data, url, name, w, h, seq }, sent with the next message
+      held: [],               // messages sent later (⌥↩): { text, refs, images, unit: 'turn'|'tool', n, left }
       tasks: { list: [], byTool: new Map(), seen: new Set(), open: false },   // the agent's task list (TodoWrite, TaskCreate/TaskUpdate)
       retry: null, limitSeen: new Set(),                     // the retry notice of this turn; limit notices already shown
       title: null, titleCustom: false,
@@ -89,7 +90,7 @@
   const clock = () => evT || Date.now();
   let chipSeq = 0;   // orders the chips above the composer (images and references) by when they were added
 
-  let viewBtn, viewMenuBtn, grip, ctxEl, moreBtn, refsEl, refBtn, tasksEl, dock, dockIn, statusEl, statusDot, statusText, modelEl, modeBtn, costEl, usagePanel, composer, input, sendBtn, micBtn, realtimeBtn, popEl, subEl, rewindEl, btwEl;
+  let viewBtn, viewMenuBtn, grip, ctxEl, moreBtn, refsEl, heldEl, holdBtn, refBtn, tasksEl, dock, dockIn, statusEl, statusDot, statusText, modelEl, modeBtn, costEl, usagePanel, composer, input, sendBtn, micBtn, realtimeBtn, popEl, subEl, rewindEl, btwEl, askEl, agentsEl, agentCard, toEl;
 
   // ── scrolling: follow the bottom while the user is near it ────────────
 
@@ -671,7 +672,8 @@
     const bar = h('span', { class: 'ck-bar' }, h('span', { class: 'ck-wait' }));
     const metaEl = h('span', { class: 'ck-meta' });
     const agentRow = isAgentTool(name);
-    const line = h('div', { class: 'ck-row' + (parentId ? ' is-sub' : '') + (agentRow ? ' is-agent' : '') }, icon, nameEl, badge, argEl, h('span', { class: 'ck-track' }, bar), metaEl);
+    const av = agentRow ? agentAvatar('Agent', 'running') : null;
+    const line = h('div', { class: 'ck-row' + (parentId ? ' is-sub' : '') + (agentRow ? ' is-agent' : '') }, av || icon, nameEl, badge, argEl, h('span', { class: 'ck-track' }, bar), metaEl);
     const detail = h('div', { class: 'ck-detail', hidden: true });
     const top = S.root || S;
     // An Agent row opens the subagent's transcript; other rows fold their output open.
@@ -683,7 +685,7 @@
       };
     if (agentRow) line.title = 'Show what this agent did';
     const row = { id, name, input: {}, phase: 'explore', state: 'preparing', t0: clock(), t1: null, waitMs: 0, waitStart: 0,
-      line, detail, icon, argEl, metaEl, bar, badge, waitBar: bar.firstChild, run, top, output: null };
+      line, detail, icon, argEl, metaEl, bar, badge, waitBar: bar.firstChild, run, top, output: null, av };
     run.rows.append(line, detail);
     if (run.list.length) enter(line);   // the first row comes with its run, which rises in itself
     run.list.push(row);
@@ -715,6 +717,7 @@
     if (row.run && row.run.mark) { paintMark(row.run); paintTray(row.run.turn); }
     row.line.dataset.state = state;
     row.icon.textContent = state === 'done' ? '✓' : state === 'error' ? '!' : '';
+    if (row.av) scheduleAgents();
     updateStatus();
   }
 
@@ -1359,7 +1362,7 @@
   /** Above the composer for suggestions (slash commands, @-mentions); above the status line, right-aligned to its chip, for menus. */
   function placePop() {
     const box = dockIn.getBoundingClientRect();
-    if (P.kind === 'slash' || P.kind === 'mention' || P.kind === 'rewind') {
+    if (P.kind === 'slash' || P.kind === 'mention' || P.kind === 'rewind' || P.kind === 'history') {
       popEl.style.left = '0'; popEl.style.right = '0';
       popEl.style.bottom = (box.bottom - composer.getBoundingClientRect().top + 6) + 'px';
     } else {
@@ -1831,6 +1834,7 @@
 
   /** The composer's suggestions: an @-mention anywhere (also inside a command's arguments), else slash commands. */
   function updateSuggest() {
+    if (P.kind === 'history') { refreshPop(); return; }
     if (updateMention()) return;
     updateSlash();
   }
@@ -1852,6 +1856,12 @@
    * chips. It says where the text came from, so the reply keeps to that thread.
    */
   const REF_NOTE = 'The user selected the passage(s) below from your earlier replies in this conversation and referenced them in this message.';
+
+  // ! commands go in the TUI's own form (bash mode), so Claude reads them as it would there.
+  const SHELL_SEND = 30000;
+  const clipOut = t => t.length > SHELL_SEND ? t.slice(0, SHELL_SEND) + `\n… (${t.length - SHELL_SEND} more characters)` : t;
+  const shellBlock = r => `<bash-input>${r.cmd}</bash-input>\n<bash-stdout>${clipOut(r.stdout)}</bash-stdout>\n<bash-stderr>${clipOut(r.stderr)}</bash-stderr>`
+    + (r.code ? `\n(exit code ${r.code})` : '');
 
   function withRefs(text, refs) {
     const q = v => String(v).replace(/"/g, "'").replace(/\s+/g, ' ').slice(0, 160);
@@ -1923,8 +1933,181 @@
     const seen = S.chipSeen || 0;
     for (const c of chips) if (c.seq > seen) play(c.el, POP, M.fast);
     S.chipSeen = Math.max(seen, ...chips.map(c => c.seq));
-    input.placeholder = chips.length ? 'Say what to do with it…  (⌫ removes the last one)' : `Message ${agent === 'codex' ? 'Codex' : 'Claude'}…${supports('slashCommands') ? '  / for commands' : ''} · ⇧↩ new line`;
+    input.placeholder = chips.length ? 'Say what to do with it…  (⌫ removes the last one)' : `Message ${agent === 'codex' ? 'Codex' : 'Claude'}…${supports('slashCommands') ? '  / for commands' : ''} · ⇧↩ new line · ⌥↩ later`;
+    paintHeld();
+    if (!chips.length && talkTarget()) input.placeholder = `Message ${talkTarget().type}…`;
     if (P.kind) placePop();
+  }
+
+  // ── ! commands: run in the session folder; the output goes with the next message ──
+
+  /** A running Bash command or subagent that Ctrl+B can send to the background. */
+  const foregroundTask = () => S.busy && [...S.rows.values()].some(r => r.state === 'running' && (r.name === 'Bash' || isAgentTool(r.name)));
+
+  const shellRuns = new Map();   // id → { conv, cmd, out, state, stop, el, stdout, stderr, t0 }
+  const ANSI = /\x1b\[[0-9;?]*[ -\/]*[@-~]|\x1b\][^\x07]*\x07/g;
+
+  function runShell(cmd) {
+    const id = newId();
+    const out = h('pre', { class: 'ck-shell-out' });
+    const state = h('span', { class: 'ck-shell-state', text: 'running…' });
+    const stop = h('button', { class: 'ck-shell-stop', type: 'button', text: 'Stop', title: 'Stop the command' });
+    stop.onmousedown = e => e.preventDefault();
+    stop.onclick = () => post({ type: 'shellKill', id });
+    const el = h('section', { class: 'ck-shell', 'data-status': 'running' },
+      h('div', { class: 'ck-shell-head' }, h('span', { class: 'ck-shell-bang', text: '!' }), h('code', { class: 'ck-shell-cmd', text: cmd }), state, stop), out);
+    S.log.append(el); enter(el);
+    shellRuns.set(id, { conv: S, cmd, out, state, stop, el, stdout: '', stderr: '', t0: Date.now() });
+    post({ type: 'shell', id, command: cmd });
+    follow = true; stick();
+  }
+
+  function onShell(e) {
+    const r = shellRuns.get(e.id);
+    if (!r) return;
+    if (e.chunk) {
+      const chunk = String(e.chunk).replace(ANSI, '');
+      const err = e.stream === 'stderr';
+      r[err ? 'stderr' : 'stdout'] += chunk;
+      if (r.out.textContent.length < 200000) r.out.append(err ? h('span', { class: 'is-err', text: chunk }) : chunk);
+      stick();
+      return;
+    }
+    if (!e.done) return;
+    shellRuns.delete(e.id);
+    r.stop.remove();
+    const secs = ((Date.now() - r.t0) / 1000).toFixed(1) + 's';
+    r.el.dataset.status = e.error ? 'error' : e.signal ? 'stopped' : e.code === 0 ? 'ok' : 'error';
+    r.state.textContent = e.error ? 'did not run: ' + e.error : e.signal ? 'stopped · ' + secs : `exit ${e.code} · ${secs}`;
+    if (!r.out.textContent) r.out.textContent = e.error ? '' : '(no output)';
+    if (e.error || (e.signal && !r.stdout && !r.stderr)) return;   // nothing ran, or stopped with nothing to show
+    // As in the TUI: into the conversation now, without a turn; Claude reads it with the next prompt.
+    const block = shellBlock({ cmd: r.cmd, stdout: r.stdout, stderr: r.stderr, code: e.code });
+    if (supports('quietContext')) {
+      post({ type: 'send', channel: r.conv.id, text: block, shouldQuery: false });
+      r.conv.quietPending = (r.conv.quietPending || 0) + 1;   // it ends with an empty result of its own
+      r.state.textContent += ' · Claude has it';
+    } else {
+      r.conv.refs.push({ text: block, from: null, seq: ++chipSeq });
+      if (r.conv === active) { paintRefs(); updateStatus(); }
+      r.state.textContent += ' · goes with your next message';
+    }
+  }
+
+  // ── prompt history: ↑ ↓ step through it, Ctrl+R searches it (shared with the TUI) ──
+
+  const HIST = { list: [], asked: false, idx: -1, draft: '' };
+
+  function requestPromptHistory() {
+    if (!supports('promptHistory') || HIST.asked) return;
+    HIST.asked = true;
+    post({ type: 'promptHistory' });
+  }
+
+  function onPromptHistory(e) {
+    const local = HIST.list;
+    HIST.list = [...new Set([...local, ...(e.list || []).map(x => x.text)])];
+  }
+
+  function rememberPrompt(text) {
+    HIST.list = [text, ...HIST.list.filter(x => x !== text)];
+    HIST.idx = -1;
+  }
+
+  /** ↑ on the first line (↓ on the last) steps through earlier prompts; the draft comes back at the end. */
+  function histStep(dir) {
+    if (!HIST.list.length || input.selectionStart !== input.selectionEnd) return false;
+    const v = input.value, at = input.selectionStart;
+    if (dir > 0 ? v.slice(0, at).includes('\n') : v.slice(at).includes('\n')) return false;
+    if (HIST.idx < 0 && dir < 0) return false;
+    if (HIST.idx < 0) HIST.draft = v;
+    const next = Math.min(HIST.idx + dir, HIST.list.length - 1);
+    HIST.idx = next;
+    input.value = next < 0 ? HIST.draft : HIST.list[next];
+    grow(); updateStatus();
+    const end = dir > 0 ? (input.value.indexOf('\n') < 0 ? input.value.length : input.value.indexOf('\n')) : input.value.length;
+    input.setSelectionRange(end, end);
+    return true;
+  }
+
+  /** Ctrl+R: the composer's text filters the list; ↩ puts the prompt in the composer. */
+  function openHistorySearch() {
+    requestPromptHistory();
+    openPop('history', composer, () => {
+      const words = input.value.toLowerCase().split(/\s+/).filter(Boolean);
+      const items = HIST.list.filter(t => words.every(w => t.toLowerCase().includes(w))).slice(0, 60).map(t => {
+        const lines = t.split('\n');
+        return { title: clip(lines[0], 140), desc: lines.length > 1 ? `+${lines.length - 1} more ${lines.length === 2 ? 'line' : 'lines'}` : null,
+          run: () => { closePop(); input.value = t; HIST.idx = -1; grow(); updateStatus(); input.focus(); input.setSelectionRange(t.length, t.length); } };
+      });
+      return { head: 'Prompt history · type to filter · ↩ to use', items, empty: HIST.list.length ? 'No prompt matches' : 'No prompts yet in this folder', keep: true };
+    });
+  }
+
+  // ── held messages (⌥↩): sent later, after some turns or tool calls, without a stop ──
+
+  const HOLD_WHEN = [['turn', 1, 'after this turn'], ['turn', 2, 'after 2 turns'], ['turn', 3, 'after 3 turns'],
+    ['tool', 1, 'after 1 tool call'], ['tool', 2, 'after 2 tool calls'], ['tool', 5, 'after 5 tool calls']];
+  const holdOptions = () => HOLD_WHEN.filter(w => w[0] === 'turn' || supports('midTurnInput'));
+
+  /** The composer's message (with its chips) waits in the held list; it is sent after this turn. */
+  function holdMessage() {
+    const text = input.value.trim();
+    if (!text && !S.refs.length && !S.images.length) return;
+    if (text.startsWith('/')) { notice('info', 'A command runs now. Send it with ↩.'); return; }
+    if (V.state !== 'idle') { V.detached = true; stopVoice(); }
+    S.held.push({ text, refs: S.refs.slice(), images: S.images.slice(), unit: 'turn', n: 1, left: 1 });
+    S.refs = []; S.images = [];
+    input.value = ''; grow(); closePop();
+    paintRefs(); updateStatus(); input.focus();
+  }
+
+  function paintHeld() {
+    if (!inView()) return;
+    heldEl.replaceChildren(...S.held.map(heldChip));
+    heldEl.hidden = !S.held.length;
+  }
+
+  function heldChip(m) {
+    const drop = () => { const at = S.held.indexOf(m); if (at >= 0) S.held.splice(at, 1); };
+    const when = h('select', { class: 'ck-held-when', title: 'When it is sent' },
+      holdOptions().map(([unit, n, label]) => h('option', { value: unit + n, text: label })));
+    when.value = m.unit + m.n;
+    when.onchange = () => {
+      const w = HOLD_WHEN.find(x => x[0] + x[1] === when.value);
+      if (w) { m.unit = w[0]; m.n = w[1]; m.left = w[1]; paintHeld(); }
+    };
+    const extra = m.refs.length + m.images.length;
+    return h('div', { class: 'ck-held-item' },
+      h('span', { class: 'ck-held-ic' }),
+      h('button', { class: 'ck-held-text', type: 'button', title: 'Edit: put it back in the composer',
+        text: refPreview(m.text || 'Attachments'), onmousedown: e => e.preventDefault(),
+        onclick: () => {
+          if (input.value.trim()) { notice('info', 'Send or clear the composer first, then edit the held message.'); return; }
+          drop(); input.value = m.text; S.refs.push(...m.refs); S.images.push(...m.images);
+          paintRefs(); grow(); updateStatus(); input.focus();
+        } }),
+      extra ? h('span', { class: 'ck-ref-n', text: '+' + extra }) : null,
+      m.left < m.n ? h('span', { class: 'ck-ref-n', text: m.left + ' to go' }) : null,
+      when,
+      h('button', { class: 'ck-held-now', type: 'button', text: 'Send now', onmousedown: e => e.preventDefault(),
+        onclick: () => { if (S.busy && !supports('midTurnInput')) { notice('info', 'Stop the turn first, or let the message wait.'); return; }
+          drop(); sendUser(m.text, m.refs, m.images); paintHeld(); } }),
+      h('button', { class: 'ck-ref-x', type: 'button', title: 'Remove', onmousedown: e => e.preventDefault(),
+        onclick: () => { drop(); paintHeld(); input.focus(); } }));
+  }
+
+  /** A turn ended well, or a tool call finished: count down; send what is due as one message. */
+  function tickHeld(unit) {
+    if (!S.held.length || S.replaying || S.root) return;
+    for (const m of S.held) if (m.unit === unit && m.left > 0) m.left--;
+    const due = S.held.filter(m => m.left <= 0);
+    if (due.length && (!S.busy || supports('midTurnInput'))) {
+      S.held = S.held.filter(m => m.left > 0);
+      // Counted in turns: if Claude has already begun another turn, it waits for that one too ('later').
+      sendUser(due.map(m => m.text).filter(Boolean).join('\n\n'), due.flatMap(m => m.refs), due.flatMap(m => m.images), unit === 'turn' ? { priority: 'later' } : {});
+    }
+    paintHeld();
   }
 
   // ── images: pasted or dropped, sent with the next message ─────────────
@@ -2202,7 +2385,7 @@
     closePop();
     if (V.state !== 'idle') { V.detached = true; stopVoice(); }
     if (supports('realtimeVoice')) post({ type: 'realtimeStop' });
-    closeSub(); closeTray(); closeRewind(); closeBtw();
+    closeSub(); closeTray(); closeRewind(); closeBtw(); closeAsk(); closeAgentCard(true);
     if (!usagePanel.hidden) toggleUsage(false);
     active.draft = input.value;
     active.follow = follow;
@@ -2370,6 +2553,7 @@
   /** Clears a conversation's log and state (its model, mode and effort stay). */
   function resetConv(conv) {
     if (btw && btw.conv === conv) closeBtw();
+    if (ask && ask.conv === conv) closeAsk();
     if (openTray && conv.turns.includes(openTray.turn)) closeTray();
     if (subShown() && subShown().root === conv) closeSub();
     for (const t of conv.turns) if (t.run) clearInterval(t.run.timer);
@@ -2489,11 +2673,11 @@
     btwEl.replaceChildren();
   }
 
-  function askBtw(question) {
-    const b = btw;
+  /** `b`: the dock's thread or the selection panel's; `shown`: the question as drawn (it can differ from the one sent). */
+  function askBtw(question, b = btw, shown = question) {
     const answer = h('div', { class: 'ck-btw-a is-wait', text: 'Answering…' });
     const item = { question, response: null, error: null, el: answer };
-    b.list.append(h('div', { class: 'ck-btw-q', text: question }), answer);
+    b.list.append(h('div', { class: 'ck-btw-q', text: shown }), answer);
     // The history: the earlier questions of this thread that got an answer.
     const history = b.thread.filter(t => typeof t.response === 'string').map(t => ({ question: t.question, response: t.response }));
     b.thread.push(item);
@@ -2505,8 +2689,8 @@
   }
 
   function onBtw(e) {
-    const b = btw;
-    if (!b || e.id !== b.pending) return;   // closed, or an answer to a thread that is gone
+    const b = [btw, ask].find(x => x && x.pending === e.id);
+    if (!b) return;   // closed, or an answer to a thread that is gone
     const item = b.thread.find(t => t.id === e.id);
     b.pending = null;
     if (!item) return;
@@ -2523,6 +2707,89 @@
       root.SkimRender.render(item.el, item.response, { streaming: false, interactive: false });
     }
     b.list.scrollTop = b.list.scrollHeight;
+  }
+
+  // ── Ask about a selection: a side question in a panel at the passage ──
+
+  const ASK_NOTE = 'The user selected the passage below from your earlier replies in this conversation and asks about it.';
+  let ask = null;   // { conv, list, field, thread, pending, range, hl }
+
+  function askSelection() {
+    const r = selectionRef();
+    if (!r || !supports('btw')) return;
+    closeAsk();
+    const range = r.range.cloneRange();
+    window.getSelection().removeAllRanges();
+    refBtn.hidden = true;
+    const list = h('div', { class: 'ck-btw-list' });
+    const field = h('textarea', { class: 'ck-btw-field ck-selask-field', rows: '1', placeholder: 'Ask about this…  ⇧↩ new line', 'aria-label': 'Question about the selection' });
+    const growField = () => { field.style.height = 'auto'; field.style.height = Math.min(field.scrollHeight, 120) + 'px'; };
+    const x = h('button', { class: 'ck-sub-btn ck-sub-x', type: 'button', title: 'Close (Esc)' });
+    x.onmousedown = e => e.preventDefault();
+    x.onclick = () => closeAsk();
+    const refIt = h('button', { class: 'ck-selask-ref', type: 'button', text: 'Reference instead', title: 'Close this and add the passage to your next message' });
+    refIt.onmousedown = e => e.preventDefault();
+    refIt.onclick = () => {
+      if (!S.refs.some(x => x.text === r.text)) S.refs.push({ text: r.text, from: r.from, seq: ++chipSeq });
+      closeAsk(); paintRefs(); updateStatus();
+    };
+    // The first question carries the passage; the follow-ups have it in their history.
+    const first = q => `${ASK_NOTE}\n\n<selected_text${r.from ? ` from_reply_to="${r.from.replace(/"/g, "'").replace(/\s+/g, ' ').slice(0, 160)}"` : ''}>\n${r.text}\n</selected_text>\n\n${q}`;
+    field.addEventListener('input', growField);
+    field.addEventListener('keydown', e => {
+      if (e.isComposing) return;
+      e.stopPropagation();   // the composer's and the page's keys do not apply here
+      if (e.key === 'Escape') { e.preventDefault(); closeAsk(); }
+      else if (e.key === 'Enter' && !e.shiftKey) {
+        e.preventDefault();
+        const q = field.value.trim();
+        if (!q || ask.pending) return;
+        field.value = ''; growField();
+        askBtw(ask.thread.length ? q : first(q), ask, q);
+        placeAsk();
+      }
+    });
+    const lines = r.text.split('\n').filter(l => l.trim()).length;
+    askEl.replaceChildren(
+      h('div', { class: 'ck-btw-head' }, h('span', { class: 'ck-btw-ic' }, icon(ICON_BTW)), h('span', { class: 'ck-btw-t', text: 'Ask about this' }),
+        h('span', { class: 'ck-btw-hint', text: 'Side question · not saved · no tools' }), refIt, x),
+      h('div', { class: 'ck-selask-quote', title: r.text.length > 600 ? r.text.slice(0, 600) + '…' : r.text },
+        h('span', { class: 'ck-selask-quote-t', text: r.text }), lines > 3 ? h('span', { class: 'ck-ref-n', text: lines + ' lines' }) : null),
+      list, h('div', { class: 'ck-btw-ask' }, field));
+    ask = { conv: S, list, field, thread: [], pending: null, range, hl: null };
+    // The passage stays marked while the panel is open (the selection itself goes to the field).
+    if (root.CSS && CSS.highlights && root.Highlight) { ask.hl = new Highlight(range); CSS.highlights.set('ck-selask', ask.hl); }
+    askEl.hidden = false;
+    placeAsk();
+    play(askEl, POP, M.fast);
+    field.focus();
+  }
+
+  /** Under the passage when there is room, else over it; it grows away from the passage, never over the dock. */
+  function placeAsk() {
+    if (!ask) return;
+    const at = ask.range.getBoundingClientRect();
+    const dockTop = dock.getBoundingClientRect().top;
+    const w = Math.min(480, window.innerWidth - 16);
+    const below = dockTop - at.bottom - 14, above = at.top - 14;
+    askEl.style.width = w + 'px';
+    askEl.style.left = Math.max(8, Math.min(at.left, window.innerWidth - w - 8)) + 'px';
+    if (below >= 240 || below >= above) {
+      askEl.style.top = Math.max(8, at.bottom + 6) + 'px'; askEl.style.bottom = '';
+      askEl.style.maxHeight = Math.max(160, Math.min(below, dockTop - 16)) + 'px';
+    } else {
+      askEl.style.top = ''; askEl.style.bottom = Math.max(8, window.innerHeight - at.top + 6) + 'px';
+      askEl.style.maxHeight = Math.max(160, above) + 'px';
+    }
+  }
+
+  function closeAsk() {
+    if (!ask) return;
+    if (ask.hl && root.CSS && CSS.highlights) CSS.highlights.delete('ck-selask');
+    ask = null;
+    askEl.hidden = true;
+    askEl.replaceChildren();
+    input.focus();
   }
 
   // ── rewind: back to before an earlier prompt ──────────────────────────
@@ -2796,6 +3063,14 @@
       state = 'busy';
       const live = S.lastTool && (S.lastTool.state === 'running' || S.lastTool.state === 'preparing') ? S.lastTool : null;
       text = S.buffering ? 'Preparing response…' : S.retry && !S.retry.done ? 'Retrying…' : live ? `${shortName(live.name)} ${live.argEl.textContent}`.trim() : S.thinking ? (S.thinkWord || 'Thinking') + '…' : S.progressText || 'Working';
+      if (supports('background') && foregroundTask()) text += ' · ⌃B to background';
+    }
+    // In an agent's view the status line is the agent's.
+    const subRow = subShown() && rowAnywhere(subShown().toolId, subShown().root);
+    if (subRow) {
+      const a = agentInfo(subRow);
+      text = `${a.type} · ${a.state === 'done' ? 'finished' : a.state === 'error' ? 'stopped' : agentLive(a) || AGENT_WORD[a.state]}`;
+      state = a.state === 'waiting' ? 'waiting' : a.state === 'running' ? 'busy' : 'idle';
     }
     postState();
     if (!inView()) { paintView(); return; }
@@ -2804,8 +3079,15 @@
     statusDot.dataset.state = state;
     dock.dataset.state = state;
     input.disabled = S.connectionClosed; sendBtn.disabled = S.connectionClosed;
-    sendBtn.dataset.mode = S.busy && (!supports('midTurnInput') || !input.value.trim() && !S.refs.length && !S.images.length) ? 'stop' : 'send';
-    sendBtn.title = sendBtn.dataset.mode === 'stop' ? 'Stop (Esc)' : 'Send (Return)';
+    sendBtn.dataset.mode = !subRow && S.busy && (!supports('midTurnInput') || !input.value.trim() && !S.refs.length && !S.images.length) ? 'stop' : 'send';
+    sendBtn.title = sendBtn.dataset.mode === 'stop' ? 'Stop (Esc)'
+      : S.busy && supports('priority') && !subRow ? 'Send: ↩ joins this turn · ⌘↩ redirect (after this step) · ⌥↩ after this turn' : 'Send (Return)';
+    if (!S.refs.length && !S.images.length && !subRow && supports('priority')) {
+      const want = S.busy ? 'Add to this turn…  ⌘↩ redirect · ⌥↩ after this turn' : `Message ${agent === 'codex' ? 'Codex' : 'Claude'}…${supports('slashCommands') ? '  / for commands' : ''} · ⇧↩ new line · ⌥↩ later`;
+      if (input.placeholder !== want) input.placeholder = want;
+    }
+    holdBtn.hidden = !input.value.trim() && !S.refs.length && !S.images.length;
+    input.parentElement.classList.toggle('is-shell', supports('shell') && input.value.startsWith('!'));
     paintView();
   }
 
@@ -2819,7 +3101,9 @@
     post({ type: 'state', channel: 'main', busy, waiting });
   }
 
-  function sendUser(text, refs, images) {
+  const priority0 = opts => supports('priority') ? opts.priority : null;
+  function sendUser(text, refs, images, opts) {
+    opts = opts || {};
     text = String(text || '').trim();
     refs = refs || [];
     images = images || [];
@@ -2835,12 +3119,19 @@
     }
     // A finished task list has done its job: the next message starts clean.
     if (S.tasks.list.length && S.tasks.list.every(t => t.status === 'completed')) { S.tasks.list = []; S.tasks.byTool.clear(); }
+    const wasBusy = S.busy;
     const t = newTurn(text, refs, images);
+    if (priority0(opts) === 'now' && wasBusy) { const box = t.el.querySelector('.ck-user'); if (box) box.prepend(h('span', { class: 'ck-user-to', text: '↪ redirect' })); }
+    if (opts.to) { const box = t.el.querySelector('.ck-user'); if (box) box.prepend(h('span', { class: 'ck-user-to', text: '→ ' + opts.to })); }
     // Rewind keys on the prompt's own ID, and resumes at the entry before it.
     const uuid = supports('rewind') ? newId() : null;
     if (uuid) markPrompt(t, uuid, S.lastChain, { text, refs, images });
     S.busy = true;
-    post({ type: 'send', text: refs.length ? withRefs(text, refs) : text, ...(uuid ? { uuid } : {}), ...(images.length ? { images: images.map(im => ({ mediaType: im.mediaType, data: im.data })) } : {}) });
+    if (text && supports('promptHistory')) rememberPrompt(text);
+    // ⌘↩ while it works: the current step ends the turn, then this one runs; that first end is not this prompt's.
+    const priority = supports('priority') && ['now', 'later'].includes(opts.priority) ? opts.priority : null;
+    if (priority === 'now' && wasBusy) S.redirect = true;
+    post({ type: 'send', text: opts.relay || (refs.length ? withRefs(text, refs) : text), ...(priority ? { priority } : {}), ...(uuid ? { uuid } : {}), ...(text && supports('promptHistory') ? { display: text } : {}), ...(images.length ? { images: images.map(im => ({ mediaType: im.mediaType, data: im.data })) } : {}) });
     updateStatus();
     follow = true; stick();
   }
@@ -2851,17 +3142,35 @@
     input.style.height = 'auto';
     input.style.height = Math.min(input.scrollHeight, 160) + 'px';
   };
-  function submit() {
+  function submit(opts) {
+    opts = opts || {};
     if (agent === 'codex' && input.value.trim().startsWith('/')) {
       const command = input.value.trim(); input.value = ''; grow(); closePop();
       runLocal(command); updateStatus(); return;
+    }
+    if (supports('shell') && /^!\s*\S/.test(input.value.trim())) {
+      const cmd = input.value.trim().slice(1).trim();
+      input.value = ''; grow(); closePop();
+      rememberPrompt('!' + cmd);
+      runShell(cmd); updateStatus(); return;
+    }
+    const target = talkTarget();
+    if (target && input.value.trim() && !/^[\/!]/.test(input.value.trim())) {
+      if (V.state !== 'idle') { V.detached = true; stopVoice(); }
+      const text = input.value.trim();
+      if (S.images.length) notice('info', 'Images cannot go to an agent; they stay here for your next message to Main.');
+      const refs = S.refs.slice();
+      if (refs.length) { S.refs = []; paintRefs(); }
+      input.value = ''; grow(); closePop();
+      sendToAgent(target, text, refs); updateStatus();
+      return;
     }
     if (sendBtn.dataset.mode === 'stop') { post({ type: 'interrupt' }); return; }
     if (V.state !== 'idle') { V.detached = true; stopVoice(); }
     const text = input.value;
     if (!text.trim() && !S.refs.length && !S.images.length) return;
     input.value = ''; grow(); closePop();
-    sendUser(text, S.refs.slice(), S.images.slice());
+    sendUser(text, S.refs.slice(), S.images.slice(), { priority: opts.priority });
     updateStatus();
   }
 
@@ -2893,17 +3202,29 @@
       post({ type: ['starting', 'active', 'muted'].includes(state) ? 'realtimeStop' : 'realtimeStart' });
     };
     refsEl = h('div', { class: 'ck-refs', hidden: true });
+    heldEl = h('div', { class: 'ck-held', hidden: true });
+    toEl = h('div', { class: 'ck-to', hidden: true });
+    holdBtn = h('button', { class: 'ck-hold', type: 'button', hidden: true, title: 'Send later, without a stop: after this turn (⌥↩)' }, h('span', { class: 'ck-hold-ic' }));
+    holdBtn.onmousedown = e => e.preventDefault();
+    holdBtn.onclick = holdMessage;
     tasksEl = h('div', { class: 'ck-tasks', hidden: true });
     downBtn = h('button', { class: 'ck-down', type: 'button', title: 'Scroll to the bottom', hidden: true }, h('span', { class: 'ck-down-ic' }));
     downBtn.onmousedown = e => e.preventDefault();
     downBtn.onclick = toBottom;
-    const field = h('div', { class: 'ck-field' }, grip, refsEl, input, downBtn);
-    composer = h('div', { class: 'ck-composer' }, field, h('div', { class: 'ck-actions' }, realtimeBtn, micBtn, sendBtn));
-    refBtn = h('button', { class: 'ck-refbtn', type: 'button', hidden: true, title: 'Add the selected text to your next message (⌘L)' },
+    const field = h('div', { class: 'ck-field' }, grip, toEl, heldEl, refsEl, input, downBtn);
+    composer = h('div', { class: 'ck-composer' }, field, h('div', { class: 'ck-actions' }, realtimeBtn, holdBtn, micBtn, sendBtn));
+    // The bar on a selection: reference it in the next message, or ask about it on the side.
+    const refOne = h('button', { class: 'ck-refbtn', type: 'button', title: 'Add the selected text to your next message (⌘L)' },
       h('span', { class: 'ck-refbtn-ic' }), 'Reference to Agent', h('kbd', { text: '⌘L' }));
+    refOne.onclick = () => referenceSelection();
+    const askOne = h('button', { class: 'ck-refbtn', type: 'button', hidden: !supports('btw'),
+      title: 'Ask about the selected text: a side question, not added to the conversation (⌘I)' },
+      h('span', { class: 'ck-ic-ask' }, icon(ICON_BTW)), 'Ask', h('kbd', { text: '⌘I' }));
+    askOne.onclick = () => askSelection();
+    refBtn = h('div', { class: 'ck-selbar', hidden: true }, refOne, askOne);
     refBtn.onmousedown = e => e.preventDefault();   // keep the selection
-    refBtn.onclick = () => referenceSelection();
-    document.body.append(refBtn);
+    askEl = h('div', { class: 'ck-selask', hidden: true, role: 'dialog', 'aria-label': 'Ask about the selection' });
+    document.body.append(refBtn, askEl);
     statusEl = h('div', { class: 'ck-status' }, viewBtn, viewMenuBtn, statusDot, statusText, h('span', { class: 'ck-spacer' }), ctxEl, modelEl, modeBtn, costEl, moreBtn);
     popEl = h('div', { class: 'ck-pop', hidden: true });
     rewindEl = h('div', { class: 'ck-rewind', hidden: true, role: 'dialog', 'aria-label': 'Rewind' });
@@ -2911,13 +3232,17 @@
     dockIn = h('div', { class: 'ck-dock-in' }, tasksEl, usagePanel, btwEl, rewindEl, statusEl, composer, popEl);
     dock = h('div', { class: 'ck-dock' }, dockIn);
     subEl = h('aside', { class: 'ck-subpanel', hidden: true, role: 'dialog', 'aria-label': 'Subagent transcript' });
-    document.body.append(main.log, dock, subEl);
+    agentsEl = h('div', { class: 'ck-agents', hidden: true, role: 'toolbar', 'aria-label': 'Agents' }, h('span', { class: 'ck-agents-label' }));
+    agentCard = h('div', { class: 'ck-ahc', hidden: true, role: 'dialog', 'aria-label': 'Agent' });
+    agentCard.addEventListener('mouseenter', () => clearTimeout(agentCardTimer));
+    agentCard.addEventListener('mouseleave', () => closeAgentCardSoon());
+    document.body.append(main.log, dock, subEl, agentsEl, agentCard);
     // The panel ends where the dock begins: the composer stays in reach.
     const fitSub = () => document.documentElement.style.setProperty('--ck-dock-h', dock.offsetHeight + 'px');
     if (root.ResizeObserver) new ResizeObserver(fitSub).observe(dock);
     fitSub();
 
-    input.addEventListener('input', () => { voiceTyped(); grow(); updateStatus(); updateSuggest(); });
+    input.addEventListener('input', () => { HIST.idx = -1; voiceTyped(); grow(); updateStatus(); updateSuggest(); });
     input.addEventListener('click', updateSuggest);
     input.addEventListener('keyup', e => { if (e.key === 'ArrowLeft' || e.key === 'ArrowRight' || e.key === 'Home' || e.key === 'End') updateSuggest(); });
     input.addEventListener('blur', () => setTimeout(() => { if ((P.kind === 'slash' || P.kind === 'mention') && document.activeElement !== input) closePop(); }, 120));
@@ -2949,10 +3274,15 @@
       if (e.key === 'Backspace' && !input.value && (S.refs.length || S.images.length)) { e.preventDefault(); popLastChip(); return; }
       if (e.key === 'Escape' && V.state !== 'idle') { e.preventDefault(); stopVoice(); return; }
       if (rewindCard && rewindKey(e)) { e.preventDefault(); return; }
+      if (e.key === 'Escape' && ask) { e.preventDefault(); closeAsk(); return; }
       if (e.key === 'Escape' && btw && !input.value) { e.preventDefault(); closeBtw(); return; }
       if (e.key === 'Escape' && openTray) { e.preventDefault(); closeTray(); return; }
       if (e.key === 'Escape' && subShown()) { e.preventDefault(); closeSub(); return; }
-      if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); submit(); }
+      if (e.ctrlKey && !e.metaKey && !e.altKey && !e.shiftKey && e.key.toLowerCase() === 'r' && supports('promptHistory')) { e.preventDefault(); openHistorySearch(); return; }
+      if ((e.key === 'ArrowUp' || e.key === 'ArrowDown') && !e.shiftKey && !e.altKey && !e.metaKey && !e.ctrlKey && histStep(e.key === 'ArrowUp' ? 1 : -1)) { e.preventDefault(); return; }
+      if (e.key === 'Enter' && e.altKey && !e.shiftKey && !e.metaKey && !e.ctrlKey) { e.preventDefault(); holdMessage(); }
+      else if (e.key === 'Enter' && e.metaKey && !e.shiftKey && !e.altKey && !e.ctrlKey) { e.preventDefault(); submit(S.busy && supports('priority') && !talkTarget() ? { priority: 'now' } : {}); }
+      else if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); submit(); }
       else if (e.key === 'Escape' && !usagePanel.hidden) { e.preventDefault(); toggleUsage(false); }
       else if (e.key === 'Escape' && S.busy) { e.preventDefault(); post({ type: 'interrupt' }); }
       else if (e.key === 'Escape' && supports('rewind') && !input.value && !S.cards.size) {
@@ -2962,7 +3292,7 @@
       }
       else if (e.key === 'Tab' && e.shiftKey) { e.preventDefault(); cycleMode(); }
     });
-    sendBtn.onclick = submit;
+    sendBtn.onclick = () => submit();
     paintMic();
     modelEl.onclick = openModelMenu;
     modeBtn.onclick = openModeMenu;
@@ -2991,11 +3321,11 @@
     // Dragging the scrollbar (a press right of the page's content box) also stops following.
     document.addEventListener('pointerdown', e => { if (e.clientX >= document.documentElement.clientWidth) { dragging = true; follow = false; } });
     document.addEventListener('pointerup', () => { if (dragging) { dragging = false; onScroll(); paintDown(); } });
-    window.addEventListener('scroll', () => { onScroll(); paintDown(); if (P.kind) placePop(); if (!refBtn.hidden) placeRefBtn(); }, { passive: true });
+    window.addEventListener('scroll', () => { onScroll(); paintDown(); if (P.kind) placePop(); if (!refBtn.hidden) placeRefBtn(); if (ask) placeAsk(); }, { passive: true });
     document.addEventListener('mouseup', () => setTimeout(placeRefBtn, 0));
     document.addEventListener('keyup', e => { if (e.shiftKey || e.key === 'Shift') placeRefBtn(); });
     document.addEventListener('selectionchange', () => { if (!refBtn.hidden && !selectionRef()) refBtn.hidden = true; });
-    window.addEventListener('resize', () => { if (P.kind) placePop(); });
+    window.addEventListener('resize', () => { if (P.kind) placePop(); if (ask) placeAsk(); });
     document.addEventListener('mousedown', e => { if (openTray && !openTray.el.contains(e.target)) closeTray(); });
     document.addEventListener('mousedown', e => {
       if (P.kind && P.kind !== 'slash' && P.kind !== 'mention' && !popEl.contains(e.target) && !(P.anchor && P.anchor.contains(e.target)) && !(P.kind === 'more' && ctxEl.contains(e.target))) closePop();
@@ -3004,11 +3334,28 @@
       if (P.kind && P.kind !== 'slash' && P.kind !== 'mention' && popKey(e)) { e.preventDefault(); return; }
       if (e.altKey && !e.metaKey && !e.ctrlKey && e.code === 'KeyP') { e.preventDefault(); openModelMenu(); return; }
       if (e.metaKey && !e.altKey && !e.ctrlKey && !e.shiftKey && e.key.toLowerCase() === 'l' && selectionRef()) { e.preventDefault(); referenceSelection(); return; }
+      if (e.metaKey && !e.altKey && !e.ctrlKey && !e.shiftKey && e.key.toLowerCase() === 'i' && supports('btw') && selectionRef()) { e.preventDefault(); askSelection(); return; }
+      if (e.key === 'Escape' && ask && !askEl.contains(document.activeElement)) { closeAsk(); return; }
       if (rewindCard && document.activeElement !== input && rewindKey(e)) { e.preventDefault(); return; }
       if (e.key === 'Escape' && openTray && document.activeElement !== input) { closeTray(); return; }
+      if (e.key === 'Escape' && agentCard && !agentCard.hidden) { closeAgentCard(); return; }
       if (e.key === 'Escape' && subShown() && document.activeElement !== input) { closeSub(); return; }
       if (e.key === 'Escape' && !usagePanel.hidden && document.activeElement !== input) { toggleUsage(false); return; }
       if (e.key === 'Escape' && S.busy && !S.cards.size && document.activeElement !== input) post({ type: 'interrupt' });
+      if (e.altKey && !e.metaKey && !e.ctrlKey && /^Digit[1-9]$/.test(e.code)) {
+        const a = agentsShown[+e.code.slice(5) - 1];
+        if (a) { e.preventDefault(); openAgent(a); return; }
+      }
+      const inAgent = talkTarget() || (subShown() && rowAnywhere(subShown().toolId, subShown().root) && agentInfo(rowAnywhere(subShown().toolId, subShown().root)));
+      if (e.ctrlKey && !e.metaKey && !e.altKey && !e.shiftKey && e.key.toLowerCase() === 'x' && inAgent && inAgent.task && (inAgent.state === 'running' || inAgent.state === 'waiting')) {
+        e.preventDefault(); stopAgent(inAgent); return;
+      }
+      if (e.ctrlKey && !e.metaKey && !e.altKey && !e.shiftKey && e.key.toLowerCase() === 'b' && inAgent && inAgent.task && !inAgent.task.background && (inAgent.state === 'running' || inAgent.state === 'waiting')) {
+        e.preventDefault(); backgroundAgent(inAgent); return;
+      }
+      if (e.ctrlKey && !e.metaKey && !e.altKey && !e.shiftKey && e.key.toLowerCase() === 'b' && supports('background') && foregroundTask()) {
+        e.preventDefault(); post({ type: 'background' });
+      }
     });
     updateStatus(); paintMeta(); paintContext(); paintView(); grow();
     input.focus();
@@ -3193,6 +3540,10 @@
     if (e.background || e.patch?.is_backgrounded) t.background = true;
     if (e.patch?.description) t.description = e.patch.description;
     if (e.usage) t.usage = e.usage;
+    if (e.type === 'task.start' && !t.t0) t.t0 = clock();
+    if (e.type === 'task.progress') { if (e.summary) t.summary = e.summary; if (e.lastTool) t.lastTool = e.lastTool; }
+    if (e.type === 'task.end') { t.endStatus = e.status || 'completed'; t.t1 = clock(); if (e.summary) t.result = e.summary; }
+    if (e.patch?.status && /^(completed|failed|killed|stopped)$/.test(e.patch.status)) { t.endStatus = e.patch.status; t.t1 = t.t1 || clock(); }
     if (t.ambient) return;
     const row = t.toolId ? rowAnywhere(t.toolId) : null;
     const status = e.type === 'task.end' ? e.status : e.patch?.status;
@@ -3276,10 +3627,14 @@
     closePop();
     const was = subShown();
     subOpen = subConv(top, toolId);
+    subOpen.seen = agentSteps(subOpen);
+    agentTarget = true;
+    closeAgentCard(true);
     subEl.hidden = false;
     if (!was) play(subEl, [{ opacity: 0, transform: 'translateY(-8px)' }, { opacity: 1, transform: 'none' }], M.mid);
     subEl.replaceChildren();
     paintSubPanel(false);
+    scheduleAgents(); paintTo();
     const sc = subEl.querySelector('.ck-sub-scroll');
     if (sc) sc.scrollTop = sc.scrollHeight;
   }
@@ -3289,6 +3644,7 @@
     subOpen = null;
     subEl.hidden = true;
     subEl.replaceChildren();
+    scheduleAgents(); paintTo();
   }
 
   /**
@@ -3302,21 +3658,33 @@
     let sc = subEl.querySelector('.ck-sub-scroll');
     const atEnd = !sc || sc.scrollTop + sc.clientHeight >= sc.scrollHeight - 24;
     const stats = [row ? agentMeta(row) : '', row && row.t0 ? secs((row.t1 || Date.now()) - row.t0) : ''].filter(Boolean).join(' · ');
-    const back = sub.parent && sub.parent !== sub.root
-      ? h('button', { class: 'ck-sub-btn', type: 'button', title: 'Back to the agent that started this one', onclick: () => openSub(sub.root, sub.parent.toolId) }, icon(ICON_BACK))
-      : null;
-    const head = h('div', { class: 'ck-sub-head' }, back, h('span', { class: 'ck-sub-ic' }, icon(ICON_AGENT)),
-      h('span', { class: 'ck-sub-type', text: inp.subagent_type || (row ? shortName(row.name) : 'Agent') }),
+    // Where you are: ← Main › the agents that started this one › this agent.
+    const a = row ? agentInfo(row) : null;
+    const chain = [];
+    for (let x = sub.parent; x && x !== sub.root; x = x.parent) chain.unshift(x);
+    const crumbs = [h('button', { class: 'ck-sub-btn ck-sub-home', type: 'button', title: 'Back to the conversation (Esc)', onclick: closeSub }, icon(ICON_BACK), h('span', { text: sub.root === main ? 'Main' : sub.root.label || 'Chat' }))];
+    for (const x of chain) {
+      const xr = rowAnywhere(x.toolId, sub.root);
+      crumbs.push(h('span', { class: 'ck-sub-sep', text: '›' }),
+        h('button', { class: 'ck-sub-btn ck-sub-crumb', type: 'button', title: 'Open the agent that started this one', onclick: () => openSub(sub.root, x.toolId),
+          text: xr ? agentInfo(xr).type : 'Agent' }));
+    }
+    const going = a && (a.state === 'running' || a.state === 'waiting');
+    const head = h('div', { class: 'ck-sub-head' }, ...crumbs, h('span', { class: 'ck-sub-sep', text: '›' }),
+      a ? agentAvatar(a.type, a.state, true) : h('span', { class: 'ck-sub-ic' }, icon(ICON_AGENT)),
+      h('span', { class: 'ck-sub-type', text: a ? a.type : inp.subagent_type || (row ? shortName(row.name) : 'Agent') }),
       h('span', { class: 'ck-sub-desc', text: inp.description || '', title: inp.description || '' }),
-      h('span', { class: 'ck-sub-state', 'data-state': state, text: state }),
-      h('span', { class: 'ck-sub-stats', text: stats }),
+      h('span', { class: 'ck-sub-state', 'data-state': a ? a.state : state, text: a ? AGENT_WORD[a.state] : state }),
+      h('span', { class: 'ck-sub-stats', text: a ? agentStats(a) : stats }),
+      going && a.task && !a.task.background ? h('button', { class: 'ck-sub-act', type: 'button', title: 'Send it to the background: the conversation goes on (⌃B)', onclick: () => backgroundAgent(a) }, 'Background', h('kbd', { text: '⌃B' })) : null,
+      going && a.task ? h('button', { class: 'ck-sub-act is-stop', type: 'button', title: 'Stop this agent (⌃X)', onclick: () => stopAgent(a) }, 'Stop', h('kbd', { text: '⌃X' })) : null,
       h('button', { class: 'ck-sub-btn ck-sub-x', type: 'button', title: 'Close (Esc)', onclick: closeSub }));
     // Head redrawn; transcript grows by itself (subagent's own log).
     if (!sc) {
       let prompt = null;
       if (inp.prompt) {
         const body = h('div', { class: 'ck-sub-prompt-t', hidden: true, text: String(inp.prompt) });
-        const btn = h('button', { class: 'ck-sub-prompt-h', type: 'button', text: 'Prompt · ' + clip(inp.prompt, 120) });
+        const btn = h('button', { class: 'ck-sub-prompt-h', type: 'button', text: `${sub.parent && sub.parent !== sub.root ? 'From its parent' : 'Prompt'} · ` + clip(inp.prompt, 120) });
         prompt = h('div', { class: 'ck-sub-prompt' }, btn, body);
         btn.onclick = () => {
           prompt.classList.toggle('is-open', body.hidden);
@@ -3341,6 +3709,248 @@
       } else if (empty) foot.append(h('div', { class: 'ck-sub-note', text: 'No steps to show.' }));
     }
     if (live && atEnd) sc.scrollTop = sc.scrollHeight;
+  }
+
+  // ── agents: avatars up top, a card on hover, and talking to one through Main ──
+
+  // An avatar: the agent type's initials on its colour; the ring says the state (it turns while the agent works).
+  const AGENT_COLORS = { Explore: '#8fb3e6', Plan: '#e2bd62', 'general-purpose': '#e08a5f', Verify: '#86c28a', 'statusline-setup': '#c98bd6' };
+  const AGENT_PALETTE = ['#8fb3e6', '#86c28a', '#e08a5f', '#e2bd62', '#c98bd6', '#a6cf94', '#f0b597'];
+  const AGENT_WORD = { running: 'working', waiting: 'needs you', done: 'done', error: 'stopped' };
+  const agentColor = type => AGENT_COLORS[type] || AGENT_PALETTE[[...String(type)].reduce((n, c) => n + c.charCodeAt(0), 0) % AGENT_PALETTE.length];
+  const agentInitials = type => { const w = String(type || 'Agent').split(/[-_\s]+/).filter(Boolean); return w.length > 1 ? (w[0][0] + w[1][0]).toUpperCase() : w[0].slice(0, 2).replace(/^./, c => c.toUpperCase()); };
+
+  function agentAvatar(type, state, small) {
+    const el = h('span', { class: 'ck-av' + (small ? ' is-small' : ''), 'data-s': state },
+      h('span', { class: 'ck-av-ring' }), h('span', { class: 'ck-av-face', text: agentInitials(type) }), h('span', { class: 'ck-av-badge' }));
+    paintAvatar(el, type, state);
+    return el;
+  }
+  function paintAvatar(el, type, state) {
+    if (el.dataset.type !== type) { el.dataset.type = type; el.style.setProperty('--c', agentColor(type)); el.children[1].textContent = agentInitials(type); }
+    if (el.dataset.s !== state) {
+      if (state === 'done' && el.dataset.s === 'running' && motionOn()) { el.classList.remove('is-ping'); void el.offsetWidth; el.classList.add('is-ping'); }
+      el.dataset.s = state;
+      el.children[2].textContent = state === 'done' ? '✓' : state === 'waiting' ? '!' : state === 'error' ? '×' : '';
+    }
+  }
+
+  const agentSteps = sub => sub ? sub.rows.size + sub.texts.size : 0;
+
+  /** All that the page knows of one Agent call: its row, task, transcript and state. */
+  function agentInfo(row) {
+    const top = row.top || main, sub = top.subs.get(row.id) || null, task = agentTaskOf(top, row.id);
+    const inp = row.input || {};
+    const waiting = sub && [...top.cards.values()].some(c => c.req && c.req.toolUseID && sub.rows.has(c.req.toolUseID));
+    let state;
+    if (waiting) state = 'waiting';
+    else if (task && task.endStatus) state = task.endStatus === 'completed' ? 'done' : 'error';
+    else if (task && !task.endStatus && row.state !== 'error' && row.state !== 'interrupted') state = 'running';   // a background agent's row ends long before it does
+    else state = row.state === 'done' ? 'done' : row.state === 'error' || row.state === 'interrupted' ? 'error' : 'running';
+    const parentConv = top.rows.has(row.id) ? top : [...top.subs.values()].find(c => c.rows.has(row.id)) || top;
+    return { row, top, sub, task, state, type: inp.subagent_type || shortName(row.name), desc: inp.description || clip(inp.prompt, 60) || 'Agent',
+      parentConv, parentType: parentConv === top ? (top === main ? 'Main' : top.label || 'Chat') : agentInfo(rowAnywhere(parentConv.toolId, top) || row).type };
+  }
+
+  function agentLive(a) {
+    const r = a.sub && [...a.sub.rows.values()].reverse().find(x => x.state === 'running' || x.state === 'preparing' || x.state === 'waiting');
+    if (r) return `${shortName(r.name)} ${r.argEl.textContent}`.trim();
+    if (a.state === 'waiting') return 'Waiting for your approval';
+    return a.task && (a.task.summary || (a.task.lastTool ? 'Last: ' + a.task.lastTool : '')) || (a.state === 'running' ? 'Starting…' : '');
+  }
+  function agentResult(a) {
+    if (a.task && a.task.result) return a.task.result;
+    const texts = a.sub ? [...a.sub.texts.values()] : [];
+    return texts.length ? texts[texts.length - 1].text : a.row.output || '';
+  }
+  function agentStats(a) {
+    const u = (a.task && a.task.usage) || {};
+    const tools = u.tool_uses || (a.sub ? a.sub.rows.size : 0);
+    const t0 = (a.task && a.task.t0) || a.row.t0, t1 = (a.task && a.task.t1) || (a.state === 'running' || a.state === 'waiting' ? clock() : a.row.t1 || clock());
+    return [tools ? plural(tools, 'tool') : null, u.total_tokens ? fmtTok(u.total_tokens) + ' tokens' : null, t0 ? secs(t1 - t0) : null].filter(Boolean).join(' · ');
+  }
+
+  /** The agents to show for a conversation: every one still working, and the finished ones of its last two turns. */
+  function agentsOf(top) {
+    const rows = [...top.rows.values(), ...[...top.subs.values()].flatMap(c => [...c.rows.values()])].filter(r => isAgentTool(r.name)).sort((x, y) => x.t0 - y.t0);
+    const last2 = top.turns.slice(-2), recent = new Set(last2), since = last2.length ? last2[0].t0 : 0;
+    const all = rows.map(agentInfo);
+    // Finished: started in one of the last two turns, or finished during them (a message to an agent makes a turn of its own).
+    const keep = new Set(all.filter(a => a.state === 'running' || a.state === 'waiting'
+      || (a.parentConv === top && ((a.row.run && recent.has(a.row.run.turn)) || ((a.task && a.task.t1) || a.row.t1 || 0) >= since))).map(a => a.row.id));
+    // A nested agent stays while the agent that started it stays.
+    for (const a of all) if (a.parentConv !== top && keep.has(a.parentConv.toolId)) keep.add(a.row.id);
+    return all.filter(a => keep.has(a.row.id));
+  }
+
+  let agentsRaf = 0, agentsShown = [], agentAvs = new Map(), agentsTop = null;
+  function scheduleAgents() { if (!agentsRaf && agentsEl) agentsRaf = requestAnimationFrame(() => { agentsRaf = 0; paintAgents(); }); }
+
+  function paintAgents() {
+    const top = active;
+    // Every Agent row's own avatar follows its state, shown in the stack or not.
+    for (const r of [...top.rows.values(), ...[...top.subs.values()].flatMap(c => [...c.rows.values()])]) if (r.av) { const a = agentInfo(r); paintAvatar(r.av, a.type, a.state); }
+    const list = agentsOf(top);
+    agentsShown = list;
+    if (agentsTop !== top) { agentAvs.forEach(el => el.remove()); agentAvs.clear(); agentsTop = top; }
+    const ids = new Set(list.map(a => a.row.id));
+    for (const [id, el] of agentAvs) if (!ids.has(id)) { el.remove(); agentAvs.delete(id); }
+    const busy = list.filter(a => a.state === 'running' || a.state === 'waiting').length;
+    agentsEl.hidden = !list.length;
+    agentsEl.firstChild.textContent = busy ? `${busy} ${busy === 1 ? 'agent' : 'agents'} working` : list.length ? 'agents done' : '';
+    list.forEach((a, i) => {
+      let el = agentAvs.get(a.row.id);
+      if (!el) {
+        el = h('button', { class: 'ck-av-btn', type: 'button' }, agentAvatar(a.type, a.state));
+        const id = a.row.id;
+        el.addEventListener('mouseenter', () => openAgentCard(id, el));
+        el.addEventListener('mouseleave', () => closeAgentCardSoon());
+        el.addEventListener('focus', () => openAgentCard(id, el));
+        el.addEventListener('blur', () => closeAgentCardSoon());
+        el.addEventListener('click', () => { const x = agentsShown.find(y => y.row.id === id); if (x) openAgent(x); });
+        if (agentsEl.dataset.ready && motionOn()) el.classList.add('is-new');
+        agentAvs.set(a.row.id, el);
+      }
+      if (el.parentNode !== agentsEl || el !== agentsEl.children[i + 1]) agentsEl.insertBefore(el, agentsEl.children[i + 1] || null);
+      paintAvatar(el.firstChild, a.type, a.state);
+      el.setAttribute('aria-label', `${a.type}: ${a.desc}, ${AGENT_WORD[a.state]} (⌥${i + 1})`);
+      el.classList.toggle('is-here', !!subShown() && subShown().toolId === a.row.id);
+      const unread = a.sub && !(subShown() === a.sub) && agentSteps(a.sub) > (a.sub.seen || 0) && a.state !== 'done';
+      el.classList.toggle('has-unread', !!unread);
+    });
+    agentsEl.dataset.ready = '1';
+    agentsEl.classList.toggle('is-compact', !!subShown());
+    if (subShown()) updateStatus();
+    // The agent's view keeps its head clear of the stack.
+    document.documentElement.style.setProperty('--ck-agents-w', (list.length ? agentsEl.offsetWidth + 28 : 12) + 'px');
+    if (agentCard && !agentCard.hidden && agentCardFor) {
+      const a = agentsShown.find(x => x.row.id === agentCardFor);
+      if (a) fillAgentCard(a, false); else closeAgentCard(true);
+    }
+  }
+
+  function openAgent(a) { closeAgentCard(true); openSub(a.top, a.row.id); }
+  function backgroundAgent(a) { post({ type: 'background', toolUseId: a.row.id, channel: a.top.id }); }
+  function stopAgent(a) { if (a.task) post({ type: 'stopTask', taskId: a.task.id, channel: a.top.id }); }
+
+  // ── the hover card: the avatar grows into it, and shrinks back on leave ──
+
+  let agentCardFor = null, agentCardFrom = null, agentCardTimer = 0, agentCardAnim = null, agentCardTick = 0;
+
+  function fillAgentCard(a, fresh) {
+    const steps = a.sub ? [...a.sub.rows.values()].filter(r => r.state === 'done').slice(-3) : [];
+    const result = a.state === 'done' || a.state === 'error' ? agentResult(a) : '';
+    const ask = a.state === 'waiting' && a.sub ? [...a.top.cards.values()].find(c => c.req && a.sub.rows.has(c.req.toolUseID)) : null;
+    const n = agentsShown.indexOf(a) + 1;
+    const body = h('div', { class: 'ck-ahc-body' },
+      h('div', { class: 'ck-ahc-h' }, agentAvatar(a.type, a.state),
+        h('div', { class: 'ck-ahc-name' }, h('div', { class: 'ck-ahc-type', text: a.type }),
+          h('div', { class: 'ck-ahc-state' }, h('b', { 'data-s': a.state, text: AGENT_WORD[a.state] }), ` · started by ${a.parentType}` + (a.task && a.task.background ? ' · background' : '')))),
+      h('div', { class: 'ck-ahc-desc', text: a.desc }),
+      ask ? h('div', { class: 'ck-ahc-ask' }, `Wants to run ${shortName(ask.req.toolName)}`, h('code', { text: clip(argOf(ask.req.toolName, ask.req.input || {}) || '', 120) }))
+        : result ? h('div', { class: 'ck-ahc-result', text: clip(result, 260) })
+        : h('div', { class: 'ck-ahc-now' }, h('span', { class: 'k', text: 'now' }), h('span', { class: 'v', text: agentLive(a) || '…' })),
+      steps.length && !result ? h('ul', { class: 'ck-ahc-steps' }, steps.map(r => h('li', { text: `${shortName(r.name)} ${r.argEl.textContent}` }))) : null,
+      h('div', { class: 'ck-ahc-stats', text: agentStats(a) }),
+      h('div', { class: 'ck-ahc-f' },
+        h('button', { class: 'ck-ahc-btn is-main', type: 'button', onclick: () => openAgent(a) }, ask ? 'Review' : a.state === 'done' ? 'Open' : 'Open and talk', n <= 9 ? h('kbd', { text: '⌥' + n }) : null),
+        h('span', { class: 'ck-ahc-grow' }),
+        (a.state === 'running' || a.state === 'waiting') && a.task && !a.task.background ? h('button', { class: 'ck-ahc-btn', type: 'button', title: 'Send it to the background', onclick: () => backgroundAgent(a) }, h('kbd', { text: '⌃B' })) : null,
+        (a.state === 'running' || a.state === 'waiting') && a.task ? h('button', { class: 'ck-ahc-btn is-stop', type: 'button', onclick: () => { closeAgentCard(true); stopAgent(a); } }, 'Stop')
+          : a.state === 'done' && supports('agentTalk') ? h('button', { class: 'ck-ahc-btn', type: 'button', title: 'Open it and write to it: Main passes your message on', onclick: () => { openAgent(a); input.focus(); } }, 'Continue it') : null));
+    agentCard.replaceChildren(body);
+    agentCard.classList.toggle('is-in', !!fresh);
+  }
+
+  function placeAgentCard(from) {
+    const r = from.getBoundingClientRect(), w = agentCard.offsetWidth;
+    const left = Math.max(8, Math.min(r.right + 8 - w, window.innerWidth - w - 8));
+    agentCard.style.left = left + 'px'; agentCard.style.top = (r.bottom + 10) + 'px';
+    agentCard.style.maxHeight = Math.max(160, dock.getBoundingClientRect().top - r.bottom - 20) + 'px';
+    return { r, left };
+  }
+
+  function openAgentCard(id, from) {
+    clearTimeout(agentCardTimer);
+    const a = agentsShown.find(x => x.row.id === id);
+    if (!a || (agentCardFor === id && !agentCard.hidden)) return;
+    agentAvs.forEach(el => el.classList.toggle('is-open', el === from));
+    const swap = !agentCard.hidden;
+    agentCardFor = id; agentCardFrom = from;
+    agentCard.hidden = false;
+    fillAgentCard(a, true);
+    const { r, left } = placeAgentCard(from);
+    clearInterval(agentCardTick);
+    agentCardTick = setInterval(() => { const x = agentsShown.find(y => y.row.id === agentCardFor); if (x) { agentCard.querySelector('.ck-ahc-stats').textContent = agentStats(x); } }, 1000);
+    if (!motionOn()) return;
+    if (agentCardAnim) agentCardAnim.cancel();
+    if (swap) { agentCardAnim = agentCard.animate([{ opacity: .6, transform: 'translateY(-2px)' }, { opacity: 1, transform: 'none' }], { duration: 160, easing: 'ease-out' }); return; }
+    // From the avatar's circle to the card: scale about the avatar's centre, round to square.
+    agentCard.style.transformOrigin = `${r.left + r.width / 2 - left}px ${-10 - r.height / 2}px`;
+    agentCardAnim = agentCard.animate([
+      { opacity: 0, transform: 'scale(.12)', borderRadius: '50%' },
+      { opacity: 1, offset: .45 },
+      { opacity: 1, transform: 'scale(1)', borderRadius: '14px' }], { duration: 340, easing: 'cubic-bezier(.34,1.3,.64,1)' });
+  }
+
+  function closeAgentCardSoon() { clearTimeout(agentCardTimer); agentCardTimer = setTimeout(() => closeAgentCard(), 140); }
+  function closeAgentCard(now) {
+    clearTimeout(agentCardTimer);
+    if (!agentCard || agentCard.hidden) return;
+    clearInterval(agentCardTick);
+    agentAvs.forEach(el => el.classList.remove('is-open'));
+    const done = () => { agentCard.hidden = true; agentCardFor = null; agentCard.replaceChildren(); };
+    if (now || !motionOn()) { if (agentCardAnim) agentCardAnim.cancel(); done(); return; }
+    agentCardAnim = agentCard.animate([{ opacity: 1, transform: 'scale(1)' }, { opacity: 0, transform: 'scale(.12)', borderRadius: '50%' }], { duration: 200, easing: 'cubic-bezier(.4,0,.8,.4)' });
+    agentCardAnim.onfinish = done;
+  }
+
+  // ── the composer in an agent's view: "To Explore" (Main passes it on), or to Main ──
+
+  let agentTarget = true;
+  const talkTarget = () => { const sub = subShown(); if (!sub || !agentTarget || !supports('agentTalk')) return null; const row = rowAnywhere(sub.toolId, sub.root); return row ? agentInfo(row) : null; };
+
+  function paintTo() {
+    if (!toEl) return;
+    const sub = subShown(), row = sub && rowAnywhere(sub.toolId, sub.root), a = row ? agentInfo(row) : null;
+    const field = input.parentElement;
+    if (!a || !supports('agentTalk')) { toEl.hidden = true; field.classList.remove('to-agent'); field.style.removeProperty('--c'); paintRefs(); return; }
+    const to = agentTarget ? a : null;
+    const chip = h('button', { class: 'ck-to-chip', type: 'button', title: 'Who gets this message (click to switch)' },
+      to ? agentAvatar(a.type, a.state, true) : h('span', { class: 'ck-to-main' }), 'To ' + (to ? a.type : 'Main'), h('span', { class: 'sk-caret ck-chip-caret' }));
+    chip.onmousedown = e => e.preventDefault();
+    chip.onclick = () => { agentTarget = !agentTarget; paintTo(); input.focus(); };
+    const hint = !to ? 'Main reads it; the agent is not told'
+      : a.state === 'done' || a.state === 'error' ? 'It finished: Main passes this on, and the agent goes on with all it knew'
+      : 'Main passes this on; the agent reads it at its next step';
+    toEl.replaceChildren(chip, h('span', { class: 'ck-to-hint', text: hint }));
+    toEl.hidden = false;
+    field.classList.toggle('to-agent', !!to);
+    if (to) field.style.setProperty('--c', agentColor(a.type)); else field.style.removeProperty('--c');
+    input.placeholder = to ? `Message ${a.type}…` : `Message ${agent === 'codex' ? 'Codex' : 'Claude'}…`;
+  }
+
+  // What Main reads: who the message is for, and how to pass it on. The user sees only their words.
+  function relayText(a, text) {
+    const id = a.task ? a.task.id : null;
+    return `[FloatyTerm] The user wrote this in the view of your subagent ${a.type} “${clip(a.desc, 80)}”` + (id ? ` (agent ID: ${id})` : '') + '. '
+      + `Pass it to that agent now with SendMessage${id ? ` (to: "${id}")` : ''}, word for word. If that agent has finished, the same SendMessage continues it. `
+      + 'Do not act on the message yourself; after sending it, reply in one short line.\n\n<message_to_agent>\n' + text + '\n</message_to_agent>';
+  }
+
+  /** In the agent's view: the message as you wrote it; in Main: a prompt marked "→ Explore". A foreground agent goes to the background first, so Main is free to pass it on. */
+  function sendToAgent(a, text, refs) {
+    const body = refs.length ? withRefs(text, refs) : text;
+    if (a.sub) {
+      a.sub.log.append(enter(h('div', { class: 'ck-sub-you' }, h('span', { class: 'ck-sub-you-h', text: 'You → ' + a.type + ' · via Main' }), text)));
+      a.sub.seen = agentSteps(a.sub);
+    }
+    if ((a.state === 'running' || a.state === 'waiting') && a.task && !a.task.background) backgroundAgent(a);
+    const prev = S;
+    S = a.top;
+    try { sendUser(text, refs, [], { relay: relayText(a, body), to: a.type }); } finally { S = prev; }
+    const sc = subEl.querySelector('.ck-sub-scroll');
+    if (sc) sc.scrollTop = sc.scrollHeight;
   }
 
   // ── event intake ───────────────────────────────────────────────────────
@@ -3417,6 +4027,13 @@
     error_max_structured_output_retries: 'Stopped: no valid structured output', error_during_execution: 'Ended with an error' };
 
   function onTurnEnd(e) {
+    if (S.redirect && !S.replaying) {
+      // The turn a ⌘↩ cut short: its tools settle, the redirected prompt's turn follows at once.
+      S.redirect = false;
+      settleLive(e.status);
+      S.busy = true; updateStatus();
+      return;
+    }
     settleLive(e.status);
     if (S.turn && !S.turn.footer) {
       const bits = [];
@@ -3438,6 +4055,8 @@
     } else if (e.status === 'error' && e.message) notice('error', e.message);
     paintMeta(); stick();
     if (!S.replaying) { requestUsage(!usagePanel.hidden); requestGit(); }
+    // A stop or an error is yours to look at first: held messages keep waiting.
+    if (e.status === 'success') tickHeld('turn');
   }
 
   function showUnknown(e) {
@@ -3533,7 +4152,7 @@
     let view = S.mediaViews.get(e.id);
     if (!view) {
       view = h('figure', { class: 'ck-media' }); S.mediaViews.set(e.id, view);
-      const row = S.rows.get(e.id);
+      const row = S.rows.get(e.ownerId || e.id);
       (row ? row.detail : turn().body).append(view);
     }
     const valid = typeof e.url === 'string' && /^data:image\/(png|jpeg|gif|webp);base64,[A-Za-z0-9+/=]+$/.test(e.url);
@@ -3646,7 +4265,9 @@
       card.dataset.done = '1';
       post({ type: 'permission', id: req.id, decision, response });
       form.querySelectorAll('input,select,textarea,button').forEach(el => { if (el.type === 'password') el.value = ''; el.disabled = true; });
-      resolveCard(req.id, decision === 'deny' ? 'denied' : 'allowed');
+      // An MCP form says what was sent, not a permission word.
+      const said = req.kind === 'elicitation' ? ({ accept: 'Sent', decline: 'Declined', cancel: 'Cancelled' })[response && response.action] : null;
+      resolveCard(req.id, decision === 'deny' ? 'denied' : 'allowed', null, said);
     };
     const form = h('form', null, body, opts); card.append(form);
     const button = (text, callback, validate = true) => {
@@ -3771,6 +4392,8 @@
       case 'surface.snapshot': paintSurface(e); break;
       case 'media.snapshot': paintMedia(e); break;
       case 'turn.end':
+        // A quiet message (shouldQuery: false) ends at once with an empty result: not a turn.
+        if (!e.local && S.quietPending && !e.steps) { S.quietPending--; break; }
         settleRetry();
         if (e.local) { settleLive(e.status); paintMeta(); }
         else onTurnEnd(e);
@@ -3778,7 +4401,9 @@
       case 'content.start': case 'content.delta': case 'content.snapshot': case 'content.end':
         settleRetry(); S.busy = true; paintContent(e); updateStatus(); break;
       case 'tool.start': case 'tool.input': case 'tool.result':
-        settleRetry(); S.busy = e.type === 'tool.result' ? S.busy : true; paintTool(e); trackTasks(e); updateStatus(); break;
+        settleRetry(); S.busy = e.type === 'tool.result' ? S.busy : true; paintTool(e); trackTasks(e); updateStatus();
+        if (e.type === 'tool.result') tickHeld('tool');
+        break;
       case 'commands': SHARED.commands = e.commands || []; if (P.kind === 'slash') refreshPop(); break;
       case 'approval.request': if (supports('approvals')) addCard(e.request); else showUnknown(e); break;
       case 'approval.cancel': resolveCard(e.id, 'cancelled'); break;
@@ -3804,7 +4429,7 @@
         if (!supports('slashCommands') && P.kind === 'slash') closePop();
         if (!supports('mentions') && P.kind === 'mention') closePop();
         paintMeta(); paintView(); paintRefs(); paintMic(); if (P.kind) refreshPop();
-        requestUsage(false); requestGit(); break;
+        requestUsage(false); requestGit(); requestPromptHistory(); break;
       case 'model': if (e.model) { const r = S.models.find(x => x.value === e.model); S.modelChoice = e.model; S.model = r ? (r.resolvedModel || r.value) : e.model; paintMeta(); } break;
       case 'mode': S.mode = e.mode || S.mode; paintMeta(); break;
       case 'effort': S.effort = e.effort || null; paintMeta(); break;
@@ -3813,6 +4438,8 @@
       case 'history': loadHistory(e); break;
       case 'rewind': onRewind(e); break;
       case 'btw': onBtw(e); break;
+      case 'shell': onShell(e); break;
+      case 'promptHistory': onPromptHistory(e); break;
       case 'prompt.state': onPromptState(e); break;
       case 'vcs': if (!S.replaying) requestGit(); break;
       case 'progress.summary': S.progressText = e.text || null; updateStatus(); break;
@@ -3874,6 +4501,7 @@
           } catch (err) { console.error('AgentChat', raw.type, err); }
         }
       } finally { evT = 0; S = prev; }
+      scheduleAgents();
       if (!batch.some(e => e.type === 'sdk' || e.type === 'native' || e.type === 'permission_request' || e.type === 'host' || e.v === 1)) return;
       if (conv !== active) { conv.unseen = true; paintView(); }
       // Output arrived while you read higher up: the down button says so.
