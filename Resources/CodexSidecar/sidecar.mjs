@@ -218,6 +218,10 @@ class CodexBridge {
     this.childParents = new Map();
     this.tasks = new Map();
     this.shells = new Map();
+    this.permissionProfiles = [];
+    this.permissionProfile = null;
+    this.guardianDenied = new Map();
+    this.importItems = [];
     this.processStreams = new Map();
     this.hostCalls = new Map();
     this.hostRequests = new Map();
@@ -295,6 +299,7 @@ class CodexBridge {
       await this.openThread(message);
       await this.readAccount(false);
       void this.loadCatalog();
+      void this.loadPermissionProfiles();
       this.started = true;
       this.starting = false;
       for (const pending of this.startQueue.splice(0)) this.handleControl(pending);
@@ -367,12 +372,13 @@ class CodexBridge {
     await this.stopRealtime();
     const sandbox = this.currentSandbox();
     const config = {};
+    if (this.permissionProfile) config.default_permissions = this.permissionProfile;
     if (this.effort) config.model_reasoning_effort = this.effort;
     if (typeof message.thinking === 'boolean' || this.configSummary) config.model_reasoning_summary = this.thinkingOn ? 'detailed' : 'none';
     const common = {
       cwd: this.config.cwd,
       approvalPolicy: 'on-request',
-      sandbox,
+      ...(this.permissionProfile ? {} : { sandbox }),
       ...(this.model?.model ? { model: this.model.model } : {}),
       ...(Object.keys(config).length ? { config } : {}),
     };
@@ -528,6 +534,183 @@ class CodexBridge {
     try { process.kill(-child.pid, 'SIGTERM'); } catch { try { child.kill('SIGTERM'); } catch { /* already gone */ } }
   }
 
+  // ── review, profiles, goals, usage history, import, marketplace, guardian ──
+
+  /** /review: Codex reviews uncommitted changes, a branch diff, a commit, or custom instructions, inside this thread. */
+  async review(message) {
+    if (!this.started || !this.threadId) { this.notice('error', 'Codex app-server is not ready.', true); return; }
+    if (this.transitioning || this.active) { this.notice('info', 'Wait for the current turn to finish before starting a review.'); return; }
+    const t = message.target || {};
+    const target = t.type === 'uncommittedChanges' ? { type: 'uncommittedChanges' }
+      : t.type === 'baseBranch' && typeof t.branch === 'string' && t.branch.trim() ? { type: 'baseBranch', branch: t.branch.trim() }
+      : t.type === 'commit' && typeof t.sha === 'string' && t.sha.trim() ? { type: 'commit', sha: t.sha.trim(), ...(t.title ? { title: String(t.title) } : {}) }
+      : t.type === 'custom' && typeof t.instructions === 'string' && t.instructions.trim() ? { type: 'custom', instructions: t.instructions.trim() }
+      : null;
+    if (!target) { this.notice('info', 'Usage: /review uncommitted · /review base <branch> · /review commit <sha> · /review <instructions>'); return; }
+    this.items.clear();
+    const turn = { id: null, started: false, ended: false, interruptRequested: false, usage: null };
+    this.active = turn;
+    try {
+      const response = await this.rpc.request('review/start', { threadId: this.threadId, target, delivery: 'inline' });
+      if (response?.turn?.id) turn.id = response.turn.id;
+      if (!turn.ended && !turn.started && response?.turn) this.onTurnStarted({ threadId: this.threadId, turn: response.turn }, { method: 'turn/started', params: { threadId: this.threadId, turn: response.turn } });
+      if (turn.interruptRequested && turn.id) await this.interruptActive();
+    } catch (error) {
+      if (this.active === turn && !turn.ended) this.endTurn(turn, 'error', plainError(error), { type: 'review/start.error', error: plainError(error) });
+    }
+  }
+
+  /** The named permission profiles the server allows; a chosen one replaces the Workspace write / Read only modes. */
+  async loadPermissionProfiles() {
+    try {
+      const out = [];
+      let cursor;
+      do {
+        const result = await this.rpc.request('permissionProfile/list', { cwd: this.config.cwd, limit: 100, ...(cursor ? { cursor } : {}) });
+        out.push(...(result?.data || []));
+        cursor = result?.nextCursor || null;
+      } while (cursor && out.length < 200);
+      this.permissionProfiles = out.filter(profile => profile?.id).map(profile => ({ id: profile.id, description: profile.description || '', allowed: profile.allowed !== false }));
+    } catch (error) { this.permissionProfiles = []; }
+    this.emit('permissionProfiles', { profiles: this.permissionProfiles, active: this.permissionProfile }, { type: 'permissionProfile.list' });
+  }
+
+  async setPermissionProfile(message) {
+    const id = message.id ? String(message.id) : null;
+    if (id && !this.permissionProfiles.some(profile => profile.id === id && profile.allowed)) { this.notice('error', `Permission profile ${id} is not available.`); return; }
+    if (this.active || this.transitioning) { this.notice('info', 'Wait for the current turn to finish before changing the permission profile.'); return; }
+    const previous = this.permissionProfile;
+    this.permissionProfile = id;
+    try {
+      // A profile is a config key, not a per-turn field: resume this thread with it.
+      await this.transition(() => this.openThread({ resume: this.threadId }));
+      this.emit('permissionProfiles', { profiles: this.permissionProfiles, active: this.permissionProfile }, { type: 'permissionProfile.selected' });
+      this.notice('info', id ? `Permission profile: ${id}` : 'Back to the Workspace write / Read only modes.');
+    } catch (error) {
+      this.permissionProfile = previous;
+      this.notice('error', `Could not switch permission profile: ${plainError(error)}`);
+    }
+  }
+
+  /** /goal: set, pause, resume or clear the thread's objective. The panel updates from thread/goal/updated. */
+  async goal(message) {
+    if (!this.started || !this.threadId) return;
+    const threadId = this.threadId;
+    try {
+      switch (message.action) {
+        case 'clear': await this.rpc.request('thread/goal/clear', { threadId }); return;
+        case 'pause': await this.rpc.request('thread/goal/set', { threadId, status: 'paused' }); return;
+        case 'resume': await this.rpc.request('thread/goal/set', { threadId, status: 'active' }); return;
+        case 'set': {
+          const objective = String(message.objective || '').trim();
+          if (!objective) { this.notice('info', 'Usage: /goal <objective> [--budget <tokens>]'); return; }
+          const budget = Number(message.tokenBudget);
+          await this.rpc.request('thread/goal/set', { threadId, objective, status: 'active', ...(Number.isFinite(budget) && budget > 0 ? { tokenBudget: Math.round(budget) } : {}) });
+          return;
+        }
+        default: {
+          const result = await this.rpc.request('thread/goal/get', { threadId });
+          this.surfaceEvent(result?.goal ? 'thread/goal/updated' : 'thread/goal/cleared', { threadId, goal: result?.goal || null });
+        }
+      }
+    } catch (error) { this.notice('warn', `Goal: ${plainError(error)}`); }
+  }
+
+  async usageHistory() {
+    try {
+      const result = await this.rpc.request('account/usage/read', {});
+      this.emit('usageHistory', { summary: result?.summary || {}, daily: (result?.dailyUsageBuckets || []).map(bucket => ({ date: bucket.startDate, tokens: bucket.tokens })) }, { type: 'usage.history' });
+    } catch (error) { this.emit('usageHistory', { summary: {}, daily: [], error: plainError(error) }, { type: 'usage.history.error' }); }
+  }
+
+  /** /import: other agents' configuration found in this folder and the home folder. */
+  async importDetect(message) {
+    try {
+      const result = await this.rpc.request('externalAgentConfig/detect', { cwds: [this.config.cwd], includeHome: true, ...(message.source ? { migrationSource: String(message.source) } : {}) });
+      this.importItems = result?.items || [];
+      this.emit('import', { stage: 'detected', source: message.source || null, items: this.importItems.map((item, id) => ({ id, itemType: item.itemType, description: item.description, cwd: item.cwd || null })) }, { type: 'import.detect' });
+    } catch (error) { this.emit('import', { stage: 'error', message: plainError(error) }, { type: 'import.detect.error' }); }
+  }
+
+  async importRun(message) {
+    const ids = new Set((Array.isArray(message.ids) ? message.ids : []).map(Number));
+    const items = this.importItems.filter((item, id) => ids.has(id));
+    if (!items.length) { this.notice('info', 'Nothing selected to import.'); return; }
+    try {
+      const result = await this.rpc.request('externalAgentConfig/import', { migrationItems: items, ...(message.source ? { migrationSource: String(message.source) } : {}) });
+      this.emit('import', { stage: 'started', importId: result?.importId || null, count: items.length }, { type: 'import.start' });
+    } catch (error) { this.emit('import', { stage: 'error', message: plainError(error) }, { type: 'import.start.error' }); }
+  }
+
+  /** /marketplace and /plugins install|uninstall|share, with one notice for the result. */
+  async marketplace(message) {
+    const say = text => this.notice('info', text);
+    try {
+      switch (message.action) {
+        case 'add': {
+          const source = String(message.source || '').trim();
+          if (!source) return say('Usage: /marketplace add <source>');
+          const r = await this.rpc.request('marketplace/add', { source });
+          say(r?.alreadyAdded ? `Marketplace ${r.marketplaceName} was already added.` : `Added marketplace ${r?.marketplaceName || source}.`); break;
+        }
+        case 'remove': {
+          const name = String(message.name || '').trim();
+          if (!name) return say('Usage: /marketplace remove <name>');
+          await this.rpc.request('marketplace/remove', { marketplaceName: name }); say(`Removed marketplace ${name}.`); break;
+        }
+        case 'upgrade': {
+          const r = await this.rpc.request('marketplace/upgrade', message.name ? { marketplaceName: String(message.name) } : {});
+          const errors = (r?.errors || []).length;
+          say(`Upgraded ${(r?.upgradedRoots || []).length} of ${(r?.selectedMarketplaces || []).length} marketplaces` + (errors ? `; ${errors} failed.` : '.')); break;
+        }
+        case 'install': {
+          const pluginName = String(message.name || '').trim();
+          if (!pluginName) return say('Usage: /plugins install <name>');
+          const list = await this.rpc.request('plugin/list', { cwds: [this.config.cwd] });
+          const market = (list?.marketplaces || []).find(entry => (entry.plugins || []).some(plugin => plugin.name === pluginName || plugin.id === pluginName));
+          const plugin = market?.plugins.find(entry => entry.name === pluginName || entry.id === pluginName);
+          if (!plugin) return say(`No plugin named ${pluginName} in the added marketplaces.`);
+          const r = await this.rpc.request('plugin/install', { pluginName: plugin.name, ...(market.path ? { marketplacePath: market.path } : { remoteMarketplaceName: market.name }) });
+          say(`Installed ${plugin.name}.` + ((r?.appsNeedingAuth || []).length ? ` Sign in needed for: ${r.appsNeedingAuth.map(app => app.name || app.id || app).join(', ')}.` : '')); break;
+        }
+        case 'uninstall': {
+          const id = String(message.name || '').trim();
+          if (!id) return say('Usage: /plugins uninstall <plugin id>');
+          await this.rpc.request('plugin/uninstall', { pluginId: id }); say(`Uninstalled ${id}.`); break;
+        }
+        case 'share': {
+          const pluginPath = String(message.path || '').trim();
+          if (!pluginPath.startsWith('/')) return say('Usage: /plugins share <absolute plugin folder> [private|internal|public]');
+          const discoverability = ['private', 'internal', 'public'].includes(message.visibility) ? message.visibility : undefined;
+          const r = await this.rpc.request('plugin/share/save', { pluginPath, ...(discoverability ? { discoverability } : {}) });
+          say(`Shared plugin. ${r?.shareUrl || r?.remotePluginId || ''}`.trim()); break;
+        }
+        default: return say('Usage: /marketplace add|remove|upgrade …  ·  /plugins install|uninstall|share …');
+      }
+      void this.loadCatalog();
+    } catch (error) { this.notice('error', `${message.action || 'Marketplace'}: ${plainError(error)}`); }
+  }
+
+  /** Guardian review of an approval: risk and rationale for the page; a denial can be overridden by the user. */
+  onGuardianReview(method, params) {
+    const review = params.review || {};
+    const done = method.endsWith('/completed');
+    const ownerId = params.targetItemId ? toolId(params.threadId, params.turnId, params.targetItemId) : null;
+    if (done && review.status === 'denied') this.guardianDenied.set(params.reviewId, params);
+    this.emit('guardian', { reviewId: params.reviewId, status: review.status || (done ? 'completed' : 'inProgress'), riskLevel: review.riskLevel || null,
+      rationale: review.rationale || '', ownerId, canOverride: done && review.status === 'denied' }, { method });
+  }
+
+  async guardianOverride(message) {
+    const params = this.guardianDenied.get(String(message.reviewId));
+    if (!params) { this.notice('info', 'That denied action can no longer be approved.'); return; }
+    try {
+      await this.rpc.request('thread/approveGuardianDeniedAction', { threadId: params.threadId, event: params });
+      this.guardianDenied.delete(String(message.reviewId));
+      this.notice('info', 'Approved the denied action. Codex can retry it.');
+    } catch (error) { this.notice('error', `Could not approve the action: ${plainError(error)}`); }
+  }
+
   /** Skills, apps, plugins and MCP servers: what `/` and `$` offer, and what the integrations panel lists. */
   async loadCatalog() {
     if (!this.rpc || this.rpc.dead || !this.config) return;
@@ -597,6 +780,7 @@ class CodexBridge {
         sandboxPolicy: { type: 'workspaceWrite', writableRoots: [], networkAccess: false, excludeTmpdirEnvVar: false, excludeSlashTmp: false },
         approvalPolicy: 'on-request',
         ...(this.permissionMode === 'plan' ? { sandboxPolicy: { type: 'readOnly', networkAccess: false } } : {}),
+        ...(this.permissionProfile ? { sandboxPolicy: undefined } : {}),
         ...(model ? { model } : {}), ...(effort ? { effort } : {}), summary,
         clientUserMessageId: randomUUID(),
       };
@@ -1289,6 +1473,14 @@ class CodexBridge {
       case 'thread/compacted':
         this.notice('info', 'Codex conversation context was compacted.', false, message);
         break;
+      case 'item/autoApprovalReview/started': case 'item/autoApprovalReview/completed':
+        this.onGuardianReview(method, params);
+        this.surfaceEvent(method, params, message);
+        break;
+      case 'externalAgentConfig/import/progress': case 'externalAgentConfig/import/completed':
+        this.emit('import', { stage: method.endsWith('completed') ? 'done' : 'progress', importId: params.importId,
+          results: (params.itemTypeResults || []).map(r => ({ itemType: r.itemType, ok: (r.successes || []).length, failed: (r.failures || []).length })) }, { method });
+        break;
       case 'thread/name/updated':
         if (params.threadId === this.threadId && this.thread) this.thread.name = params.threadName || params.name || this.thread.name;
         this.emit('title', { title: params.threadName || params.name || '', sessionId: params.threadId, custom: true }, { method }); break;
@@ -1492,6 +1684,15 @@ class CodexBridge {
       switch (message.type) {
         case 'user': return this.user(message.text, message.images);
         case 'catalog': return this.loadCatalog();
+        case 'review': return this.review(message);
+        case 'setPermissionProfile': return this.setPermissionProfile(message);
+        case 'permissionProfiles': return this.loadPermissionProfiles();
+        case 'goal': return this.goal(message);
+        case 'usageHistory': return this.usageHistory();
+        case 'importDetect': return this.importDetect(message);
+        case 'importRun': return this.importRun(message);
+        case 'marketplace': return this.marketplace(message);
+        case 'guardianOverride': return this.guardianOverride(message);
         case 'files': return this.files(message);
         case 'title': return this.title();
         case 'rename': return this.rename(message);

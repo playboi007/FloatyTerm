@@ -61,6 +61,11 @@ function doTurn(request) {
     notify('item/started', { threadId: request.params.threadId, turnId: currentTurn, item: call('inProgress'), startedAtMs: Date.now() });
     notify('item/completed', { threadId: request.params.threadId, turnId: currentTurn, item: call('completed'), completedAtMs: Date.now() });
   }
+  if (text === 'guardian') {
+    const review = (status) => ({ status, riskLevel: 'high', rationale: 'Deletes files outside the workspace', userAuthorization: null });
+    notify('item/autoApprovalReview/started', { threadId: request.params.threadId, turnId: currentTurn, reviewId: 'rev-1', targetItemId: 'cmd-1', startedAtMs: 1, action: { type: 'command' }, review: review('inProgress') });
+    notify('item/autoApprovalReview/completed', { threadId: request.params.threadId, turnId: currentTurn, reviewId: 'rev-1', targetItemId: 'cmd-1', startedAtMs: 1, completedAtMs: 2, decisionSource: 'agent', action: { type: 'command' }, review: review('denied') });
+  }
   if (text === 'reasoning') {
     notify('item/reasoning/textDelta', { threadId: request.params.threadId, turnId: currentTurn, itemId: 'reasoning-1', delta: 'PRIVATE_RAW_REASONING' });
     notify('item/reasoning/summaryTextDelta', { threadId: request.params.threadId, turnId: currentTurn, itemId: 'reasoning-1', summaryIndex: 0, delta: 'Public summary' });
@@ -167,6 +172,17 @@ rl.on('line', line => {
     case 'thread/compact/start': respond(request, {}); notify('thread/compacted', { threadId: request.params.threadId, turnId: 'compact-turn' }); return;
     case 'fuzzyFileSearch': respond(request, { files: [{ file_name: 'a.dart', path: 'lib/a.dart', root: process.cwd(), match_type: 'file', score: 5, indices: null }, { file_name: 'b.dart', path: 'lib/b.dart', root: process.cwd(), match_type: 'file', score: 9, indices: null }] }); return;
     case 'turn/steer': respond(request, { turnId: request.params.expectedTurnId }); return;
+    case 'review/start': { currentTurn = 'turn-' + (++turnNumber); const started = turn(currentTurn);
+      respond(request, { turn: started, reviewThreadId: request.params.threadId });
+      notify('turn/started', { threadId: request.params.threadId, turn: started }); finishTurn(request.params.threadId, 'completed'); return; }
+    case 'permissionProfile/list': respond(request, { data: [{ id: ':workspace', description: 'Workspace write', allowed: true }, { id: ':danger', description: 'No sandbox', allowed: false }], nextCursor: null }); return;
+    case 'thread/goal/set': respond(request, {}); notify('thread/goal/updated', { threadId: request.params.threadId, goal: { threadId: request.params.threadId, objective: request.params.objective || 'kept', status: request.params.status || 'active', tokenBudget: request.params.tokenBudget ?? null, tokensUsed: 0, timeUsedSeconds: 0, createdAt: 1, updatedAt: 2 } }); return;
+    case 'thread/goal/clear': respond(request, {}); notify('thread/goal/cleared', { threadId: request.params.threadId }); return;
+    case 'account/usage/read': respond(request, { summary: { lifetimeTokens: 1234, peakDailyTokens: 99, currentStreakDays: 3 }, dailyUsageBuckets: [{ startDate: '2026-10-05', tokens: 99 }] }); return;
+    case 'externalAgentConfig/detect': respond(request, { items: [{ itemType: 'SKILLS', description: 'Import 2 skills', cwd: null }, { itemType: 'HOOKS', description: 'Import hooks', cwd: process.cwd() }], connectors: [] }); return;
+    case 'externalAgentConfig/import': respond(request, { importId: 'imp-1' }); notify('externalAgentConfig/import/completed', { importId: 'imp-1', itemTypeResults: [{ itemType: 'SKILLS', successes: [{}, {}], failures: [] }] }); return;
+    case 'marketplace/add': respond(request, { alreadyAdded: false, installedRoot: '/m', marketplaceName: 'team' }); return;
+    case 'thread/approveGuardianDeniedAction': respond(request, {}); return;
     case 'thread/name/set': respond(request, {}); return;
     case 'skills/list': respond(request, { data: [{ cwd: process.cwd(), errors: [], skills: [
       { name: 'imagegen', description: 'Make images', enabled: true, path: '/skills/imagegen/SKILL.md', scope: 'user', interface: { shortDescription: 'Generate images' } },
@@ -506,5 +522,87 @@ test('a message sent while a turn runs joins it through turn/steer', async () =>
     assert.equal(steer.params.expectedTurnId, 'turn-1');
     assert.equal(steer.params.input[0].text, 'also check the tests');
     assert.equal((await calls()).filter(request => request.method === 'turn/start').length, 1);
+  });
+});
+
+test('/review starts a review turn with the chosen target and rejects an incomplete one', async () => {
+  await harness(async ({ lines, send, until, calls }) => {
+    send({ type: 'review', target: { type: 'baseBranch', branch: '' } });
+    await until(xs => xs.some(event => event.type === 'notice' && /Usage: \/review/.test(event.message)));
+    send({ type: 'review', target: { type: 'baseBranch', branch: 'main' } });
+    await until(xs => xs.some(event => event.type === 'turn.end'));
+    const request = (await calls()).find(call => call.method === 'review/start');
+    assert.deepEqual(request.params.target, { type: 'baseBranch', branch: 'main' });
+    assert.equal(request.params.delivery, 'inline');
+    assert.equal((await calls()).filter(call => call.method === 'review/start').length, 1);
+  });
+});
+
+test('permission profiles list, and choosing one resumes the thread with default_permissions and no forced sandbox', async () => {
+  await harness(async ({ lines, send, until, calls }) => {
+    await until(xs => xs.some(event => event.type === 'permissionProfiles'));
+    const list = lines.find(event => event.type === 'permissionProfiles');
+    assert.deepEqual(list.profiles.map(profile => [profile.id, profile.allowed]), [[':workspace', true], [':danger', false]]);
+    send({ type: 'setPermissionProfile', id: ':danger' });
+    await until(xs => xs.some(event => event.type === 'notice' && /not available/.test(event.message)));
+    send({ type: 'setPermissionProfile', id: ':workspace' });
+    await until(xs => xs.filter(event => event.type === 'permissionProfiles').length >= 2);
+    const resume = (await calls()).find(call => call.method === 'thread/resume');
+    assert.equal(resume.params.config.default_permissions, ':workspace');
+    assert.equal('sandbox' in resume.params, false);
+    send({ type: 'user', text: 'hello' });
+    await until(xs => xs.some(event => event.type === 'turn.end' && !event.local));
+    assert.equal('sandboxPolicy' in (await calls()).find(call => call.method === 'turn/start').params, false);
+  });
+});
+
+test('goal controls set, pause, resume and clear through thread/goal', async () => {
+  await harness(async ({ lines, send, until, calls }) => {
+    send({ type: 'goal', action: 'set', objective: 'Ship it', tokenBudget: 5000 });
+    await until(xs => xs.some(event => event.surface === 'goal' && event.data?.goal?.objective === 'Ship it'));
+    send({ type: 'goal', action: 'pause' });
+    send({ type: 'goal', action: 'clear' });
+    await until(async () => true);
+    for (let i = 0; i < 100 && !(await calls()).some(call => call.method === 'thread/goal/clear'); i++) await new Promise(resolve => setTimeout(resolve, 20));
+    const goals = (await calls()).filter(call => call.method.startsWith('thread/goal/'));
+    assert.deepEqual(goals.map(call => call.method), ['thread/goal/set', 'thread/goal/set', 'thread/goal/clear']);
+    assert.equal(goals[0].params.tokenBudget, 5000);
+    assert.equal(goals[1].params.status, 'paused');
+  });
+});
+
+test('usage history, import detect/run and marketplace add return results to the page', async () => {
+  await harness(async ({ lines, send, until, calls }) => {
+    send({ type: 'usageHistory' });
+    await until(xs => xs.some(event => event.type === 'usageHistory'));
+    const usage = lines.find(event => event.type === 'usageHistory');
+    assert.equal(usage.summary.lifetimeTokens, 1234);
+    assert.deepEqual(usage.daily, [{ date: '2026-10-05', tokens: 99 }]);
+    send({ type: 'importDetect' });
+    await until(xs => xs.some(event => event.type === 'import' && event.stage === 'detected'));
+    const detected = lines.find(event => event.type === 'import' && event.stage === 'detected');
+    assert.deepEqual(detected.items.map(item => item.itemType), ['SKILLS', 'HOOKS']);
+    send({ type: 'importRun', ids: [0] });
+    await until(xs => xs.some(event => event.type === 'import' && event.stage === 'done'));
+    const run = (await calls()).find(call => call.method === 'externalAgentConfig/import');
+    assert.deepEqual(run.params.migrationItems.map(item => item.itemType), ['SKILLS']);
+    assert.deepEqual(lines.find(event => event.type === 'import' && event.stage === 'done').results, [{ itemType: 'SKILLS', ok: 2, failed: 0 }]);
+    send({ type: 'marketplace', action: 'add', source: 'github.com/acme/plugins' });
+    await until(xs => xs.some(event => event.type === 'notice' && /Added marketplace team/.test(event.message)));
+  });
+});
+
+test('guardian reviews report risk and rationale, and a denied action can be approved by the user', async () => {
+  await harness(async ({ lines, send, until, calls }) => {
+    send({ type: 'user', text: 'guardian' });
+    await until(xs => xs.some(event => event.type === 'guardian' && event.canOverride));
+    const denied = lines.find(event => event.type === 'guardian' && event.canOverride);
+    assert.equal(denied.riskLevel, 'high');
+    assert.match(denied.rationale, /outside the workspace/);
+    assert.match(denied.ownerId, /cmd-1/);
+    send({ type: 'guardianOverride', reviewId: 'rev-1' });
+    await until(xs => xs.some(event => event.type === 'notice' && /Approved the denied action/.test(event.message)));
+    const call = (await calls()).find(entry => entry.method === 'thread/approveGuardianDeniedAction');
+    assert.equal(call.params.event.reviewId, 'rev-1');
   });
 });
