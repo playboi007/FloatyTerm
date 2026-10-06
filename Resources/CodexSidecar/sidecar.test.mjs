@@ -166,6 +166,7 @@ rl.on('line', line => {
     case 'thread/items/list': respond(request, { data: [], nextCursor: null, backwardsCursor: null }); return;
     case 'thread/compact/start': respond(request, {}); notify('thread/compacted', { threadId: request.params.threadId, turnId: 'compact-turn' }); return;
     case 'fuzzyFileSearch': respond(request, { files: [{ file_name: 'a.dart', path: 'lib/a.dart', root: process.cwd(), match_type: 'file', score: 5, indices: null }, { file_name: 'b.dart', path: 'lib/b.dart', root: process.cwd(), match_type: 'file', score: 9, indices: null }] }); return;
+    case 'turn/steer': respond(request, { turnId: request.params.expectedTurnId }); return;
     case 'thread/name/set': respond(request, {}); return;
     case 'skills/list': respond(request, { data: [{ cwd: process.cwd(), errors: [], skills: [
       { name: 'imagegen', description: 'Make images', enabled: true, path: '/skills/imagegen/SKILL.md', scope: 'user', interface: { shortDescription: 'Generate images' } },
@@ -247,7 +248,7 @@ test('initializes persistent app-server, exposes model catalog by selectable slu
     assert.equal(capabilities.agent, 'codex');
     assert.equal(capabilities.features.approvals, true);
     assert.equal(capabilities.features.history, true);
-    assert.equal(capabilities.features.midTurnInput, false);
+    assert.equal(capabilities.features.midTurnInput, true);
     assert.deepEqual(capabilities.permissionModes, ['default', 'plan']);
     const luna = capabilities.models.find(model => model.value === 'gpt-6-luna');
     assert.equal(luna.resolvedModel, 'gpt-6-luna');
@@ -491,5 +492,19 @@ test('@file suggestions, /rename and ! shell commands use app-server search, thr
     await until(xs => xs.some(event => event.type === 'shell' && event.done));
     assert.ok(lines.some(event => event.type === 'shell' && event.stream === 'stdout' && /hello/.test(event.chunk)));
     assert.equal(lines.find(event => event.type === 'shell' && event.done).code, 0);
+  });
+});
+
+test('a message sent while a turn runs joins it through turn/steer', async () => {
+  await harness(async ({ lines, send, until, calls }) => {
+    send({ type: 'user', text: 'hang' });
+    await until(xs => xs.some(event => event.type === 'turn.start'));
+    send({ type: 'user', text: 'also check the tests' });
+    await until(async () => true);
+    for (let i = 0; i < 100 && !(await calls()).some(request => request.method === 'turn/steer'); i++) await new Promise(resolve => setTimeout(resolve, 20));
+    const steer = (await calls()).find(request => request.method === 'turn/steer');
+    assert.equal(steer.params.expectedTurnId, 'turn-1');
+    assert.equal(steer.params.input[0].text, 'also check the tests');
+    assert.equal((await calls()).filter(request => request.method === 'turn/start').length, 1);
   });
 });

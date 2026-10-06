@@ -28,7 +28,7 @@
     permissionMode: true, thinking: true, usage: true, git: true, tui: true, slashCommands: true, midTurnInput: true,
     mentions: true, images: true, rename: true, rewind: true, btw: true, shell: true, promptHistory: true, background: true, agentTalk: true, priority: true, quietContext: true };
   const CODEX_FEATURES = { approvals: true, fork: true, history: true, models: true, effort: true,
-    permissionMode: true, thinking: true, usage: true, git: true, tui: true, slashCommands: true, midTurnInput: false,
+    permissionMode: true, thinking: true, usage: true, git: true, tui: true, slashCommands: true, midTurnInput: true,
     mentions: true, images: true, rename: true, shell: true };
   let agent = 'claude';
   let features = { ...CLAUDE_FEATURES };

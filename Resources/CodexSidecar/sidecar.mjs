@@ -36,7 +36,7 @@ const COMMANDS = [
 const featureSet = {
   approvals: true, fork: true, history: true, models: true, effort: true,
   permissionMode: true, thinking: true, usage: true, git: true, tui: true,
-  slashCommands: true, midTurnInput: false, images: true, mentions: true, rename: true, shell: true,
+  slashCommands: true, midTurnInput: true, images: true, mentions: true, rename: true, shell: true,
 };
 
 const output = value => {
@@ -573,10 +573,17 @@ class CodexBridge {
   async user(text, images = []) {
     if (!this.started || !this.threadId) { this.notice('error', 'Codex app-server is not ready.', true); return; }
     if (this.transitioning) { this.notice('info', 'Wait for the conversation operation to finish.'); return; }
-    if (this.active) { this.notice('info', 'Codex is already working on a turn.'); return; }
     const pictures = (Array.isArray(images) ? images : []).filter(image => image && /^image\/(png|jpeg|gif|webp)$/.test(image.mediaType) && typeof image.data === 'string' && image.data)
       .map(image => ({ type: 'image', url: `data:${image.mediaType};base64,${image.data}` }));
     if (typeof text !== 'string' || (!text.trim() && !pictures.length)) return;
+    const input = [...pictures, ...(text.trim() ? [{ type: 'text', text, text_elements: [] }] : []), ...this.mentionInputs(text)];
+    if (this.active) {
+      // A message while it works joins the running turn (turn/steer), as in the Codex TUI.
+      if (!this.active.id || this.active.ended) { this.notice('info', 'Codex is still starting this turn. Try again in a moment.'); return; }
+      try { await this.rpc.request('turn/steer', { threadId: this.threadId, expectedTurnId: this.active.id, input, clientUserMessageId: randomUUID() }); }
+      catch (error) { this.notice('warn', `Could not add to this turn: ${plainError(error)}`, false, { type: 'turn/steer.error' }); }
+      return;
+    }
     this.items.clear();
     const turn = { id: null, started: false, ended: false, interruptRequested: false, usage: null };
     this.active = turn;
@@ -586,7 +593,7 @@ class CodexBridge {
       const summary = this.thinkingOn ? (this.configSummary && this.configSummary !== 'none' ? this.configSummary : 'detailed') : 'none';
       const params = {
         threadId: this.threadId,
-        input: [...pictures, ...(text.trim() ? [{ type: 'text', text, text_elements: [] }] : []), ...this.mentionInputs(text)],
+        input,
         sandboxPolicy: { type: 'workspaceWrite', writableRoots: [], networkAccess: false, excludeTmpdirEnvVar: false, excludeSlashTmp: false },
         approvalPolicy: 'on-request',
         ...(this.permissionMode === 'plan' ? { sandboxPolicy: { type: 'readOnly', networkAccess: false } } : {}),
