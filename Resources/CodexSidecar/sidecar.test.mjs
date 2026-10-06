@@ -54,6 +54,13 @@ function doTurn(request) {
   notify('turn/started', { threadId: request.params.threadId, turn: started });
   notify('item/started', { threadId: request.params.threadId, turnId: currentTurn,
     item: { type: 'agentMessage', id: 'message-' + currentTurn, text: '' }, startedAtMs: Date.now() });
+  if (text === 'spawn') {
+    const call = status => ({ type: 'collabAgentToolCall', id: 'collab-1', tool: 'spawnAgent', status, senderThreadId: request.params.threadId,
+      receiverThreadIds: ['child-1'], prompt: 'Review the diff', model: null, reasoningEffort: null,
+      agentsStates: status === 'inProgress' ? { 'child-1': { status: 'running', message: null } } : { 'child-1': { status: 'completed', message: 'Looks fine' } } });
+    notify('item/started', { threadId: request.params.threadId, turnId: currentTurn, item: call('inProgress'), startedAtMs: Date.now() });
+    notify('item/completed', { threadId: request.params.threadId, turnId: currentTurn, item: call('completed'), completedAtMs: Date.now() });
+  }
   if (text === 'reasoning') {
     notify('item/reasoning/textDelta', { threadId: request.params.threadId, turnId: currentTurn, itemId: 'reasoning-1', delta: 'PRIVATE_RAW_REASONING' });
     notify('item/reasoning/summaryTextDelta', { threadId: request.params.threadId, turnId: currentTurn, itemId: 'reasoning-1', summaryIndex: 0, delta: 'Public summary' });
@@ -450,5 +457,20 @@ test('catalog lists enabled skills, apps, plugins and MCP servers; $mentions and
       { type: 'mention', name: 'Google Drive', path: 'app://connector_1' },
       { type: 'mention', name: 'GitHub', path: 'plugin://github@official' },
     ]);
+  });
+});
+
+test('child agents become task.start and task.end events joined to the Agent tool row', async () => {
+  await harness(async ({ lines, send, until }) => {
+    send({ type: 'user', text: 'spawn' });
+    await until(xs => xs.some(event => event.type === 'task.end'));
+    const start = lines.find(event => event.type === 'task.start');
+    const end = lines.find(event => event.type === 'task.end');
+    assert.equal(start.taskId, 'child-1');
+    assert.equal(start.description, 'Review the diff');
+    assert.equal(start.toolId, end.toolId);
+    assert.equal(end.status, 'completed');
+    assert.equal(end.summary, 'Looks fine');
+    assert.equal(lines.filter(event => event.type === 'task.start').length, 1);
   });
 });

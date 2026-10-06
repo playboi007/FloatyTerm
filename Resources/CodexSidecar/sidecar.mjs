@@ -215,6 +215,7 @@ class CodexBridge {
     this.approvals = new Map();
     this.items = new Map();
     this.childParents = new Map();
+    this.tasks = new Map();
     this.processStreams = new Map();
     this.hostCalls = new Map();
     this.hostRequests = new Map();
@@ -390,7 +391,7 @@ class CodexBridge {
   applyThread(response, { emitSession = true } = {}) {
     const thread = response?.thread;
     if (!thread?.id) throw new Error('Codex app-server did not return a thread id.');
-    if (this.threadId !== thread.id) { this.cancelHostTools('Conversation changed.'); this.items.clear(); this.childParents.clear(); this.processStreams.clear(); this.latestUsage = null; this.cancelApprovals(); }
+    if (this.threadId !== thread.id) { this.cancelHostTools('Conversation changed.'); this.items.clear(); this.childParents.clear(); this.tasks.clear(); this.processStreams.clear(); this.latestUsage = null; this.cancelApprovals(); }
     this.thread = thread;
     this.threadId = thread.id;
     if (response.model) {
@@ -936,6 +937,25 @@ class CodexBridge {
     this.approvals.clear();
   }
 
+  /** Child agents as tasks: the page draws their avatars and panel from task.start, task.progress and task.end. */
+  emitTasks(item, state, raw) {
+    const ended = { completed: 'completed', errored: 'failed', interrupted: 'stopped', shutdown: 'stopped', notFound: 'failed' };
+    for (const child of item.receiverThreadIds || []) {
+      const agent = item.agentsStates?.[child] || {};
+      const task = this.tasks.get(child) || { started: false, ended: false };
+      this.tasks.set(child, task);
+      const base = { taskId: child, toolId: state.id, description: String(item.prompt || '').replace(/\s+/g, ' ').slice(0, 160) };
+      if (!task.started) { task.started = true; this.emit('task.start', { ...base, taskType: 'agent', subagentType: item.tool === 'spawnAgent' ? 'agent' : String(item.tool || 'agent') }, raw); }
+      if (agent.status && ended[agent.status] && !task.ended) {
+        task.ended = true;
+        this.emit('task.end', { ...base, status: ended[agent.status], summary: agent.message || '' }, raw);
+      } else if (!task.ended && agent.message && agent.message !== task.message) {
+        task.message = agent.message;
+        this.emit('task.progress', { ...base, summary: agent.message }, raw);
+      }
+    }
+  }
+
   ensureItem(params, type, raw) {
     const { item, threadId, turnId } = params;
     if (!item?.id) return null;
@@ -963,6 +983,7 @@ class CodexBridge {
     if (item.type === 'userMessage') return; // The optimistic prompt already owns this user message.
     if (item.type === 'collabAgentToolCall') {
       for (const child of item.receiverThreadIds || []) this.childParents.set(child, state.id);
+      this.emitTasks(item, state, raw);
     }
     if (item.type === 'imageView' || (item.type === 'imageGeneration' && phase === 'completed')) void this.emitImage(item, state, raw);
     if (['mcpToolCall','dynamicToolCall','webSearch','collabAgentToolCall','functionCallOutput','hookPrompt','enteredReviewMode','exitedReviewMode'].includes(item.type)) this.surfaceEvent(item.type, { ...params, item: safePayload(item) }, { method: item.type });
