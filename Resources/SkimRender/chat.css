@@ -903,3 +903,14 @@ body.tools-inline .ck-tray, body.tools-inline .ck-run-mark { display: none; }
   .ck-av[data-s="running"] .ck-av-ring, .ck-av[data-s="waiting"], .ck-av-btn.is-new, .ck-ahc.is-in .ck-ahc-body > * { animation: none; }
   .ck-av-btn { transition: none; }
 }
+
+/* Codex: guardian review verdicts and the import card */
+.ck-guardian { margin:8px 0; padding:6px 10px; border:1px solid var(--line-3); border-left:3px solid var(--muted); border-radius:6px; font:12px var(--sans); color:var(--text); }
+.ck-guardian[data-risk="low"] { border-left-color:var(--ok, #5fb878); }
+.ck-guardian[data-risk="medium"] { border-left-color:var(--warn); }
+.ck-guardian[data-risk="high"], .ck-guardian[data-risk="critical"], .ck-guardian[data-status="denied"] { border-left-color:var(--bad); }
+.ck-guardian-k { font-weight:600; } .ck-guardian-why { color:var(--muted); }
+.ck-guardian button, .ck-import button { margin:0 6px 0 8px; padding:4px 9px; border:1px solid var(--line-3); border-radius:6px; background:var(--surface-2); color:var(--text); font:12px var(--sans); cursor:pointer; }
+.ck-guardian button:hover, .ck-import button:hover { border-color:var(--accent); }
+.ck-import { margin:10px 0; padding:10px 12px; border:1px solid var(--line-3); border-radius:8px; font:13px var(--sans); }
+.ck-import-row { display:block; margin:4px 0; }

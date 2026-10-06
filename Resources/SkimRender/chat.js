@@ -42,7 +42,9 @@
     info: {},               // from init: Claude Code version, MCP servers, output style
     sessions: null,         // { at, list }: the folder's conversations, for /resume
     agents: [],             // subagents the session offers, for @agent-… mentions
-    catalog: { skills: [], apps: [], plugins: [], mcp: [] }   // Codex: skills, apps, plugins and MCP servers
+    catalog: { skills: [], apps: [], plugins: [], mcp: [] },  // Codex: skills, apps, plugins and MCP servers
+    permissionProfiles: [], permissionProfileActive: null,    // Codex: named permission profiles
+    usageHistory: null, guardianViews: new Map(), importView: null
   };
 
   /**
@@ -1290,7 +1292,7 @@
     const [name, ...extra] = (modelLabel(S.model) || 'Model').split(' · ');
     if (S.effort) extra.push(S.effort);
     modelEl.firstChild.replaceChildren(name, extra.length ? h('span', { class: 'ck-model-x', text: ' · ' + extra.join(' · ') }) : '');
-    modeBtn.firstChild.textContent = agent === 'codex' ? (CODEX_MODES.find(m => m.mode === S.mode)?.label || S.mode) : MODE_LABEL[S.mode] || S.mode;
+    modeBtn.firstChild.textContent = agent === 'codex' ? (S.permissionProfileActive || CODEX_MODES.find(m => m.mode === S.mode)?.label || S.mode) : MODE_LABEL[S.mode] || S.mode;
     modeBtn.dataset.mode = S.mode;
     const pct = S.ctx && S.ctx.maxTokens ? Math.round(S.ctx.totalTokens / S.ctx.maxTokens * 100) : null;
     costEl.firstChild.textContent = [agent === 'codex' ? (S.tokens ? fmtTok(S.tokens.totalTokens) + ' tokens' : null) : S.cost ? '$' + S.cost.toFixed(2) : null, pct != null ? pct + '%' : null].filter(Boolean).join(' · ') || 'Usage';
@@ -1443,10 +1445,14 @@
     modeBtn.classList.add('is-open');
     openPop('mode', modeBtn, () => ({
       head: h('span', null, 'Permission mode', h('span', { class: 'ck-pop-head-k', text: '⇧Tab cycles' })),
-      items: modes().map(m => ({
-        title: h('span', { class: 'ck-mode-dot', 'data-mode': m.mode }, m.label), desc: m.desc, current: m.mode === S.mode,
-        run: () => { setMode(m.mode); closePop(); input.focus(); }
-      }))
+      items: [...modes().map(m => ({
+        title: h('span', { class: 'ck-mode-dot', 'data-mode': m.mode }, m.label), desc: m.desc, current: m.mode === S.mode && !S.permissionProfileActive,
+        run: () => { if (S.permissionProfileActive) post({ type: 'setPermissionProfile', id: null }); setMode(m.mode); closePop(); input.focus(); }
+      })), ...(agent === 'codex' ? S.permissionProfiles.map(pr => ({
+        title: h('span', { class: pr.allowed ? 'ck-mode-dot' : 'ck-surface-muted', text: pr.id }), desc: pr.allowed ? (pr.description || 'Permission profile') : 'Not allowed by your policy',
+        current: S.permissionProfileActive === pr.id,
+        run: () => { if (!pr.allowed) return; post({ type: 'setPermissionProfile', id: pr.id }); closePop(); input.focus(); }
+      })) : [])]
     }));
   }
 
@@ -1479,7 +1485,7 @@
     const was = !usagePanel.hidden;
     costEl.classList.toggle('is-open', show);
     closePop();
-    if (show) { requestUsage(true); paintUsage(); }
+    if (show) { requestUsage(true); if (agent === 'codex') post({ type: 'usageHistory' }); paintUsage(); }
     if (show && !was) expand(usagePanel, () => { usagePanel.hidden = false; });
     else if (!show && was) collapse(usagePanel, () => { usagePanel.hidden = true; });
     stick();
@@ -1542,7 +1548,15 @@
         h('div', { class: 'ck-u-line' }, h('span', { text: l.label || LIMIT_LABEL[l.kind] || l.kind }), h('span', { text: Math.round(l.percent) + '%' })),
         meter(l.percent), l.resets_at ? h('div', { class: 'ck-u-line', text: resetsIn(l.resets_at) }) : null))
         : h('div', { class: 'ck-u-line', text: S.usageUnavailable || 'No account limits reported yet' }));
-    usagePanel.replaceChildren(session, context, plan);
+    const hist = S.usageHistory, sum = hist && hist.summary || {};
+    const history = h('div', { class: 'ck-u-col' }, h('div', { class: 'ck-u-k', text: 'History' }),
+      hist && !hist.error && (sum.lifetimeTokens != null || (hist.daily || []).length) ? [
+        sum.lifetimeTokens != null ? h('div', { class: 'ck-u-big', text: fmtTok(sum.lifetimeTokens) }) : null,
+        h('div', { class: 'ck-u-line', text: [sum.peakDailyTokens != null ? 'peak day ' + fmtTok(sum.peakDailyTokens) : null, sum.currentStreakDays != null ? sum.currentStreakDays + '-day streak' : null,
+          sum.longestRunningTurnSec != null ? 'longest turn ' + Math.round(sum.longestRunningTurnSec / 60) + ' min' : null].filter(Boolean).join(' · ') || 'Lifetime tokens' }),
+        ...(hist.daily || []).slice(-7).map(d => h('div', { class: 'ck-u-line' }, h('span', { text: d.date }), h('span', { text: fmtTok(d.tokens) })))]
+        : h('div', { class: 'ck-u-line', text: hist && hist.error ? 'History unavailable: ' + hist.error : 'Loading history…' }));
+    usagePanel.replaceChildren(session, context, plan, history);
   }
 
   // ── slash commands ─────────────────────────────────────────────────────
@@ -1568,8 +1582,12 @@
     { name: 'fork', description: 'Open a side chat from this conversation' },
     { name: 'skills', description: 'List the skills you can call with $name' },
     { name: 'mcp', description: 'MCP servers and their tools' },
-    { name: 'plugins', description: 'Installed plugins' },
+    { name: 'plugins', description: 'Installed plugins; install, uninstall or share one', argumentHint: '[install <name> | uninstall <id> | share <path> [private|internal|public]]' },
     { name: 'apps', description: 'Connected apps (use $name to call one)' },
+    { name: 'review', description: 'Review code changes with Codex', argumentHint: '[uncommitted|base|commit] [branch or sha] — or your own instructions' },
+    { name: 'goal', description: 'Set, pause, resume or clear this conversation’s goal', argumentHint: '[objective] [--budget <tokens>] | pause | resume | clear' },
+    { name: 'import', description: 'Import skills, hooks, MCP servers and more from another agent’s setup', argumentHint: '[source]' },
+    { name: 'marketplace', description: 'Add, remove or upgrade plugin marketplaces', argumentHint: '[add <source> | remove <name> | upgrade [name]]' },
     { name: 'help', description: 'Show the available commands' }
   ].map(c => ({ ...c, local: true }));
   const HIDDEN_CMD = c => c.name.startsWith('__') || /^\((removed)\)|^Renamed to /.test(c.description || '') || S.terminalCmds.has(c.name);
@@ -1704,6 +1722,33 @@
     };
   }
 
+  /** /review uncommitted · /review base main · /review commit abc123 · /review <instructions> */
+  function startReview(arg) {
+    const [kind, ...rest] = arg.split(/\s+/), value = rest.join(' ');
+    const target = !arg || kind === 'uncommitted' ? { type: 'uncommittedChanges' }
+      : kind === 'base' ? { type: 'baseBranch', branch: value }
+      : kind === 'commit' ? { type: 'commit', sha: value }
+      : { type: 'custom', instructions: arg };
+    if (S.busy) { notice('info', 'Wait for the current turn to finish before starting a review.'); return; }
+    const label = target.type === 'uncommittedChanges' ? 'uncommitted changes' : target.type === 'baseBranch' ? 'changes against ' + (target.branch || '…')
+      : target.type === 'commit' ? 'commit ' + (target.sha || '…').slice(0, 10) : 'custom instructions';
+    if ((target.type === 'baseBranch' && !target.branch) || (target.type === 'commit' && !target.sha)) { notice('info', 'Usage: /review base <branch> · /review commit <sha>'); return; }
+    newTurn('/review ' + (arg || 'uncommitted'), [], []);
+    S.busy = true;
+    post({ type: 'review', target });
+    updateStatus();
+  }
+
+  /** /goal <objective> [--budget N] · pause · resume · clear · (nothing: show it) */
+  function runGoal(arg) {
+    const word = arg.toLowerCase();
+    if (['pause', 'resume', 'clear'].includes(word)) { post({ type: 'goal', action: word }); return; }
+    if (!arg) { post({ type: 'goal', action: 'get' }); return; }
+    const m = arg.match(/^(.*?)\s*--budget\s+(\d+(?:\.\d+)?)([km]?)\s*$/i);
+    const mult = m && m[3] ? (m[3].toLowerCase() === 'm' ? 1e6 : 1e3) : 1;
+    post({ type: 'goal', action: 'set', objective: m ? m[1] : arg, ...(m ? { tokenBudget: Number(m[2]) * mult } : {}) });
+  }
+
   /** Slash commands the page handles itself; true when `text` was one of them. */
   function runLocal(text) {
     if (!supports('slashCommands')) return false;
@@ -1715,7 +1760,22 @@
     if (agent === 'codex') {
       if (name === 'help') { localOutput(commandList().map(c => `- **/${c.name}** — ${c.description}`).join('\n')); return true; }
       if (name === 'status') { toggleUsage(true); openMoreMenu(); return true; }
+      if (name === 'plugins' && /^(install|uninstall|share)\b/i.test(arg)) {
+        const [action, ...rest] = arg.split(/\s+/);
+        const vis = ['private', 'internal', 'public'].includes(rest[rest.length - 1]) ? rest.pop() : undefined;
+        post({ type: 'marketplace', action: action.toLowerCase(), name: rest.join(' '), path: rest.join(' '), ...(vis ? { visibility: vis } : {}) });
+        return true;
+      }
       if (['skills', 'mcp', 'plugins', 'apps'].includes(name)) { post({ type: 'catalog' }); localOutput(catalogText(name)); return true; }
+      if (name === 'review') { startReview(arg); return true; }
+      if (name === 'goal') { runGoal(arg); return true; }
+      if (name === 'import') { post({ type: 'importDetect', ...(arg ? { source: arg } : {}) }); notice('info', 'Looking for other agents’ settings…'); return true; }
+      if (name === 'marketplace') {
+        const [action, ...rest] = arg.split(/\s+/);
+        if (!['add', 'remove', 'upgrade'].includes((action || '').toLowerCase())) { notice('info', 'Usage: /marketplace add <source> · remove <name> · upgrade [name]'); return true; }
+        post({ type: 'marketplace', action: action.toLowerCase(), source: rest.join(' '), name: rest.join(' ') });
+        return true;
+      }
       if (name === 'permissions') { openModeMenu(); return true; }
       if (name === 'fork') { newSide(); return true; }
       if (name === 'new' || name === 'compact') {
@@ -4216,6 +4276,46 @@
     stick();
   }
 
+  /** Guardian's verdict on an approval: a risk badge and its reason; a denial can be approved anyway. */
+  function paintGuardian(e) {
+    let view = S.guardianViews.get(e.reviewId);
+    if (!view) {
+      view = h('div', { class: 'ck-guardian' }); S.guardianViews.set(e.reviewId, view);
+      const row = e.ownerId ? S.rows.get(e.ownerId) : null;
+      (row ? row.detail : turn().body).append(view);
+    }
+    const word = { inProgress: 'Reviewing', approved: 'Approved', denied: 'Denied', timedOut: 'Timed out', aborted: 'Cancelled' }[e.status] || e.status;
+    if (e.canOverride && view.parentNode !== turn().body) turn().body.append(view);   // a denial should not hide in a closed row
+    view.dataset.risk = e.riskLevel || 'none'; view.dataset.status = e.status;
+    view.replaceChildren(h('span', { class: 'ck-guardian-k', text: 'Guardian · ' + word + (e.riskLevel ? ' · ' + e.riskLevel + ' risk' : '') }),
+      e.rationale ? h('span', { class: 'ck-guardian-why', text: ' — ' + e.rationale }) : null,
+      e.canOverride ? h('button', { type: 'button', text: 'Approve anyway', onclick: () => { post({ type: 'guardianOverride', reviewId: e.reviewId }); view.dataset.status = 'overridden'; } }) : null);
+    stick();
+  }
+
+  /** /import: what was found, with a box for each; then the outcome. */
+  function paintImport(e) {
+    if (e.stage === 'error') { notice('warn', 'Import: ' + e.message); return; }
+    if (e.stage === 'started') { notice('info', `Importing ${e.count} ${e.count === 1 ? 'item' : 'items'}…`); return; }
+    if (e.stage === 'progress' || e.stage === 'done') {
+      const parts = (e.results || []).map(r => `${r.itemType.toLowerCase().replace(/_/g, ' ')}: ${r.ok} done${r.failed ? ', ' + r.failed + ' failed' : ''}`);
+      if (e.stage === 'done') { notice(parts.some(x => /failed/.test(x)) ? 'warn' : 'info', 'Import finished' + (parts.length ? ' — ' + parts.join(' · ') : '')); post({ type: 'catalog' }); }
+      return;
+    }
+    if (!(e.items || []).length) { notice('info', 'No other agent settings found to import.'); return; }
+    const boxes = e.items.map(it => h('label', { class: 'ck-import-row' }, h('input', { type: 'checkbox', checked: true, 'data-id': String(it.id) }),
+      h('span', { text: ' ' + it.description + ' ' }), h('span', { class: 'ck-surface-muted', text: it.itemType.toLowerCase().replace(/_/g, ' ') + (it.cwd ? ' · ' + it.cwd : ' · home') })));
+    const card = h('div', { class: 'ck-import' }, h('div', { class: 'ck-surface-title', text: 'Found settings from another agent' }), ...boxes,
+      h('button', { type: 'button', text: 'Import selected', onclick: () => {
+        const ids = [...card.querySelectorAll('input:checked')].map(i => Number(i.dataset.id));
+        if (!ids.length) return;
+        post({ type: 'importRun', ids, ...(e.source ? { source: e.source } : {}) }); card.remove();
+      } }),
+      h('button', { type: 'button', text: 'Dismiss', onclick: () => card.remove() }));
+    if (S.importView) S.importView.remove();
+    S.importView = card; turn().body.append(card); stick();
+  }
+
   function paintMedia(e) {
     let view = S.mediaViews.get(e.id);
     if (!view) {
@@ -4273,6 +4373,10 @@
       body.replaceChildren(...[h('p', { class: 'ck-surface-title', text: goal.objective || 'Goal' }),
         h('p', { class: 'ck-surface-muted', text: `${goal.status || 'active'} · ${goal.tokensUsed || 0} tokens · ${goal.timeUsedSeconds || 0}s` }),
         goal.tokenBudget > 0 ? h('progress', { value: goal.tokensUsed || 0, max: goal.tokenBudget, 'aria-label': 'Goal token budget' }) : null,
+        agent === 'codex' ? h('div', null,
+          goal.status === 'paused' ? h('button', { type: 'button', text: 'Resume', onclick: () => post({ type: 'goal', action: 'resume' }) })
+            : goal.status === 'active' ? h('button', { type: 'button', text: 'Pause', onclick: () => post({ type: 'goal', action: 'pause' }) }) : null,
+          h('button', { type: 'button', text: 'Clear', onclick: () => post({ type: 'goal', action: 'clear' }) })) : null,
         eventValue({ tokenBudget: goal.tokenBudget, tokensUsed: goal.tokensUsed })].filter(Boolean));
     } else if (e.surface === 'queue' && Array.isArray(data.data)) {
       body.replaceChildren(...data.data.map(item => h('div', { class: 'ck-queue-item' }, h('p', { text: (item.input || []).filter(p => p.type === 'text').map(p => p.text).join('\n') || 'Queued message' }),
@@ -4487,6 +4591,10 @@
       case 'tasks.background': S.bgTasks = e.tasks || []; updateStatus(); break;
       case 'thinking.tokens': onThinkTokens(e); break;
       case 'files': onFiles(e); break;
+      case 'permissionProfiles': SHARED.permissionProfiles = e.profiles || []; SHARED.permissionProfileActive = e.active || null; paintMeta(); if (P.kind === 'mode') refreshPop(); break;
+      case 'usageHistory': SHARED.usageHistory = e; if (!usagePanel.hidden) paintUsage(); break;
+      case 'guardian': paintGuardian(e); break;
+      case 'import': paintImport(e); break;
       case 'catalog': SHARED.catalog = { skills: e.skills || [], apps: e.apps || [], plugins: e.plugins || [], mcp: e.mcp || [] }; if (P.kind === 'mention' && P.build === buildDollar) refreshPop(); break;
       case 'unknown': showUnknown(e); break;
       case 'local.output': localOutput(e.content ?? e.text); break;
