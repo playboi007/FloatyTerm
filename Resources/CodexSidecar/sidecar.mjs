@@ -15,6 +15,7 @@ const STDERR_BYTES = 4000;
 const REQUEST_TIMEOUT_MS = 30_000;
 const HISTORY_TURN_LIMIT = 300;
 const HISTORY_ITEM_LIMIT = 5000;
+const SHELL_MAX = 1 << 20;
 
 const COMMANDS = [
   ['model', 'Choose the Codex model', '[model]'],
@@ -35,7 +36,7 @@ const COMMANDS = [
 const featureSet = {
   approvals: true, fork: true, history: true, models: true, effort: true,
   permissionMode: true, thinking: true, usage: true, git: true, tui: true,
-  slashCommands: true, midTurnInput: false, images: true,
+  slashCommands: true, midTurnInput: false, images: true, mentions: true, rename: true, shell: true,
 };
 
 const output = value => {
@@ -216,6 +217,7 @@ class CodexBridge {
     this.items = new Map();
     this.childParents = new Map();
     this.tasks = new Map();
+    this.shells = new Map();
     this.processStreams = new Map();
     this.hostCalls = new Map();
     this.hostRequests = new Map();
@@ -469,6 +471,61 @@ class CodexBridge {
       unavailable: unavailable || null,
     };
     this.emit('usage', value, { type: 'usage.snapshot', source: unavailable ? 'unavailable' : 'app-server' });
+  }
+
+  /** @-mention suggestions: Codex's own fuzzy file search over the session folder. */
+  async files(message) {
+    const query = String(message.query || '');
+    let suggestions = [];
+    try {
+      const result = await this.rpc.request('fuzzyFileSearch', { query: query || '.', roots: [this.config.cwd] });
+      suggestions = (result?.files || []).slice().sort((a, b) => (b.score || 0) - (a.score || 0)).slice(0, 30).map(file => ({ path: file.path }));
+    } catch (error) { this.emit('files', { id: message.id, query, suggestions: [], error: plainError(error) }, { type: 'files.error' }); return; }
+    this.emit('files', { id: message.id, query, suggestions }, { type: 'files.result' });
+  }
+
+  async title() {
+    try {
+      const result = await this.rpc.request('thread/read', { threadId: this.threadId, includeTurns: false });
+      const thread = result?.thread || this.thread || {};
+      this.emit('title', { sessionId: this.threadId, title: thread.name || thread.preview || '', custom: !!thread.name }, { type: 'title.read' });
+    } catch (error) { this.notice('info', `Could not read the conversation name: ${plainError(error)}`); }
+  }
+
+  async rename(message) {
+    const name = String(message.title || '').trim();
+    if (!name || !this.threadId) return;
+    try {
+      await this.rpc.request('thread/name/set', { threadId: this.threadId, name });
+      if (this.thread) this.thread.name = name;
+      this.emit('title', { sessionId: this.threadId, title: name, custom: true }, { type: 'title.set' });
+    } catch (error) { this.notice('error', `Rename failed: ${plainError(error)}`); }
+  }
+
+  /** `!command` in the composer: runs in the session folder; output streams back to the page. */
+  runShell(message) {
+    const id = String(message.id || ''), command = String(message.command || '').trim();
+    const done = fields => this.emit('shell', { id, done: true, code: null, ...fields }, { type: 'shell.done' });
+    if (!id || !command) return done({ error: 'no command' });
+    let child;
+    try { child = spawn(process.env.SHELL || '/bin/zsh', ['-lc', command], { cwd: this.config.cwd, env: process.env, stdio: ['ignore', 'pipe', 'pipe'], detached: true }); }
+    catch (error) { return done({ error: error.message }); }
+    this.shells.set(id, child);
+    const sizes = { stdout: 0, stderr: 0 };
+    for (const stream of ['stdout', 'stderr']) child[stream].on('data', data => {
+      if (sizes[stream] >= SHELL_MAX) return;
+      const chunk = data.toString('utf8').slice(0, SHELL_MAX - sizes[stream]);
+      sizes[stream] += chunk.length;
+      this.emit('shell', { id, stream, chunk }, { type: 'shell.output' });
+    });
+    child.on('error', error => { this.shells.delete(id); done({ error: error.message }); });
+    child.on('close', (code, signal) => { if (this.shells.delete(id)) done({ code, signal: signal || null }); });
+  }
+
+  killShell(id) {
+    const child = this.shells.get(String(id));
+    if (!child) return;
+    try { process.kill(-child.pid, 'SIGTERM'); } catch { try { child.kill('SIGTERM'); } catch { /* already gone */ } }
   }
 
   /** Skills, apps, plugins and MCP servers: what `/` and `$` offer, and what the integrations panel lists. */
@@ -1428,6 +1485,11 @@ class CodexBridge {
       switch (message.type) {
         case 'user': return this.user(message.text, message.images);
         case 'catalog': return this.loadCatalog();
+        case 'files': return this.files(message);
+        case 'title': return this.title();
+        case 'rename': return this.rename(message);
+        case 'shell': return this.runShell(message);
+        case 'shellKill': return this.killShell(message.id);
         case 'interrupt': return this.interruptActive();
         case 'permission': return this.permission(message);
         case 'realtimeStart': return this.startRealtime(message);

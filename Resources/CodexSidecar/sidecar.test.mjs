@@ -165,6 +165,8 @@ rl.on('line', line => {
     ], nextCursor: null, backwardsCursor: 'history-new' }); return;
     case 'thread/items/list': respond(request, { data: [], nextCursor: null, backwardsCursor: null }); return;
     case 'thread/compact/start': respond(request, {}); notify('thread/compacted', { threadId: request.params.threadId, turnId: 'compact-turn' }); return;
+    case 'fuzzyFileSearch': respond(request, { files: [{ file_name: 'a.dart', path: 'lib/a.dart', root: process.cwd(), match_type: 'file', score: 5, indices: null }, { file_name: 'b.dart', path: 'lib/b.dart', root: process.cwd(), match_type: 'file', score: 9, indices: null }] }); return;
+    case 'thread/name/set': respond(request, {}); return;
     case 'skills/list': respond(request, { data: [{ cwd: process.cwd(), errors: [], skills: [
       { name: 'imagegen', description: 'Make images', enabled: true, path: '/skills/imagegen/SKILL.md', scope: 'user', interface: { shortDescription: 'Generate images' } },
       { name: 'off', description: 'Disabled', enabled: false, path: '/skills/off/SKILL.md', scope: 'user' }] }] }); return;
@@ -472,5 +474,22 @@ test('child agents become task.start and task.end events joined to the Agent too
     assert.equal(end.status, 'completed');
     assert.equal(end.summary, 'Looks fine');
     assert.equal(lines.filter(event => event.type === 'task.start').length, 1);
+  });
+});
+
+test('@file suggestions, /rename and ! shell commands use app-server search, thread names and the session folder', async () => {
+  await harness(async ({ lines, send, until, calls }) => {
+    send({ type: 'files', id: 7, query: 'dart' });
+    await until(xs => xs.some(event => event.type === 'files'));
+    const files = lines.find(event => event.type === 'files');
+    assert.equal(files.id, 7);
+    assert.deepEqual(files.suggestions.map(file => file.path), ['lib/b.dart', 'lib/a.dart']);
+    send({ type: 'rename', title: 'Nice name' });
+    await until(xs => xs.some(event => event.type === 'title' && event.title === 'Nice name'));
+    assert.deepEqual((await calls()).find(request => request.method === 'thread/name/set').params.name, 'Nice name');
+    send({ type: 'shell', id: 'sh1', command: 'echo hello' });
+    await until(xs => xs.some(event => event.type === 'shell' && event.done));
+    assert.ok(lines.some(event => event.type === 'shell' && event.stream === 'stdout' && /hello/.test(event.chunk)));
+    assert.equal(lines.find(event => event.type === 'shell' && event.done).code, 0);
   });
 });

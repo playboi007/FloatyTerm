@@ -334,7 +334,7 @@ final class ClaudeChatController: NSObject, TabContent, WKNavigationDelegate {
                 }
                 dictation?.start()
             } else { dictation?.stop() }
-        case "git", "sessions", "promptHistory":
+        case "git", "sessions", "promptHistory", "catalog":
             // Any running sidecar can read git and the session list of the shared folder.
             (ch.sidecar.isRunning ? ch : channels.values.first { $0.sidecar.isRunning } ?? ch).sidecar.send(["type": type])
         case "resume":
