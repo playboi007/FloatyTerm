@@ -1,0 +1,143 @@
+<!DOCTYPE html>
+<html lang="en"><head>
+<meta charset="utf-8">
+<link rel="stylesheet" href="../fonts.css">
+<link rel="stylesheet" href="../skim.css">
+<link rel="stylesheet" href="../chat.css">
+</head><body>
+<script src="../vendor/marked.min.js"></script>
+<script src="../vendor/purify.min.js"></script>
+<script src="../vendor/highlight.min.js"></script>
+<script src="../skim-classify.js"></script>
+<script src="../skim-render.js"></script>
+<script src="../agent-events.js"></script>
+<script src="../agent-claude.js"></script>
+<script src="../agent-codex.js"></script>
+<script src="../chat.js"></script>
+<script>
+  // Subagent approvals: who asks, cards that outlive Main's turn, the bar in the agent's view,
+  // blocked calls (allow + retry / redo where you can approve / dismiss), and a quiet agent.
+  //   swift Resources/SkimRender/dev/snapshot.swift Resources/SkimRender/dev/approvals-check.html /tmp/approvals.png 760 2 900
+  //   ?blocked=1 stops with the blocked cards open for the picture.
+  window.__pending = true;
+  document.documentElement.classList.add('no-motion');
+  const posts = [];
+  window.webkit = { messageHandlers: { skim: { postMessage: m => { if (m.type === 'action') posts.push(m.action); return Promise.resolve(); } } } };
+  ClaudeChat.boot({ cwd: '/tmp/demo', home: '' });
+  ClaudeChat.receive([{ type: 'sdk', msg: { type: 'system', subtype: 'init', model: 'claude-opus-5-5', permissionMode: 'default', session_id: 's1', cwd: '/tmp/demo' } }]);
+  const $ = s => document.querySelector(s), $$ = s => [...document.querySelectorAll(s)];
+  const inp = $('.ck-input');
+  const frame = () => new Promise(r => requestAnimationFrame(() => setTimeout(r, 20)));
+  const type = v => { inp.focus(); inp.value = v; inp.dispatchEvent(new Event('input')); };
+  const key = (k, o = {}, el = inp) => el.dispatchEvent(new KeyboardEvent('keydown', { key: k, bubbles: true, cancelable: true, ...o }));
+  const of = t => posts.filter(p => p.type === t);
+  const sdk = msg => ({ type: 'sdk', msg });
+  const asst = (parent, id, content) => sdk({ type: 'assistant', uuid: 'u-' + id, parent_tool_use_id: parent, message: { id: 'm-' + id, model: 'claude-opus-5-5', content } });
+  const res = (parent, id, content, isError) => sdk({ type: 'user', parent_tool_use_id: parent, message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: id, content, ...(isError ? { is_error: true } : {}) }] } });
+  const sys = (subtype, f) => sdk({ type: 'system', subtype, ...f });
+  const q = new URLSearchParams(location.search);
+  let pass = 0;
+  const check = (name, ok, got) => { if (ok) pass++; else console.error('FAIL ' + name + (got !== undefined ? ' got: ' + JSON.stringify(got) : '')); };
+  const avs = () => $$('.ck-agents .ck-av-btn');
+  const avState = i => avs()[i].querySelector('.ck-av').dataset.s;
+  const openCards = () => $$('.ck-card:not(.is-resolved)');
+  const asker = c => c && c.querySelector('.ck-card-agent > span:last-child')?.textContent;
+  (async () => { try {
+    type('Test the app in the background. Use two agents.'); key('Enter');
+    ClaudeChat.receive([asst(null, 'a', [{ type: 'tool_use', id: 'tu-E', name: 'Agent', input: { description: 'Drive the Electron app', prompt: 'Run the matrix.', subagent_type: 'Explore', run_in_background: true } },
+      { type: 'tool_use', id: 'tu-G', name: 'Agent', input: { description: 'Read the results', prompt: 'Summarize.', subagent_type: 'general-purpose' } }]),
+      sys('task_started', { task_id: 'aE1', tool_use_id: 'tu-E', description: 'Drive the Electron app', task_type: 'local_agent', subagent_type: 'Explore', is_backgrounded: true }),
+      sys('task_started', { task_id: 'aG1', tool_use_id: 'tu-G', description: 'Read the results', task_type: 'local_agent', subagent_type: 'general-purpose' }),
+      res(null, 'tu-E', 'Async agent launched successfully. agentId: aE1'),
+      asst('tu-G', 'g1', [{ type: 'tool_use', id: 'tu-g1', name: 'Bash', input: { command: 'cat /tmp/bgelectron/RESULTS.md' } }])]);
+    await frame();
+    check('two agents', avs().length === 2, avs().length);
+
+    // 1. A foreground agent asks: the card names it, its avatar needs you.
+    ClaudeChat.receive([{ type: 'permission_request', id: 'p-g1', toolName: 'Bash', input: { command: 'cat /tmp/bgelectron/RESULTS.md' }, toolUseID: 'tu-g1', agentID: 'aG1', suggestions: [] }]);
+    await frame();
+    const gCard = openCards().pop();
+    check('foreground ask: card names the agent', asker(gCard) === 'general-purpose', gCard && gCard.textContent.slice(0, 120));
+    check('foreground ask: avatar needs you', avState(1) === 'waiting', avState(1));
+
+    // 2. A background agent asks for a call that is not in its streamed steps: matched by agent ID.
+    ClaudeChat.receive([{ type: 'permission_request', id: 'p-e1', toolName: 'Bash', input: { command: '/tmp/bgprobe/front 1119' }, toolUseID: 'tu-hidden', agentID: 'aE1', suggestions: [] }]);
+    await frame();
+    check('background ask: card names Explore', openCards().some(c => asker(c) === 'Explore'));
+    check('background ask: avatar needs you (by agent ID)', avState(0) === 'waiting', avState(0));
+
+    // 3. The foreground agent is answered and returns; Main's turn ends; the background agent's card stays open.
+    gCard.querySelector('.ck-opt').click();
+    check('Yes posts the permission', of('permission').pop()?.id === 'p-g1' && of('permission').pop()?.decision === 'allow');
+    ClaudeChat.receive([res('tu-G', 'tu-g1', 'B1 passed'), asst('tu-G', 'g2', [{ type: 'text', text: 'All rows passed.' }]),
+      sys('task_notification', { task_id: 'aG1', tool_use_id: 'tu-G', status: 'completed', summary: 'All rows passed.' }), res(null, 'tu-G', 'All rows passed.')]);
+    ClaudeChat.receive([asst(null, 'b', [{ type: 'text', text: 'Explore is still running.' }]),
+      sdk({ type: 'result', subtype: 'success', is_error: false, result: 'Both agents are running.', usage: { input_tokens: 1, output_tokens: 1 } })]);
+    await frame();
+    check('turn end leaves the background agent\'s card open', openCards().length === 1 && asker(openCards()[0]) === 'Explore', openCards().length);
+
+    // 4. The agent's view says it waits, and Review goes to the card.
+    avs()[0].click();
+    await frame();
+    const panel = $('.ck-subpanel');
+    const bar = panel.querySelector('.ck-sub-ask');
+    check('agent view: the waiting bar', !panel.hidden && bar && bar.textContent.includes('Waiting for your approval') && bar.textContent.includes('/tmp/bgprobe/front'), bar && bar.textContent);
+    bar.querySelector('button').click();
+    await frame();
+    const eCard = openCards().find(c => asker(c) === 'Explore');
+    check('Review closes the view and flashes the card', panel.hidden && eCard && eCard.classList.contains('is-flash'));
+
+    // 5. Claude Code withdraws the background ask: the state clears.
+    ClaudeChat.receive([{ type: 'permission_cancelled', id: 'p-e1' }]);
+    await frame();
+    check('withdrawn: no open cards, Explore working, GP done', openCards().length === 0 && avState(0) === 'running' && avState(1) === 'done', [openCards().length, avState(0), avState(1)]);
+
+    // 6. A blocked call with a visible input: allow exactly it, and the agent retries through Main.
+    ClaudeChat.receive([asst('tu-E', 'e9', [{ type: 'tool_use', id: 'tu-e9', name: 'Bash', input: { command: '/tmp/bgprobe/front 1119' } }]),
+      sys('permission_denied', { tool_name: 'Bash', tool_use_id: 'tu-e9', agent_id: 'aE1', uuid: 'd-9', decision_reason_type: 'asyncAgent', message: 'Permission to use Bash has been denied.' }),
+      res('tu-E', 'tu-e9', 'Permission to use Bash has been denied.', true)]);
+    await frame();
+    const bCard = $('.ck-card.is-blocked:not(.is-resolved)');
+    check('blocked card: who and what', bCard && bCard.querySelector('.ck-card-title').textContent === 'Explore could not run Bash' && bCard.textContent.includes('/tmp/bgprobe/front 1119'), bCard && bCard.textContent.slice(0, 160));
+    check('blocked card: why', bCard && bCard.textContent.includes('A background agent cannot ask'));
+    check('blocked card: the error result does not settle it', bCard && !bCard.classList.contains('is-resolved'));
+    check('blocked card: three choices', bCard && bCard.querySelectorAll('.ck-opt').length === 3, bCard && bCard.querySelectorAll('.ck-opt').length);
+    check('blocked: avatar needs you', avState(0) === 'waiting', avState(0));
+    // 7. Blocked with no visible input: no rule to offer.
+    ClaudeChat.receive([sys('permission_denied', { tool_name: 'WebFetch', tool_use_id: 'tu-unseen', agent_id: 'aE1', uuid: 'd-10', decision_reason_type: 'classifier', message: 'denied' })]);
+    await frame();
+    const wCard = $$('.ck-card.is-blocked:not(.is-resolved)').pop();
+    check('blocked, input unseen: says so, two choices', wCard !== bCard && wCard.textContent.includes('input is not visible') && wCard.querySelectorAll('.ck-opt').length === 2, wCard && wCard.querySelectorAll('.ck-opt').length);
+    // 8. Main's own denial stays a notice.
+    ClaudeChat.receive([sys('permission_denied', { tool_name: 'Bash', message: 'rm is not allowed' })]);
+    await frame();
+    check('Main denial: a notice, no card', $$('.ck-note, .ck-notice').some(n => n.textContent.includes('Blocked Bash: rm is not allowed')) && $$('.ck-card.is-blocked').length === 2);
+    if (q.has('blocked')) { console.error(`approvals-check: ${pass} passed (blocked cards left open)`); window.__pending = false; return; }
+
+    bCard.querySelector('.ck-opt').click();
+    check('Allow posts the session rule', JSON.stringify(of('allowRules').pop()?.rules) === JSON.stringify(['Bash(/tmp/bgprobe/front 1119)']), of('allowRules'));
+    const relay = of('send').pop();
+    check('…and asks Main to have the agent retry', relay.text.includes('[FloatyTerm]') && relay.text.includes('SendMessage (to: "aE1")') && relay.text.includes('`Bash(/tmp/bgprobe/front 1119)`'), relay.text);
+    check('…shown as your choice', (relay.display || '').startsWith('Allow Bash(/tmp/bgprobe/front 1119)'), relay.display);
+    check('allowed card: resolved with the rule', bCard.classList.contains('is-resolved') && bCard.textContent.includes('Allowed for this session'));
+    wCard.querySelector('.ck-opt').click();
+    check('Redo asks Main for a foreground redo', of('send').pop().text.includes('run_in_background: false'));
+    await frame();
+    check('blocked cards settled: avatar working again', avState(0) === 'running', avState(0));
+
+    // 9. A working agent with no sign of life for 5 minutes reads as quiet.
+    ClaudeChat.receive([{ ...sys('task_progress', { task_id: 'aE1', tool_use_id: 'tu-E', usage: { tool_uses: 1, total_tokens: 1200 } }), t: Date.now() - 5 * 60 * 1000 }]);
+    await frame();
+    check('quiet: the avatar dims', avs()[0].classList.contains('is-quiet'));
+    avs()[0].dispatchEvent(new MouseEvent('mouseenter'));
+    const ahc = $('.ck-ahc');
+    check('quiet: the card says how long', ahc.querySelector('.ck-ahc-now.is-quiet')?.textContent.includes('No new activity for 5 min'), ahc.textContent.slice(0, 200));
+    avs()[0].dispatchEvent(new MouseEvent('mouseleave'));
+    ClaudeChat.receive([sys('task_progress', { task_id: 'aE1', tool_use_id: 'tu-E', usage: { tool_uses: 2, total_tokens: 1500 } })]);
+    await frame();
+    check('a new sign of life clears quiet', !avs()[0].classList.contains('is-quiet'));
+    console.error(`approvals-check: ${pass} passed`);
+  } catch (e) { console.error('approvals-check threw: ' + e.message + ' ' + (e.stack || '').split('\n')[0]); }
+  window.__pending = false; })();
+</script>
+</body></html>

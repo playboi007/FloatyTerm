@@ -914,3 +914,17 @@ body.tools-inline .ck-tray, body.tools-inline .ck-run-mark { display: none; }
 .ck-guardian button:hover, .ck-import button:hover { border-color:var(--accent); }
 .ck-import { margin:10px 0; padding:10px 12px; border:1px solid var(--line-3); border-radius:8px; font:13px var(--sans); }
 .ck-import-row { display:block; margin:4px 0; }
+
+/* ── subagent approvals: who asks, a blocked call, the bar in the agent's view, a quiet agent ── */
+.ck-card-agent { margin-left: auto; display: inline-flex; align-items: center; gap: 6px; font: 11.5px var(--sans); color: var(--muted); }
+.ck-card.is-blocked .ck-opts code { font: 11.5px var(--mono); color: var(--code); overflow-wrap: anywhere; }
+.ck-card.is-flash { animation: ck-card-flash 1.3s ease-out; }
+@keyframes ck-card-flash { 0%, 45% { box-shadow: 0 0 0 3px color-mix(in srgb, var(--warn) 65%, transparent); } }
+.ck-sub-ask { flex: none; display: flex; align-items: center; gap: 8px; min-width: 0; padding: 6px 12px; border-bottom: 1px solid rgba(226,189,98,.35);
+  background: rgba(226,189,98,.08); font: 12.5px var(--sans); color: var(--text-3); }
+.ck-sub-ask-dot { flex: none; width: 7px; height: 7px; border-radius: 50%; background: var(--warn); }
+.ck-sub-ask-t { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ck-sub-ask-n { flex: none; font: 11px var(--mono); color: var(--faint); }
+.ck-av-btn.is-quiet .ck-av-ring { animation-play-state: paused; opacity: .45; }
+.ck-ahc-now.is-quiet .k, .ck-ahc-now.is-quiet .v { color: var(--warn); }
+@media (prefers-reduced-motion: reduce) { .ck-card.is-flash { animation: none; } }

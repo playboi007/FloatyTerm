@@ -230,3 +230,15 @@ test('files answers pass through the normalizer unchanged', () => {
   assert.deepEqual([files.id, files.query, files.suggestions.length], [4, 'chat', 2]);
   assert.equal(c.state.unknown.length, 0);
 });
+
+test('a subagent\'s denied call becomes a blocked approval; Main\'s stays a notice', () => {
+  const c = conversation();
+  const [blocked] = c.feed(sys('permission_denied', { tool_name: 'Bash', tool_use_id: 'tu-9', agent_id: 'aE1', uuid: 'u-9',
+    decision_reason_type: 'asyncAgent', decision_reason: 'background agent', message: 'Permission to use Bash has been denied.' }));
+  assert.equal(blocked.type, 'approval.blocked');
+  assert.deepEqual(blocked.denial, { id: 'blocked-u-9', toolName: 'Bash', toolUseID: 'tu-9', agentID: 'aE1', reasonType: 'asyncAgent',
+    reason: 'background agent', message: 'Permission to use Bash has been denied.' });
+  const [note] = c.feed(sys('permission_denied', { tool_name: 'Bash', message: 'rm is not allowed' }));
+  assert.deepEqual([note.type, note.kind], ['notice', 'warn']);
+  assert.equal(c.state.unknown.length, 0);
+});

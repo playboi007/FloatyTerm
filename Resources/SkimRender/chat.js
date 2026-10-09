@@ -958,15 +958,106 @@
     return b;
   };
 
+  /** The Agent row a request or a denial came from: its agentID is the agent's task ID; else the agent whose steps hold the call. */
+  function agentRowOfReq(req) {
+    const top = S.root || S;
+    const t = req.agentID && top.agentTasks.get(req.agentID);
+    if (t && t.toolId) { const r = rowAnywhere(t.toolId, top); if (r) return r; }
+    if (req.toolUseID) for (const [toolId, sub] of top.subs) if (sub.rows.has(req.toolUseID)) return rowAnywhere(toolId, top);
+    return null;
+  }
+  /** Who asks: the agent's avatar and type, on its card. */
+  const agentTag = a => h('span', { class: 'ck-card-agent', title: a.desc }, agentAvatar(a.type, 'waiting', true), h('span', { text: a.type }));
+
+  /** The narrowest allow rule for one blocked call, or null when there is no safe one to offer. */
+  function ruleFor(tool, input) {
+    if (!tool || !input) return null;
+    if (tool === 'Bash') { const c = String(input.command || '').trim(); return c && !c.includes('\n') && c.length <= 300 ? `Bash(${c})` : null; }
+    if (tool === 'WebFetch') { try { return `WebFetch(domain:${new URL(input.url).hostname})`; } catch { return null; } }
+    if (tool === 'WebSearch') return 'WebSearch';
+    if (['Read', 'Edit', 'Write', 'NotebookEdit'].includes(tool)) {
+      const p = String(input.file_path || input.notebook_path || '');
+      return p.startsWith('/') ? `${tool}(/${p})` : null;   // "//" marks an absolute path in a rule
+    }
+    if (tool.startsWith('mcp__')) return tool;
+    return null;
+  }
+  const BLOCK_WHY = {
+    asyncAgent: 'A background agent cannot ask for permission, so Claude Code declined the call.',
+    classifier: 'Auto mode’s safety check declined it.', rule: 'A deny rule matches it.',
+    mode: 'The permission mode does not allow it.', hook: 'A hook declined it.', safetyCheck: 'A safety check declined it.',
+  };
+
+  /**
+   * A subagent's call that Claude Code declined without asking (a background agent cannot ask).
+   * The choices: allow exactly that call for the session and have the agent retry, or have Main redo it where you can approve. */
+  function addBlockedCard(d) {
+    if (S.cards.has(d.id)) return;
+    const top = S.root || S;
+    const ar = agentRowOfReq(d), ag = ar ? agentInfo(ar) : null;
+    const row = d.toolUseID ? rowAnywhere(d.toolUseID, top) : null;
+    const input = row && row.input && Object.keys(row.input).length ? row.input : null;
+    const rule = ruleFor(d.toolName, input);
+    const req = { id: d.id, toolName: d.toolName, toolUseID: d.toolUseID, agentID: d.agentID, input: input || {}, blocked: true };
+    closeRun();
+    const who = ag ? `${ag.type} “${clip(ag.desc, 60)}”` : 'a subagent';
+    const agentId = ag && ag.task ? ag.task.id : d.agentID;
+    const opts = h('div', { class: 'ck-opts' });
+    const card = h('div', { class: 'ck-card is-blocked', 'data-risk': 'high' },
+      h('div', { class: 'ck-card-head' },
+        h('span', { class: 'ck-risk' }, h('span', { class: 'ck-risk-dot' }), 'Blocked'),
+        h('span', { class: 'ck-card-title', text: `${ag ? ag.type : 'A subagent'} could not run ${shortName(d.toolName || 'a tool')}` }),
+        ag ? agentTag(ag) : null),
+      input ? preview(req) : h('div', { class: 'ck-why', text: 'The call’s input is not visible here: this agent’s steps are not streamed to this view.' }),
+      h('div', { class: 'ck-why' }, h('span', { class: 'ck-why-k', text: 'Why · ' }), BLOCK_WHY[d.reasonType] || d.reason || d.message || 'Claude Code declined it.'),
+      opts);
+    // Main passes it on: the user sees their choice, Main reads the instruction.
+    const relay = (shown, text) => { const prev = S; S = top; try { sendUser(shown, [], [], { relay: text, to: ag ? ag.type : undefined }); } finally { S = prev; } };
+    const settle = (outcome, label) => { if (card.dataset.done) return; card.dataset.done = '1'; resolveCard(req.id, outcome, null, label); };
+    const keys = {};
+    let n = 0;
+    const add = (label, fn, cls) => { const k = String(++n); opts.append(optBtn(k, label, fn, cls)); keys[k] = fn; };
+    if (rule) add(h('span', null, 'Allow ', h('code', { text: rule }), ' for this session, and retry'), () => {
+      post({ type: 'allowRules', rules: [rule], channel: top.id });
+      relay(`Allow ${rule} for this session, and retry.`,
+        `[FloatyTerm] The user added the allow rule \`${rule}\` for this session. Your subagent ${who} (agent ID: ${agentId}) was blocked running that call. `
+        + `Tell it with SendMessage (to: "${agentId}") to retry the blocked call now. If that agent has finished, the same SendMessage continues it. `
+        + 'Do not run the call yourself; after sending, reply in one short line.');
+      settle('always', ['Allowed for this session · ', h('code', { text: rule }), ' · retry asked']);
+    });
+    add('Redo it where I can approve it', () => {
+      relay(`Redo the blocked ${shortName(d.toolName || 'call')} where I can approve it.`,
+        `[FloatyTerm] Your subagent ${who} (agent ID: ${agentId}) was blocked running ${d.toolName || 'a tool'}`
+        + (d.reason ? ` (${clip(d.reason, 200)})` : '') + '. The user wants to approve it. A background agent cannot ask, so redo that step where '
+        + 'the approval prompt reaches the user: run it yourself in this conversation, or start the agent again with run_in_background: false. '
+        + 'Reply in one short line before you start.');
+      settle('allowed', 'Asked Main to redo it where you can approve');
+    });
+    add('Dismiss', () => settle('denied', 'Dismissed'), 'is-no');
+    registerCard(req, card, keys, opts);
+  }
+
+  /** Leave the agent's view and bring a card into sight. */
+  function reviewCard(c) {
+    closeSub();
+    requestAnimationFrame(() => {
+      c.card.scrollIntoView({ block: 'center', behavior: motionOn() ? 'smooth' : 'auto' });
+      c.card.classList.add('is-flash');
+      setTimeout(() => c.card.classList.remove('is-flash'), 1300);
+    });
+  }
+
   /** Puts a finished card in the flow and books it: its keys, the row waiting on it, the status line. */
   function registerCard(req, card, keys, opts) {
     turn().body.append(card);
     enter(card);
     S.cards.set(req.id, { card, keys, req, opts });
-    const row = req.toolUseID && rowAnywhere(req.toolUseID);
+    const row = !req.blocked && req.toolUseID && rowAnywhere(req.toolUseID);   // a blocked call's row already ended
     if (row) { row.waitStart = clock(); setRowState(row, 'waiting'); }
     updateStatus();
     stick();
+    scheduleAgents();
+    if (subShown()) paintSubPanel(true);
   }
 
   function addCard(req) {
@@ -979,10 +1070,12 @@
     const title = req.title || (req.displayName ? `${req.displayName}${req.description ? ' ' + req.description : ''}` : req.toolName);
     const why = req.input && req.input.description ? String(req.input.description) : req.decisionReason || null;
     const opts = h('div', { class: 'ck-opts' });
+    const asker = agentRowOfReq(req);
     const card = h('div', { class: 'ck-card', 'data-risk': level },
       h('div', { class: 'ck-card-head' },
         h('span', { class: 'ck-risk' }, h('span', { class: 'ck-risk-dot' }), risk),
-        h('span', { class: 'ck-card-title', text: title })),
+        h('span', { class: 'ck-card-title', text: title }),
+        asker ? agentTag(agentInfo(asker)) : null),
       preview(req),
       why && h('div', { class: 'ck-why' }, h('span', { class: 'ck-why-k', text: (agent === 'codex' ? 'Codex' : 'Claude') + '\'s reason · ' }), why),
       opts);
@@ -1036,9 +1129,11 @@
     c.opts.replaceWith(outcomeEl);
     if (!quiet()) play(outcomeEl, FADE, M.mid);
     c.card.classList.add('is-resolved');
-    const row = c.req.toolUseID && rowAnywhere(c.req.toolUseID);
+    const row = !c.req.blocked && c.req.toolUseID && rowAnywhere(c.req.toolUseID);
     if (row && row.waitStart) { row.waitMs += clock() - row.waitStart; row.waitStart = 0; setRowState(row, outcome === 'denied' || outcome === 'cancelled' ? 'error' : 'running'); }
     updateStatus();
+    scheduleAgents();
+    if (subShown()) paintSubPanel(true);
   }
 
   // ── dialog tools: AskUserQuestion and ExitPlanMode get their own cards ──
@@ -3668,6 +3763,7 @@
     if (e.background || e.patch?.is_backgrounded) t.background = true;
     if (e.patch?.description) t.description = e.patch.description;
     if (e.usage) t.usage = e.usage;
+    t.lastAt = clock();   // any sign of life; a long silence shows on the avatar
     if (e.type === 'task.start' && !t.t0) t.t0 = clock();
     if (e.type === 'task.progress') { if (e.summary) t.summary = e.summary; if (e.lastTool) t.lastTool = e.lastTool; }
     if (e.type === 'task.end') { t.endStatus = e.status || 'completed'; t.t1 = clock(); if (e.summary) t.result = e.summary; }
@@ -3727,7 +3823,10 @@
   function toSub(e) {
     const top = S.root || S;
     // Subagent tool result settles its approval card (stays in conversation).
-    if (e.type === 'tool.result') for (const [id, card] of [...top.cards]) if (card.req.toolUseID === e.id) resolveCard(id, e.isError ? 'denied' : 'allowed');
+    // (A blocked card waits for the user's choice: the denied call's error result doesn't settle it.)
+    if (e.type === 'tool.result') for (const [id, card] of [...top.cards]) if (card.req.toolUseID === e.id && !card.req.blocked) resolveCard(id, e.isError ? 'denied' : 'allowed');
+    const task = agentTaskOf(top, e.parentId);
+    if (task) task.lastAt = clock();
     const sub = subConv(top, e.parentId);
     const own = { ...e, parentId: null };
     const prev = S;
@@ -3803,7 +3902,7 @@
       h('span', { class: 'ck-sub-type', text: a ? a.type : inp.subagent_type || (row ? shortName(row.name) : 'Agent') }),
       h('span', { class: 'ck-sub-desc', text: inp.description || '', title: inp.description || '' }),
       h('span', { class: 'ck-sub-state', 'data-state': a ? a.state : state, text: a ? AGENT_WORD[a.state] : state }),
-      h('span', { class: 'ck-sub-stats', text: a ? agentStats(a) : stats }),
+      h('span', { class: 'ck-sub-stats', text: a ? agentStats(a) + (a.quiet ? ' · quiet ' + mins(a.quiet) : '') : stats }),
       going && a.task && !a.task.background ? h('button', { class: 'ck-sub-act', type: 'button', title: 'Send it to the background: the conversation goes on (⌃B)', onclick: () => backgroundAgent(a) }, 'Background', h('kbd', { text: '⌃B' })) : null,
       going && a.task ? h('button', { class: 'ck-sub-act is-stop', type: 'button', title: 'Stop this agent (⌃X)', onclick: () => stopAgent(a) }, 'Stop', h('kbd', { text: '⌃X' })) : null,
       h('button', { class: 'ck-sub-btn ck-sub-x', type: 'button', title: 'Close (Esc)', onclick: closeSub }));
@@ -3822,6 +3921,18 @@
       sc = h('div', { class: 'ck-sub-scroll' }, h('div', { class: 'ck-sub-in' }, prompt, sub.log, h('div', { class: 'ck-sub-foot' })));
       subEl.replaceChildren(head, sc);
     } else subEl.firstChild.replaceWith(head);
+    // The approval this agent waits on lives in the conversation (this view covers it): say so here, and go there.
+    const asks = a ? cardsFor(a.top, a.sub, a.task) : [];
+    const oldAsk = subEl.querySelector(':scope > .ck-sub-ask');
+    if (asks.length) {
+      const c = asks[0];
+      const what = `${shortName(c.req.toolName || 'a tool')} ${clip(argOf(c.req.toolName || '', c.req.input || {}) || '', 80)}`.trim();
+      const bar = h('div', { class: 'ck-sub-ask' }, h('span', { class: 'ck-sub-ask-dot' }),
+        h('span', { class: 'ck-sub-ask-t', text: (c.req.blocked ? 'Blocked, needs your decision: ' : 'Waiting for your approval: ') + what }),
+        asks.length > 1 ? h('span', { class: 'ck-sub-ask-n', text: `+${asks.length - 1} more` }) : null,
+        h('button', { class: 'ck-sub-act', type: 'button', onclick: () => reviewCard(c) }, 'Review'));
+      if (oldAsk) oldAsk.replaceWith(bar); else head.after(bar);
+    } else if (oldAsk) oldAsk.remove();
     // With no transcript (a resumed chat, or it has not started yet): the result, or a line that says why it is empty.
     const foot = sc.querySelector('.ck-sub-foot');
     const empty = !sub.log.childNodes.length;
@@ -3865,18 +3976,26 @@
 
   const agentSteps = sub => sub ? sub.rows.size + sub.texts.size : 0;
 
+  /** The open approval and blocked cards of one agent: matched by its agent ID, or by a call in its steps. */
+  const cardsFor = (top, sub, task) => [...top.cards.values()].filter(c => c.req
+    && ((task && c.req.agentID === task.id) || (sub && c.req.toolUseID && sub.rows.has(c.req.toolUseID))));
+  const QUIET_MS = 3 * 60 * 1000;   // a working agent with no sign of life for this long reads as "quiet"
+  const mins = ms => Math.max(1, Math.round(ms / 60000)) + ' min';
+
   /** All that the page knows of one Agent call: its row, task, transcript and state. */
   function agentInfo(row) {
     const top = row.top || main, sub = top.subs.get(row.id) || null, task = agentTaskOf(top, row.id);
     const inp = row.input || {};
-    const waiting = sub && [...top.cards.values()].some(c => c.req && c.req.toolUseID && sub.rows.has(c.req.toolUseID));
+    const waiting = cardsFor(top, sub, task).length > 0;
     let state;
     if (waiting) state = 'waiting';
     else if (task && task.endStatus) state = task.endStatus === 'completed' ? 'done' : 'error';
     else if (task && !task.endStatus && row.state !== 'error' && row.state !== 'interrupted') state = 'running';   // a background agent's row ends long before it does
     else state = row.state === 'done' ? 'done' : row.state === 'error' || row.state === 'interrupted' ? 'error' : 'running';
     const parentConv = top.rows.has(row.id) ? top : [...top.subs.values()].find(c => c.rows.has(row.id)) || top;
-    return { row, top, sub, task, state, type: inp.subagent_type || shortName(row.name), desc: inp.description || clip(inp.prompt, 60) || 'Agent',
+    const lastAt = task ? task.lastAt || task.t0 : 0;
+    const silent = state === 'running' && lastAt ? clock() - lastAt : 0;
+    return { row, top, sub, task, state, quiet: silent >= QUIET_MS ? silent : 0, type: inp.subagent_type || shortName(row.name), desc: inp.description || clip(inp.prompt, 60) || 'Agent',
       parentConv, parentType: parentConv === top ? (top === main ? 'Main' : top.label || 'Chat') : agentInfo(rowAnywhere(parentConv.toolId, top) || row).type };
   }
 
@@ -3913,6 +4032,8 @@
 
   let agentsRaf = 0, agentsShown = [], agentAvs = new Map(), agentsTop = null;
   function scheduleAgents() { if (!agentsRaf && agentsEl) agentsRaf = requestAnimationFrame(() => { agentsRaf = 0; paintAgents(); }); }
+  // "Quiet" comes from time passing, not from events: look again now and then while an agent works.
+  setInterval(() => { if (agentsShown.some(a => a.state === 'running')) scheduleAgents(); }, 30000);
 
   function paintAgents() {
     const top = active;
@@ -3941,7 +4062,8 @@
       }
       if (el.parentNode !== agentsEl || el !== agentsEl.children[i + 1]) agentsEl.insertBefore(el, agentsEl.children[i + 1] || null);
       paintAvatar(el.firstChild, a.type, a.state);
-      el.setAttribute('aria-label', `${a.type}: ${a.desc}, ${AGENT_WORD[a.state]} (⌥${i + 1})`);
+      el.classList.toggle('is-quiet', !!a.quiet);
+      el.setAttribute('aria-label', `${a.type}: ${a.desc}, ${AGENT_WORD[a.state]}${a.quiet ? ', no new activity for ' + mins(a.quiet) : ''} (⌥${i + 1})`);
       el.classList.toggle('is-here', !!subShown() && subShown().toolId === a.row.id);
       const unread = a.sub && !(subShown() === a.sub) && agentSteps(a.sub) > (a.sub.seen || 0) && a.state !== 'done';
       el.classList.toggle('has-unread', !!unread);
@@ -3968,20 +4090,21 @@
   function fillAgentCard(a, fresh) {
     const steps = a.sub ? [...a.sub.rows.values()].filter(r => r.state === 'done').slice(-3) : [];
     const result = a.state === 'done' || a.state === 'error' ? agentResult(a) : '';
-    const ask = a.state === 'waiting' && a.sub ? [...a.top.cards.values()].find(c => c.req && a.sub.rows.has(c.req.toolUseID)) : null;
+    const ask = a.state === 'waiting' ? cardsFor(a.top, a.sub, a.task)[0] || null : null;
     const n = agentsShown.indexOf(a) + 1;
     const body = h('div', { class: 'ck-ahc-body' },
       h('div', { class: 'ck-ahc-h' }, agentAvatar(a.type, a.state),
         h('div', { class: 'ck-ahc-name' }, h('div', { class: 'ck-ahc-type', text: a.type }),
           h('div', { class: 'ck-ahc-state' }, h('b', { 'data-s': a.state, text: AGENT_WORD[a.state] }), ` · started by ${a.parentType}` + (a.task && a.task.background ? ' · background' : '')))),
       h('div', { class: 'ck-ahc-desc', text: a.desc }),
-      ask ? h('div', { class: 'ck-ahc-ask' }, `Wants to run ${shortName(ask.req.toolName)}`, h('code', { text: clip(argOf(ask.req.toolName, ask.req.input || {}) || '', 120) }))
+      ask ? h('div', { class: 'ck-ahc-ask' }, `${ask.req.blocked ? 'Was blocked running' : 'Wants to run'} ${shortName(ask.req.toolName || 'a tool')}`, h('code', { text: clip(argOf(ask.req.toolName || '', ask.req.input || {}) || '', 120) }))
         : result ? h('div', { class: 'ck-ahc-result', text: clip(result, 260) })
+        : a.quiet ? h('div', { class: 'ck-ahc-now is-quiet' }, h('span', { class: 'k', text: 'quiet' }), h('span', { class: 'v', text: `No new activity for ${mins(a.quiet)}. It may be stuck: Stop ends it.` }))
         : h('div', { class: 'ck-ahc-now' }, h('span', { class: 'k', text: 'now' }), h('span', { class: 'v', text: agentLive(a) || '…' })),
       steps.length && !result ? h('ul', { class: 'ck-ahc-steps' }, steps.map(r => h('li', { text: `${shortName(r.name)} ${r.argEl.textContent}` }))) : null,
       h('div', { class: 'ck-ahc-stats', text: agentStats(a) }),
       h('div', { class: 'ck-ahc-f' },
-        h('button', { class: 'ck-ahc-btn is-main', type: 'button', onclick: () => openAgent(a) }, ask ? 'Review' : a.state === 'done' ? 'Open' : 'Open and talk', n <= 9 ? h('kbd', { text: '⌥' + n }) : null),
+        h('button', { class: 'ck-ahc-btn is-main', type: 'button', onclick: () => { if (ask) { closeAgentCard(true); reviewCard(ask); } else openAgent(a); } }, ask ? 'Review' : a.state === 'done' ? 'Open' : 'Open and talk', n <= 9 ? h('kbd', { text: '⌥' + n }) : null),
         h('span', { class: 'ck-ahc-grow' }),
         (a.state === 'running' || a.state === 'waiting') && a.task && !a.task.background ? h('button', { class: 'ck-ahc-btn', type: 'button', title: 'Send it to the background', onclick: () => backgroundAgent(a) }, h('kbd', { text: '⌃B' })) : null,
         (a.state === 'running' || a.state === 'waiting') && a.task ? h('button', { class: 'ck-ahc-btn is-stop', type: 'button', onclick: () => { closeAgentCard(true); stopAgent(a); } }, 'Stop')
@@ -4095,7 +4218,8 @@
         setRowState(row, 'interrupted');
       }
     }
-    for (const id of [...S.cards.keys()]) resolveCard(id, 'cancelled');
+    // A subagent's card outlives Main's turn: a background agent still waits on it (Claude Code withdraws it with an explicit cancel).
+    for (const [id, c] of [...S.cards]) if (!c.req.agentID && !c.req.blocked) resolveCard(id, 'cancelled');
     closeRun();
     S.busy = false; S.thinking = false; S.buffering = false; S.progressText = null;
     updateStatus();
@@ -4579,6 +4703,10 @@
       case 'commands': SHARED.commands = e.commands || []; if (P.kind === 'slash') refreshPop(); break;
       case 'approval.request': if (supports('approvals')) addCard(e.request); else showUnknown(e); break;
       case 'approval.cancel': resolveCard(e.id, 'cancelled'); break;
+      case 'approval.blocked':
+        if (supports('approvals') && !S.replaying) addBlockedCard(e.denial);
+        else notice('warn', 'Blocked ' + (e.denial.toolName || 'a tool') + (e.denial.message ? ': ' + e.denial.message : ''));
+        break;
       case 'notice':
         if (e.terminal) settleRetry();
         notice(e.kind || 'info', e.message || 'Session ended');

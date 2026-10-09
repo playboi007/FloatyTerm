@@ -148,6 +148,10 @@
         if (msg.subtype === 'hook_started' || msg.subtype === 'hook_progress') return [];
         if (msg.subtype === 'hook_response') return [{ type: 'hook', name: msg.hook_name, event: msg.hook_event, outcome: msg.outcome,
           exitCode: msg.exit_code ?? null, output: String(msg.stderr || msg.stdout || msg.output || '').trim() }];
+        // A subagent's call denied without a prompt (a background agent cannot ask): a card the user can act on.
+        if (msg.subtype === 'permission_denied' && msg.agent_id) return [{ type: 'approval.blocked', denial: {
+          id: 'blocked-' + (msg.uuid || msg.tool_use_id || Date.now()), toolName: msg.tool_name || '', toolUseID: msg.tool_use_id || null,
+          agentID: msg.agent_id, reasonType: msg.decision_reason_type || null, reason: msg.decision_reason || '', message: msg.message || '' } }];
         if (msg.subtype === 'permission_denied') return notice('warn', 'Blocked ' + (msg.tool_name || 'a tool') + (msg.message ? ': ' + msg.message : ''));
         if (msg.subtype === 'notification') return notice(['high', 'immediate'].includes(msg.priority) ? 'warn' : 'info', msg.text);
         if (msg.subtype === 'informational') return notice(msg.level === 'warning' ? 'warn' : 'info', msg.content);

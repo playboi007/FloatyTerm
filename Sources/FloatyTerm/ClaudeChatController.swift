@@ -242,6 +242,10 @@ final class ClaudeChatController: NSObject, TabContent, WKNavigationDelegate {
         case "stopTask":
             guard let task = action["taskId"] as? String, !task.isEmpty else { return }
             ch.sidecar.send(["type": "stopTask", "taskId": task])
+        case "allowRules":
+            // A blocked subagent call the user allowed: a session-only allow rule.
+            guard let rules = action["rules"] as? [String], !rules.isEmpty else { return }
+            ch.sidecar.send(["type": "allowRules", "rules": Array(rules.prefix(8))])
         case "shell", "shellKill":
             // A ! command: the conversation's own sidecar runs it in the session folder, else any running one.
             guard let sid = action["id"] as? String else { return }
