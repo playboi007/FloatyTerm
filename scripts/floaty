@@ -89,6 +89,22 @@
 #                 # steps retry:1) and typed text re-read from the focused element's AX value.
 #                 # Unreadable value (canvas) → step passes UNVERIFIED and the reply lists it
 #                 # in unverified_steps — re-check those effects before trusting completed:true.
+#   BACKGROUND MODE — the agent works in its own window while you keep the keyboard:
+#     export FLOATY_MODE=background      # every call in this shell (or --background per call;
+#                                        # --foreground on one call overrides the env)
+#                 # click/click-mark/click-in-frame → AXPress on the element under the point (no
+#                 # cursor move); type/key --pid N → posted to that process (CGEventPostToPid),
+#                 # refused unless the app's key window is the agent's on-screen window; navigate
+#                 # --pid N --url … → the browser's address bar via AX. query-ax element actions:
+#                 # --press / --focus / --set-value "…" / --scroll-to / --action AXShowMenu.
+#                 # Nothing activates or raises the target; move/drag/scroll/right/double clicks,
+#                 # raise, focus, enable-cdp refuse with "needs_foreground":true. A window on
+#                 # another Space is unreachable (AX sees only the active Space) → keep the agent's
+#                 # window on a visible display. Replies carry "interference":{human_app,
+#                 # focus_kept[,stolen_by_target,restored]} — the host hands focus straight back
+#                 # if an action made the target frontmost.
+#                 # Flutter web: press the text field first (opens its edit session), then type;
+#                 # --set-value alone is ignored by Flutter.
 #   floaty focused --app "Notes" | --pid 8123           # the focused element (role/value/editable):
 #                                                        # confirm a text cursor exists BEFORE typing
 #   floaty set-text --pid 8123 --text "hello"           # write text into the FOCUSED field via the AX API
@@ -250,8 +266,23 @@ RUN A PLAN (linear steps, host-executed — the model only returns on divergence
       # divergence → {"completed":false,"failed_step":N,reason} + capture of where.
       # Forensics per step: route "run.step" in calls.ndjson. Full schema: script header.
 
+BACKGROUND MODE (agent works in one window while you keep working in another)
+  --background on any call, or export FLOATY_MODE=background for the session
+  (--foreground on one call overrides it). Never activates, raises, or moves
+  the real cursor:
+    click / click-mark / click-in-frame  → AXPress on the element under the point
+    type / key  --pid N                  → posted to that process (CGEventPostToPid),
+                                           only into the agent's own window of the app
+    navigate --pid N --url …             → the browser's address bar via AX
+    query-ax … --press | --focus | --set-value "…" | --scroll-to | --action AXShowMenu
+  Refused with needs_foreground: move, drag, scroll, right/double/modified
+  clicks, raise, focus, enable-cdp. Windows on another Space are unreachable —
+  keep the agent's window on a visible display. Every reply carries
+  "interference": {human_app, focus_kept[, stolen_by_target, restored]}.
+
 SEE THE SCREEN (cheapest first — climb only when the previous rung failed)
   query-ax  --app "…" | --pid N [--role button] [--title Save] [--press] [--diff]
+            [--focus | --set-value "…" | --scroll-to | --action AXShowMenu]   # act on 1st match
   som     --app "…" | --pid N | [--port 9222] [--diff]   # numbered marks: TABLE by default (one
                                                  # element per line); annotated PNG only when marks
                                                  # are poorly named or you pass --image.
@@ -350,6 +381,15 @@ while i < len(toks):
     else:
         obj[key] = val
     i += 2
+# Interaction mode. --foreground / --background on the call win; else
+# FLOATY_MODE (set once for a whole agent session); else the host default
+# (foreground). Background = AX press + pid-posted keys, never activate.
+if obj.pop("foreground", None) is True:
+    obj["mode"] = "foreground"
+elif obj.pop("background", None) is True:
+    obj["mode"] = "background"
+elif "mode" not in obj and os.environ.get("FLOATY_MODE", "").lower() in ("background", "bg", "foreground", "fg"):
+    obj["mode"] = "background" if os.environ["FLOATY_MODE"].lower() in ("background", "bg") else "foreground"
 paths = {"click":"/agent/click","move":"/agent/move","drag":"/agent/drag",
          "scroll":"/agent/scroll","type":"/agent/type","key":"/agent/key",
          "capture":"/agent/capture","query-dom":"/agent/query-dom",
@@ -370,6 +410,22 @@ PY
 
 path=$(printf '%s' "$routed" | python3 -c "import sys,json;print(json.load(sys.stdin)['path'])")
 body=$(printf '%s' "$routed" | python3 -c "import sys,json;print(json.dumps(json.load(sys.stdin)['body']))")
+
+# Background mode needs a host that knows it. An older FloatyTerm ignores
+# "mode" and would run the call in the FOREGROUND — activating the target and
+# moving the real cursor — while reporting success. Ask first; stop if not.
+case "$body" in *'"mode": "background"'*)
+    probe=$(curl -s -m 3 -H "Content-Type: application/json" -X POST \
+            "http://$HOST/agent/host" -d '{"probe":"background"}' 2>/dev/null) || true
+    case "$probe" in *'"background_mode":true'*) ;; *)
+        if [ -z "$probe" ]; then
+            echo '{"error":"FloatyTerm not reachable on 127.0.0.1:7777 (is the app running?)"}' >&2
+        else
+            echo '{"error":"the running FloatyTerm has no background mode (older build) — it would run this call in the FOREGROUND. Relaunch FloatyTerm, or drop --background / FLOATY_MODE.","needs_relaunch":true}'
+        fi
+        exit 1;;
+    esac;;
+esac
 
 # Capture the body and the HTTP status separately. The relay returns 400 with a
 # JSON {"error":…} body for legitimate failures (element not found, port closed,

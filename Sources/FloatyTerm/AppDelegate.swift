@@ -46,8 +46,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         DevtoolsRelay.shared.onAgentScroll = { [weak self] b in
             self?.performAction("scroll", b) ?? ["error": "no self"]
         }
+        // Background mode (FLOATY_MODE=background / --background): the
+        // pointer/key verbs re-expressed without the HID path. See
+        // AgentBackground.swift for what maps to what, and what refuses.
+        DevtoolsRelay.shared.onAgentBackground = { [weak self] b in
+            guard let self else { return ["error": "no self"] }
+            return await self.performBackground(b["_action"] as? String ?? "", b)
+        }
         DevtoolsRelay.shared.onAgentType = { [weak self] b in
-            guard let self, let text = b["text"] as? String else { return ["error": "expected {text}"] }
+            guard let self else { return ["error": "no self"] }
+            if AgentBackground.isBackground(b) { return await self.backgroundType(b) }
+            guard let text = b["text"] as? String else { return ["error": "expected {text}"] }
             // --human sessions get overlaid replay controls (play/pause/stop/
             // speed) on the terminal window; --no-controls opts out.
             let noControls = (b["no_controls"] as? NSNumber)?.boolValue ?? false
@@ -75,10 +84,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     // / other desktop — usually a stray click shoved it there) instead
                     // of erroring with "run raise". Surfaces it AND keeps the agent's
                     // in-flight target in front. No-op if it's already on-screen.
-                    _ = await AgentAX.ensureOnScreen(pid: pid)
+                    await AgentBackground.surface(pid: pid, b)
                     win = AgentCapture.listWindows().filter({ $0.pid == pid }).max(by: { $0.area < $1.area })
                 }
                 if let win { windowID = win.id }
+                else if AgentBackground.isBackground(b) { return AgentBackground.offSpaceError(pid: pid, verb: "capture") }
                 else { return ["error": "no window for pid \(pid) (it may have no open window — ⌘N in the app)"] }
             }
             guard window != nil || windowID != nil else {
@@ -133,7 +143,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 if windowID == nil, let pid = (b["pid"] as? NSNumber).map({ pid_t($0.intValue) }) {
                     var win = AgentCapture.listWindows().filter({ $0.pid == pid }).max(by: { $0.area < $1.area })
                     if win == nil {
-                        _ = await AgentAX.ensureOnScreen(pid: pid)
+                        await AgentBackground.surface(pid: pid, b)
                         win = AgentCapture.listWindows().filter({ $0.pid == pid }).max(by: { $0.area < $1.area })
                     }
                     if let win { windowID = win.id }
@@ -226,8 +236,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     var iterations = 0
                     var lastHash = baseline
                     var edge = false
+                    let background = AgentBackground.isBackground(b)
                     repeat {
-                        let r = self.performAction(action, b)
+                        let r = background ? await self.performBackground(action, b)
+                                           : self.performAction(action, b)
                         if r["error"] != nil {
                             var out = r; out["iterations"] = iterations
                             reply(out); return
@@ -323,8 +335,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 // Top-level target defaults merge into each step, so a plan
                 // for one app names it once.
                 var defaults: [String: Any] = [:]
-                for k in ["pid", "app", "target", "window", "window_id"] where b[k] != nil { defaults[k] = b[k]! }
+                for k in ["pid", "app", "target", "window", "window_id", "mode", "background"] where b[k] != nil {
+                    defaults[k] = b[k]!
+                }
                 let knownVerbs = ["click", "drag", "key", "scroll", "type", "press"]
+                let background = AgentBackground.isBackground(b)
                 // Validate the WHOLE plan before acting — a malformed step 5
                 // must not leave steps 1–4 half-executed.
                 var steps: [(doPart: [String: Any], verb: String, expect: [String: Any]?, retry: Int)] = []
@@ -343,6 +358,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     let verb = doPart["verb"] as? String ?? ""
                     guard knownVerbs.contains(verb) else {
                         reply(["error": "step \(i + 1): unknown verb \"\(verb)\" — one of \(knownVerbs.joined(separator: "/"))"]); return
+                    }
+                    if AgentBackground.isBackground(doPart), verb == "drag" || verb == "scroll" {
+                        reply(["error": "step \(i + 1): \(verb) has no background equivalent (it needs the real pointer) — "
+                            + "replace it (scroll → press/scroll-to the element) or run the plan with --foreground",
+                               "needs_foreground": true, "mode": "background"]); return
                     }
                     var expect = step["expect"] as? [String: Any]
                     if var e = expect {
@@ -376,8 +396,40 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 }
 
                 // One actuator step (press = AX predicate resolved fresh).
+                // Background type steps verify inside the actuator; the verdict
+                // is handed to verifyStep through this.
+                var backgroundTypeVerdict: Bool?? = nil
                 @MainActor
                 func performStep(_ verb: String, _ d: [String: Any]) async -> [String: Any] {
+                    if AgentBackground.isBackground(d) {
+                        switch verb {
+                        case "press":
+                            guard let pid = stepPID(d) else { return ["error": "press step needs a pid or target"] }
+                            let role = d["role"] as? String
+                            let title = (d["title"] as? String) ?? (d["name"] as? String)
+                            let ticket = FocusShield.shared.begin(target: pid)
+                            var r: [String: Any]
+                            do {
+                                let q = try await AgentAX.queryAct(app: nil, pid: pid, role: role, title: title,
+                                                                   max: 5, act: .press,
+                                                                   root: AgentBackground.agentWindow(pid: pid))
+                                if let el = q.element { AgentBackground.noteActed(el, pid: pid) }
+                                r = q.acted.map { ["ok": true, "pressed": $0.name] }
+                                    ?? ["error": "press matched no element (role \(role ?? "*"), title \"\(title ?? "*")\")"]
+                            } catch { r = ["error": error.localizedDescription] }
+                            r["interference"] = await FocusShield.shared.finish(ticket)
+                            return r
+                        case "type":
+                            let r = await self.backgroundType(d)
+                            switch r["landed"] {
+                            case let v as Bool: backgroundTypeVerdict = .some(v)
+                            default: backgroundTypeVerdict = .some(nil)
+                            }
+                            return r
+                        default:
+                            return await self.performBackground(verb, d)
+                        }
+                    }
                     switch verb {
                     case "press":
                         let role = d["role"] as? String
@@ -418,6 +470,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 @MainActor
                 func verifyStep(_ verb: String, _ d: [String: Any], preValue: String?) async -> (Bool?, String) {
                     guard verb == "type" || verb == "key" else { return (nil, "") }
+                    // Background: keystrokes went to the process, not the
+                    // frontmost app (which is the human's, by design); type
+                    // already re-read its own value.
+                    if AgentBackground.isBackground(d) {
+                        guard verb == "type", let verdict = backgroundTypeVerdict else { return (nil, "") }
+                        backgroundTypeVerdict = nil
+                        if verdict == nil {
+                            return (nil, "typed text isn't host-verifiable here (focused element exposes no AX value — canvas/engine-drawn?)")
+                        }
+                        return (verdict, verdict == false ? "the focused element's value is unchanged after typing" : "")
+                    }
                     guard let pid = stepPID(d) else { return (nil, "") }
                     // Keystrokes route to the FRONTMOST app: focus moved =
                     // the keys landed somewhere else, though the events
@@ -570,10 +633,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 }
 
                 if let pid = (defaults["pid"] as? NSNumber).map({ pid_t($0.intValue) }) {
-                    _ = await AgentAX.ensureOnScreen(pid: pid)
+                    await AgentBackground.surface(pid: pid, b)
                 }
                 let runStart = Date()
                 var retriesTotal = 0
+                var focusSteals = 0              // background steps that made the target frontmost
                 var unverified: [Int] = []       // steps whose effect the host couldn't check
                 for (i, step) in steps.enumerated() {
                     guard Date().timeIntervalSince(runStart) < 300 else {
@@ -618,6 +682,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                         }
                         ledger["ok"] = r["error"] == nil
                         ledger["satisfied"] = satisfied
+                        if let inter = r["interference"] as? [String: Any] {
+                            ledger["focus_kept"] = inter["focus_kept"]
+                            if inter["stolen_by_target"] != nil { focusSteals += 1 }
+                        }
                         if !satisfied { ledger["reason"] = lastReason }
                         DevtoolsRelay.shared.logRunStep(
                             args: ["step": i + 1, "verb": step.verb, "attempt": attempt]
@@ -650,6 +718,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     out["screen_hash"] = r.screenHash
                 }
                 var notes: [String] = []
+                if background {
+                    out["mode"] = "background"
+                    out["focus_steals"] = focusSteals
+                    if focusSteals > 0 {
+                        notes.append("\(focusSteals) step\(focusSteals == 1 ? "" : "s") made the target app frontmost; the "
+                            + "focus shield handed focus back each time — grep route run.step for focus_kept:false")
+                    }
+                }
                 if retriesTotal > 0 {
                     notes.append("completed, but \(retriesTotal) retr\(retriesTotal == 1 ? "y" : "ies") were needed — "
                         + "if the final state looks off, grep route run.step in calls.ndjson")
@@ -766,6 +842,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         DevtoolsRelay.shared.onAgentNavigate = { b in
             guard let url = b["url"] as? String else { return ["error": "expected {url}"] }
+            // Background: CDP (--port / --via-extension) doesn't activate, so it
+            // stays as is. Without it, drive the browser's address bar via AX —
+            // `open -g` and AppleScript both ACTIVATED Chrome when measured.
+            if AgentBackground.isBackground(b), b["port"] == nil,
+               (b["via_extension"] as? NSNumber)?.boolValue != true {
+                guard let pid = AgentBackground.targetPID(b) else {
+                    return ["error": "navigate (background) needs --pid/--app (address bar via AX), "
+                        + "or --via-extension / --port (CDP)", "mode": "background"]
+                }
+                let ticket = FocusShield.shared.begin(target: pid)
+                var out = await AgentBackground.navigate(pid: pid, url: url)
+                out["mode"] = "background"
+                out["interference"] = await FocusShield.shared.finish(ticket)
+                return out
+            }
             let port = UInt16((b["port"] as? NSNumber)?.intValue ?? 9222)
             let match = b["match"] as? String
             let viaExt = (b["via_extension"] as? NSNumber)?.boolValue ?? false
@@ -779,6 +870,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             catch { return ["error": error.localizedDescription] }
         }
         DevtoolsRelay.shared.onAgentFocus = { b in
+            if AgentBackground.isBackground(b) {
+                return AgentBackground.needsForeground("focus", "it brings the tab's window to the front",
+                    hint: "Background mode acts on the window where it is — skip this call.")
+            }
             let port = UInt16((b["port"] as? NSNumber)?.intValue ?? 9222)
             let match = b["match"] as? String
             let viaExt = (b["via_extension"] as? NSNumber)?.boolValue ?? false
@@ -878,10 +973,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     if win == nil {
                         // Default for --pid/--app: auto-raise an off-Space window (it
                         // can't be screenshotted off-stage) instead of erroring.
-                        _ = await AgentAX.ensureOnScreen(pid: pid)
+                        await AgentBackground.surface(pid: pid, b)
                         win = AgentCapture.listWindows().filter({ $0.pid == pid }).max(by: { $0.area < $1.area })
                     }
                     guard let win else {
+                        if AgentBackground.isBackground(b) { return AgentBackground.offSpaceError(pid: pid, verb: "som") }
                         return ["error": "no window for that app/pid (it may have no open windows — ⌘N in the app)"]
                     }
                     // Query generously, then keep only this window's elements.
@@ -1024,16 +1120,64 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             let title = (b["title"] as? String) ?? (b["name"] as? String)
             let maxN = (b["max"] as? NSNumber)?.intValue ?? 100
             let press = (b["press"] as? NSNumber)?.boolValue ?? false
+            // Element actions on the first match — all element-addressed, so
+            // they need no pointer, no keyboard, no activation (background-safe):
+            //   --press  --focus  --set-value "…"  --scroll-to  --action AXShowMenu
+            var act: AgentAX.ElementAct? = nil
+            if press { act = .press }
+            else if (b["focus"] as? NSNumber)?.boolValue == true { act = .focus }
+            else if let v = b["set_value"] as? String { act = .setValue(v) }
+            else if let v = b["set_value"] as? NSNumber { act = .setValue(v.stringValue) }
+            else if (b["scroll_to"] as? NSNumber)?.boolValue == true { act = .scrollTo }
+            else if let a = b["action"] as? String, !a.isEmpty {
+                act = .action(a.hasPrefix("AX") ? a : "AX" + a.prefix(1).uppercased() + a.dropFirst())
+            }
+            let background = AgentBackground.isBackground(b)
             do {
-                // Auto-raise (default for --pid/--app): Chromium/Flutter expose their
-                // a11y tree only when foreground, so surface an off-Space window first.
+                // Auto-raise (foreground default for --pid/--app): surface an
+                // off-Space window first. Background mode never raises — and
+                // Chromium builds its tree for a background window anyway
+                // (measured), given a beat.
                 let resolvedPID = try? AgentAX.resolvePID(app: app, pid: pid)
                 if let rp = resolvedPID {
-                    _ = await AgentAX.ensureOnScreen(pid: rp)
+                    await AgentBackground.surface(pid: rp, b)
+                    if background, act != nil, !AgentCapture.listWindows().contains(where: { $0.pid == rp }) {
+                        return AgentBackground.offSpaceError(pid: rp, verb: "query-ax --\(act!.label)")
+                    }
                 }
-                let (matches, pressed) = try await AgentAX.query(
-                    app: app, pid: pid, role: role, title: title, max: maxN, press: press)
+                let ticket = (background && act != nil) ? resolvedPID.map { FocusShield.shared.begin(target: $0) } : nil
+                // Background acts stay inside the agent's window — never a
+                // match in the human's own window of the same app.
+                let root = (background && act != nil) ? resolvedPID.flatMap { AgentBackground.agentWindow(pid: $0) } : nil
+                let qr = try await AgentAX.queryAct(
+                    app: app, pid: pid, role: role, title: title, max: maxN, act: act, root: root)
+                let matches = qr.matches
+                let pressed: AgentAX.AXMatch? = press ? qr.acted : nil
                 var out: [String: Any] = ["ok": true, "count": matches.count]
+                if let act, let acted = qr.acted {
+                    out["acted"] = ["action": act.label, "role": acted.role, "name": acted.name]
+                    if let code = qr.axResult, code != .success {
+                        out["ax_error"] = Int(code.rawValue)
+                        out["note"] = "the AX call returned error \(code.rawValue) — \(acted.role) may not support "
+                            + "\(act.label); check the effect before relying on it"
+                    }
+                    if let el = qr.element, let rp = resolvedPID { AgentBackground.noteActed(el, pid: rp) }
+                    // set-value: re-read the element (AX lags the write by a beat).
+                    if case .setValue(let text) = act, let el = qr.element {
+                        var value = ""
+                        for _ in 0..<8 {
+                            value = AgentAX.copyString(el, kAXValueAttribute as CFString) ?? ""
+                            if value == text || (!text.isEmpty && value.contains(text)) { break }
+                            try? await Task.sleep(nanoseconds: 120_000_000)
+                        }
+                        out["value"] = String(value.prefix(300))
+                        out["landed"] = value == text || (!text.isEmpty && value.contains(text))
+                    }
+                }
+                if let ticket {
+                    out["mode"] = "background"
+                    out["interference"] = await FocusShield.shared.finish(ticket)
+                }
                 let brief = (b["brief"] as? NSNumber)?.boolValue ?? false
                 // Snapshot key: same target + same filters = comparable observations.
                 let els = matches.map { AgentPerception.Element(role: $0.role, name: $0.name, rect: $0.rect) }
@@ -1107,6 +1251,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // driving the GUI from a terminal inside FloatyTerm.
         DevtoolsRelay.shared.onAgentHost = { [weak self] b in
             guard let self else { return ["error": "no self"] }
+            // Capability probe: the CLI asks before any background-mode call,
+            // because an older host ignores `mode` and would run the call in
+            // the FOREGROUND (activate + real cursor) while reporting success.
+            if b["probe"] != nil { return ["ok": true, "background_mode": true] }
             let on: Bool
             if let s = b["ghost"] as? String { on = ["on", "true", "1", "yes"].contains(s.lowercased()) }
             else if let n = b["ghost"] as? NSNumber { on = n.boolValue }
@@ -1290,7 +1438,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             do {
                 let f = try AgentAX.focused(app: app, pid: pid)
                 return ["ok": true, "has_focus": f.hasFocus, "role": f.role,
-                        "name": f.name, "value": f.value, "editable": f.editable]
+                        "name": f.name, "value": f.value, "editable": f.editable, "window": f.window]
             } catch { return ["error": error.localizedDescription] }
         }
         // set-text: write into the focused field by SETTING its AXValue directly,
@@ -1305,6 +1453,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             guard app != nil || pid != nil else {
                 return ["error": "expected {app} or {pid} (see `floaty list-windows` for pids). "
                     + "Focus the field first (click → `floaty focused`), then set-text writes into it."]
+            }
+            if AgentBackground.isBackground(b), let rp = try? AgentAX.resolvePID(app: app, pid: pid) {
+                // set-text writes the app's FOCUSED element — the same hazard as
+                // pid-posted keys: it must be in the agent's window, not the
+                // human's own window of this app.
+                let (route, err, _) = await AgentBackground.keyRoute(pid: rp)
+                if route == nil { return ["error": "set-text (background): \(err ?? "no key route")", "mode": "background"] }
             }
             do {
                 let r = try await AgentAX.setText(app: app, pid: pid, text: text)
@@ -1328,6 +1483,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // path that moots synthetic-keystroke flakiness. Browsers are refused (the
         // personal-profile / singleton-lock problem); they stay on osascript/AX.
         DevtoolsRelay.shared.onAgentEnableCDP = { b in
+            if AgentBackground.isBackground(b) {
+                return AgentBackground.needsForeground("enable-cdp", "it quits and relaunches the app",
+                    hint: "Run it once with --foreground while nobody is using that app.")
+            }
             guard let app = b["app"] as? String else {
                 return ["error": "expected {app} (the Electron app to relaunch with a debug port, e.g. Slack)"]
             }
@@ -1359,6 +1518,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // off-stage / other-Space / inactive-full-screen window: list-windows sees
         // on_screen:false → raise → capture/som/click now work (no manual step).
         DevtoolsRelay.shared.onAgentRaise = { b in
+            if AgentBackground.isBackground(b) {
+                return AgentBackground.needsForeground("raise", "raising a window activates its app",
+                    hint: "Move the agent's window onto a visible Space by hand (e.g. your second display), "
+                        + "or run raise with --foreground.")
+            }
             let app = b["app"] as? String
             let pid = (b["pid"] as? NSNumber).map { pid_t($0.intValue) }
             guard app != nil || pid != nil else {
@@ -1389,7 +1553,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 // and the OCR fallback needs it on-screen — so this makes the read
                 // richer, not just the fallback work. No-op if already on-screen.
                 if let rp = try? AgentAX.resolvePID(app: app, pid: pid) {
-                    _ = await AgentAX.ensureOnScreen(pid: rp)
+                    await AgentBackground.surface(pid: rp, b)
                 }
                 // --sections: labeled regions (by ARIA landmark) so the caller can
                 // pick "the thread/detail pane" without awk-ing the flat dump.
@@ -1412,6 +1576,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                         .filter({ $0.pid == resolvedPID }).max(by: { $0.area < $1.area }) else {
                     let off = AgentCapture.listWindows(includingOffScreen: true)
                         .filter { $0.pid == resolvedPID && !$0.onScreen }
+                    if !off.isEmpty, AgentBackground.isBackground(b) {
+                        return AgentBackground.offSpaceError(pid: resolvedPID, verb: "read-text")
+                    }
                     if !off.isEmpty {
                         return ["error": "\(app ?? "pid \(resolvedPID)") is off the current Space/Stage; run "
                             + "`floaty raise --pid \(resolvedPID)` to surface it, then retry (need it visible to OCR)."]
@@ -1461,6 +1628,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     || abs(cur.bounds.size.height - frame.windowBounds.size.height) > tol {
                     return ["error": "the window moved or resized since `floaty som`; re-run `floaty som`"]
                 }
+                if AgentBackground.isBackground(b) {
+                    if let refusal = self.backgroundClickRefusal(b, verb: "click-mark") { return refusal }
+                    var bb = b
+                    if frame.pid != 0 { bb["pid"] = NSNumber(value: frame.pid) }
+                    var out = await self.backgroundPress(at: mark.center, bb, verb: "click-mark")
+                    if out["error"] == nil { out["id"] = id; out["role"] = mark.role; out["name"] = mark.name }
+                    return out
+                }
                 // Raise that EXACT process (pid-precise → no two-Chrome ambiguity)
                 // via the full cooperative-activation path, then click its center.
                 let clicks = (b["clicks"] as? NSNumber)?.intValue ?? 1
@@ -1491,6 +1666,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     }
                 }
             } catch { return ["error": "click-mark: \(error.localizedDescription)"] }
+            if AgentBackground.isBackground(b) {
+                // No raise: press the element under the mark via AX instead.
+                if let refusal = self.backgroundClickRefusal(b, verb: "click-mark") { return refusal }
+                var out = await self.backgroundPress(at: mark.center, b, verb: "click-mark")
+                if out["error"] == nil { out["id"] = id; out["role"] = mark.role; out["name"] = mark.name }
+                return out
+            }
             // Raise the tab's window so the screen-point click lands on it.
             try? await AgentDOM.bringToFront(port: frame.port, match: frame.match, viaExtension: frame.viaExtension)
             let clicks = (b["clicks"] as? NSNumber)?.intValue ?? 1
@@ -2391,7 +2573,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if let pid = (b["pid"] as? NSNumber).map({ pid_t($0.intValue) }) {
             var win = AgentCapture.listWindows().filter({ $0.pid == pid }).max(by: { $0.area < $1.area })
             if win == nil {
-                _ = await AgentAX.ensureOnScreen(pid: pid)
+                await AgentBackground.surface(pid: pid, b)
                 win = AgentCapture.listWindows().filter({ $0.pid == pid }).max(by: { $0.area < $1.area })
             }
             if let win { return win.id }
@@ -2402,7 +2584,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             // Space (seen live: `run --target MarkEdit` failed while MarkEdit
             // sat off-Space). Resolve to a pid and raise, like the pid path.
             if let pid = try? AgentAX.resolvePID(app: name, pid: nil) {
-                _ = await AgentAX.ensureOnScreen(pid: pid)
+                await AgentBackground.surface(pid: pid, b)
                 if let win = AgentCapture.listWindows().filter({ $0.pid == pid }).max(by: { $0.area < $1.area }) {
                     return win.id
                 }
@@ -2457,6 +2639,146 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         default:
             return ["error": "unknown action \"\(action)\""]
         }
+    }
+
+    /// Background-mode actuator: the same verbs without the HID path — a click
+    /// is an AXPress on the element under the point, keys are posted to the
+    /// target process — each wrapped in the focus shield, which measures the
+    /// human's focus and hands it back if the action made the target
+    /// frontmost. Verbs with no non-interfering equivalent refuse with
+    /// needs_foreground instead of silently falling back.
+    @MainActor
+    private func performBackground(_ action: String, _ b: [String: Any]) async -> [String: Any] {
+        switch action {
+        case "click", "click-in-frame":
+            if let refusal = backgroundClickRefusal(b, verb: action) { return refusal }
+            let p: CGPoint
+            if action == "click-in-frame" {
+                do { p = try resolveFrame(b).point } catch { return ["error": error.localizedDescription] }
+            } else {
+                guard let pt = point(b) else { return ["error": "expected {x,y}"] }
+                p = pt
+            }
+            return await backgroundPress(at: p, b, verb: action)
+        case "key":
+            guard let key = b["key"] as? String else { return ["error": "expected {key}"] }
+            guard AgentInput.isKnownKey(key) else {
+                return ["error": "key failed: \"\(key)\" is not a known key name (see `floaty help`)"]
+            }
+            guard let pid = AgentBackground.targetPID(b) else {
+                return ["error": "key (background) needs --pid or --target: keys are posted to one process, "
+                    + "never to whatever is frontmost", "mode": "background"]
+            }
+            let modifiers = mods(b)
+            return await backgroundKeystrokes(pid: pid, verb: "key") { _ in
+                AgentBackground.postKey(key, modifiers: modifiers, pid: pid)
+                return ["key": key]
+            }
+        case "move", "move-in-frame":
+            return AgentBackground.needsForeground(action, "hovering needs the real cursor, which you share with the human",
+                hint: "Run this call with --foreground if the hover state matters.")
+        case "drag":
+            return AgentBackground.needsForeground("drag", "a drag needs the real pointer and button",
+                hint: "Run it with --foreground (it will take the pointer for the drag).")
+        case "scroll":
+            return AgentBackground.needsForeground("scroll", "wheel events go to whatever is under the REAL cursor",
+                hint: "Bring a control into view with `query-ax --title … --scroll-to`, or focus something in the "
+                    + "page and send `key --key pgdown --background --pid N`. AXPress also works on off-screen elements.")
+        default:
+            return ["error": "unknown action \"\(action)\""]
+        }
+    }
+
+    /// Only a plain left single click maps to AXPress.
+    private func backgroundClickRefusal(_ b: [String: Any], verb: String) -> [String: Any]? {
+        let clicks = (b["clicks"] as? NSNumber)?.intValue ?? 1
+        if button(b) == .left, clicks == 1, mods(b).isEmpty { return nil }
+        return AgentBackground.needsForeground(verb,
+            "only a plain left single click maps to an AXPress (got \(button(b).rawValue) ×\(clicks)"
+                + (mods(b).isEmpty ? "" : " with \(mods(b).joined(separator: "+"))") + ")",
+            hint: "Context menu: `query-ax --title … --action AXShowMenu`. Otherwise use --foreground.")
+    }
+
+    /// Click → AXPress on the element under `p`, inside the focus shield.
+    @MainActor
+    private func backgroundPress(at p: CGPoint, _ b: [String: Any], verb: String) async -> [String: Any] {
+        guard let pid = AgentBackground.targetPID(b, at: p) else {
+            return ["error": "\(verb) (background): no window under \(Int(p.x)),\(Int(p.y)) and no --pid/--target",
+                    "mode": "background"]
+        }
+        guard AgentCapture.listWindows().contains(where: { $0.pid == pid }) else {
+            return AgentBackground.offSpaceError(pid: pid, verb: verb)
+        }
+        let ticket = FocusShield.shared.begin(target: pid)
+        var out: [String: Any]
+        do {
+            let pressed = try await AgentBackground.press(at: p, pid: pid)
+            out = ["ok": true, "mode": "background", "via": "ax-press",
+                   "screen_x": p.x, "screen_y": p.y,
+                   "pressed": ["role": pressed.role, "name": pressed.name,
+                               "center_x": pressed.center.x, "center_y": pressed.center.y]]
+        } catch {
+            out = ["error": "\(verb) (background): \(error.localizedDescription)", "mode": "background"]
+        }
+        out["interference"] = await FocusShield.shared.finish(ticket)
+        return out
+    }
+
+    /// Shared guard for pid-posted keystrokes (key / type): never into an app
+    /// the human is using, only into the agent's own window of the target,
+    /// always inside the focus shield.
+    @MainActor
+    private func backgroundKeystrokes(pid: pid_t, verb: String,
+                                      _ send: (AgentBackground.KeyRoute) async -> [String: Any]) async -> [String: Any] {
+        if NSWorkspace.shared.frontmostApplication?.processIdentifier == pid {
+            let name = NSRunningApplication(processIdentifier: pid)?.localizedName ?? "the target"
+            return ["error": "\(verb) (background): \(name) is the frontmost app — someone may be typing in it, "
+                + "and background keystrokes would interleave with theirs. Use --foreground if nobody is.",
+                    "mode": "background"]
+        }
+        guard AgentCapture.listWindows().contains(where: { $0.pid == pid }) else {
+            return AgentBackground.offSpaceError(pid: pid, verb: verb)
+        }
+        let (route, err, note) = await AgentBackground.keyRoute(pid: pid)
+        guard let route else {
+            return ["error": "\(verb) (background): \(err ?? "no key route")", "mode": "background"]
+        }
+        let ticket = FocusShield.shared.begin(target: pid)
+        var out: [String: Any] = ["ok": true, "mode": "background", "via": "post-to-pid",
+                                  "into": ["role": route.role, "name": route.name, "window": route.window]]
+        for (k, v) in await send(route) { out[k] = v }
+        if let note { out["note"] = note }
+        out["interference"] = await FocusShield.shared.finish(ticket)
+        return out
+    }
+
+    /// type --background: post the text to the process, then re-read the
+    /// focused value. landed:false is an error (the keys went nowhere);
+    /// unverifiable fields (canvas, secure) pass with landed:"unverifiable".
+    @MainActor
+    private func backgroundType(_ b: [String: Any]) async -> [String: Any] {
+        guard let text = b["text"] as? String else { return ["error": "expected {text}"] }
+        guard let pid = AgentBackground.targetPID(b) else {
+            return ["error": "type (background) needs --pid or --target: text is posted to one process, "
+                + "never to whatever is frontmost", "mode": "background"]
+        }
+        var out = await backgroundKeystrokes(pid: pid, verb: "type") { route in
+            let typed = await AgentBackground.postText(text, pid: pid)
+            var r: [String: Any] = ["typed": typed]
+            switch await AgentBackground.verifyTyped(text, pid: pid, before: route.value) {
+            case true?: r["landed"] = true
+            case false?: r["landed"] = false
+            case nil: r["landed"] = "unverifiable"
+            }
+            return r
+        }
+        if (out["landed"] as? Bool) == false {
+            out["ok"] = false
+            out["error"] = "type (background): the focused \(((out["into"] as? [String: Any])?["role"] as? String) ?? "element")'s "
+                + "value didn't change — the keystrokes didn't land. Press the field first (Flutter opens its "
+                + "edit session on a press), check `floaty focused --pid \(pid)`, then retry."
+        }
+        return out
     }
 
     /// Optional pacing from the JSON body: `duration` (seconds) wins, else a
