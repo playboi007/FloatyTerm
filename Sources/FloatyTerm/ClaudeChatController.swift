@@ -9,6 +9,7 @@ final class ClaudeChatController: NSObject, TabContent, WKNavigationDelegate {
     let agent: ChatAgent
     private let container = NSView()
     private let webView: DropWebView
+    private var appearanceToken: NSObjectProtocol?
 
     /// One conversation and its sidecar: "main", or a side chat ("side-1", …)
     /// forked from main. Each has its own session file, so they can run at once.
@@ -56,6 +57,7 @@ final class ClaudeChatController: NSObject, TabContent, WKNavigationDelegate {
         channels[main.id] = main
         SkimAssets.install(in: config, chat: true) { [weak self] action in self?.handle(action) }
         webView.navigationDelegate = self
+        appearanceToken = SkimAssets.followAppearance(webView)
         webView.setValue(false, forKey: "drawsBackground")
         webView.translatesAutoresizingMaskIntoConstraints = false
         container.addSubview(webView)
@@ -206,6 +208,9 @@ final class ClaudeChatController: NSObject, TabContent, WKNavigationDelegate {
             var m: [String: Any] = ["type": "user", "text": text]
             if let uuid = action["uuid"] as? String, Self.isID(uuid) { m["uuid"] = uuid }
             if let images = action["images"] as? [[String: Any]], !images.isEmpty { m["images"] = images }
+            if let display = action["display"] as? String { m["display"] = display }
+            if let priority = action["priority"] as? String { m["priority"] = priority }
+            if let query = action["shouldQuery"] as? Bool { m["shouldQuery"] = query }
             ch.sidecar.send(m)
         case "permission":
             var m: [String: Any] = ["type": "permission"]
@@ -230,6 +235,23 @@ final class ClaudeChatController: NSObject, TabContent, WKNavigationDelegate {
             ch.sidecar.send(m)
         case "interrupt":
             ch.sidecar.send(["type": "interrupt"])
+        case "background":
+            var m: [String: Any] = ["type": "background"]
+            if let tool = action["toolUseId"] as? String { m["toolUseId"] = tool }
+            ch.sidecar.send(m)
+        case "stopTask":
+            guard let task = action["taskId"] as? String, !task.isEmpty else { return }
+            ch.sidecar.send(["type": "stopTask", "taskId": task])
+        case "shell", "shellKill":
+            // A ! command: the conversation's own sidecar runs it in the session folder, else any running one.
+            guard let sid = action["id"] as? String else { return }
+            guard let runner = ch.sidecar.isRunning ? ch : channels.values.first(where: { $0.sidecar.isRunning }) else {
+                if type == "shell" { deliverJSON(["type": "shell", "id": sid, "done": true, "error": "the session is not running here. Send a message to start it."], to: id) }
+                return
+            }
+            var m: [String: Any] = ["type": type, "id": sid]
+            if let command = action["command"] as? String { m["command"] = command }
+            runner.sidecar.send(m)
         case "setPermissionMode":
             ch.permissionMode = action["mode"] as? String
             ch.sidecar.send(["type": "setPermissionMode", "mode": ch.permissionMode ?? "default"])
@@ -312,7 +334,13 @@ final class ClaudeChatController: NSObject, TabContent, WKNavigationDelegate {
                 }
                 dictation?.start()
             } else { dictation?.stop() }
-        case "git", "sessions":
+        case "review", "goal", "usageHistory", "importDetect", "importRun", "marketplace", "setPermissionProfile", "permissionProfiles", "guardianOverride":
+            // Codex-only controls: the page's fields go to the sidecar as they are.
+            guard agent == .codex, ch.sidecar.isRunning else { return }
+            var m: [String: Any] = ["type": type]
+            for (key, value) in action where key != "type" { m[key] = value }
+            ch.sidecar.send(m)
+        case "git", "sessions", "promptHistory", "catalog":
             // Any running sidecar can read git and the session list of the shared folder.
             (ch.sidecar.isRunning ? ch : channels.values.first { $0.sidecar.isRunning } ?? ch).sidecar.send(["type": type])
         case "resume":
@@ -515,6 +543,7 @@ final class ClaudeChatController: NSObject, TabContent, WKNavigationDelegate {
     }
 
     func cleanup() {
+        if let appearanceToken { NotificationCenter.default.removeObserver(appearanceToken) }
         stopRealtime()
         dictation?.cancel()
         for ch in channels.values {

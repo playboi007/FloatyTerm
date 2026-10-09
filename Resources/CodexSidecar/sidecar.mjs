@@ -15,6 +15,7 @@ const STDERR_BYTES = 4000;
 const REQUEST_TIMEOUT_MS = 30_000;
 const HISTORY_TURN_LIMIT = 300;
 const HISTORY_ITEM_LIMIT = 5000;
+const SHELL_MAX = 1 << 20;
 
 const COMMANDS = [
   ['model', 'Choose the Codex model', '[model]'],
@@ -35,7 +36,7 @@ const COMMANDS = [
 const featureSet = {
   approvals: true, fork: true, history: true, models: true, effort: true,
   permissionMode: true, thinking: true, usage: true, git: true, tui: true,
-  slashCommands: true, midTurnInput: false,
+  slashCommands: true, midTurnInput: true, images: true, mentions: true, rename: true, shell: true,
 };
 
 const output = value => {
@@ -203,6 +204,7 @@ class CodexBridge {
     this.threadId = null;
     this.thread = null;
     this.models = [];
+    this.catalog = { skills: [], apps: [], plugins: [], mcp: [] };
     this.modelsById = new Map();
     this.model = null;
     this.effort = null;
@@ -214,6 +216,12 @@ class CodexBridge {
     this.approvals = new Map();
     this.items = new Map();
     this.childParents = new Map();
+    this.tasks = new Map();
+    this.shells = new Map();
+    this.permissionProfiles = [];
+    this.permissionProfile = null;
+    this.guardianDenied = new Map();
+    this.importItems = [];
     this.processStreams = new Map();
     this.hostCalls = new Map();
     this.hostRequests = new Map();
@@ -290,6 +298,8 @@ class CodexBridge {
       await this.readRateLimits(false);
       await this.openThread(message);
       await this.readAccount(false);
+      void this.loadCatalog();
+      void this.loadPermissionProfiles();
       this.started = true;
       this.starting = false;
       for (const pending of this.startQueue.splice(0)) this.handleControl(pending);
@@ -362,12 +372,13 @@ class CodexBridge {
     await this.stopRealtime();
     const sandbox = this.currentSandbox();
     const config = {};
+    if (this.permissionProfile) config.default_permissions = this.permissionProfile;
     if (this.effort) config.model_reasoning_effort = this.effort;
     if (typeof message.thinking === 'boolean' || this.configSummary) config.model_reasoning_summary = this.thinkingOn ? 'detailed' : 'none';
     const common = {
       cwd: this.config.cwd,
       approvalPolicy: 'on-request',
-      sandbox,
+      ...(this.permissionProfile ? {} : { sandbox }),
       ...(this.model?.model ? { model: this.model.model } : {}),
       ...(Object.keys(config).length ? { config } : {}),
     };
@@ -388,7 +399,7 @@ class CodexBridge {
   applyThread(response, { emitSession = true } = {}) {
     const thread = response?.thread;
     if (!thread?.id) throw new Error('Codex app-server did not return a thread id.');
-    if (this.threadId !== thread.id) { this.cancelHostTools('Conversation changed.'); this.items.clear(); this.childParents.clear(); this.processStreams.clear(); this.latestUsage = null; this.cancelApprovals(); }
+    if (this.threadId !== thread.id) { this.cancelHostTools('Conversation changed.'); this.items.clear(); this.childParents.clear(); this.tasks.clear(); this.processStreams.clear(); this.latestUsage = null; this.cancelApprovals(); }
     this.thread = thread;
     this.threadId = thread.id;
     if (response.model) {
@@ -468,11 +479,294 @@ class CodexBridge {
     this.emit('usage', value, { type: 'usage.snapshot', source: unavailable ? 'unavailable' : 'app-server' });
   }
 
-  async user(text) {
+  /** @-mention suggestions: Codex's own fuzzy file search over the session folder. */
+  async files(message) {
+    const query = String(message.query || '');
+    let suggestions = [];
+    try {
+      const result = await this.rpc.request('fuzzyFileSearch', { query: query || '.', roots: [this.config.cwd] });
+      suggestions = (result?.files || []).slice().sort((a, b) => (b.score || 0) - (a.score || 0)).slice(0, 30).map(file => ({ path: file.path }));
+    } catch (error) { this.emit('files', { id: message.id, query, suggestions: [], error: plainError(error) }, { type: 'files.error' }); return; }
+    this.emit('files', { id: message.id, query, suggestions }, { type: 'files.result' });
+  }
+
+  async title() {
+    try {
+      const result = await this.rpc.request('thread/read', { threadId: this.threadId, includeTurns: false });
+      const thread = result?.thread || this.thread || {};
+      this.emit('title', { sessionId: this.threadId, title: thread.name || thread.preview || '', custom: !!thread.name }, { type: 'title.read' });
+    } catch (error) { this.notice('info', `Could not read the conversation name: ${plainError(error)}`); }
+  }
+
+  async rename(message) {
+    const name = String(message.title || '').trim();
+    if (!name || !this.threadId) return;
+    try {
+      await this.rpc.request('thread/name/set', { threadId: this.threadId, name });
+      if (this.thread) this.thread.name = name;
+      this.emit('title', { sessionId: this.threadId, title: name, custom: true }, { type: 'title.set' });
+    } catch (error) { this.notice('error', `Rename failed: ${plainError(error)}`); }
+  }
+
+  /** `!command` in the composer: runs in the session folder; output streams back to the page. */
+  runShell(message) {
+    const id = String(message.id || ''), command = String(message.command || '').trim();
+    const done = fields => this.emit('shell', { id, done: true, code: null, ...fields }, { type: 'shell.done' });
+    if (!id || !command) return done({ error: 'no command' });
+    let child;
+    try { child = spawn(process.env.SHELL || '/bin/zsh', ['-lc', command], { cwd: this.config.cwd, env: process.env, stdio: ['ignore', 'pipe', 'pipe'], detached: true }); }
+    catch (error) { return done({ error: error.message }); }
+    this.shells.set(id, child);
+    const sizes = { stdout: 0, stderr: 0 };
+    for (const stream of ['stdout', 'stderr']) child[stream].on('data', data => {
+      if (sizes[stream] >= SHELL_MAX) return;
+      const chunk = data.toString('utf8').slice(0, SHELL_MAX - sizes[stream]);
+      sizes[stream] += chunk.length;
+      this.emit('shell', { id, stream, chunk }, { type: 'shell.output' });
+    });
+    child.on('error', error => { this.shells.delete(id); done({ error: error.message }); });
+    child.on('close', (code, signal) => { if (this.shells.delete(id)) done({ code, signal: signal || null }); });
+  }
+
+  killShell(id) {
+    const child = this.shells.get(String(id));
+    if (!child) return;
+    try { process.kill(-child.pid, 'SIGTERM'); } catch { try { child.kill('SIGTERM'); } catch { /* already gone */ } }
+  }
+
+  // ── review, profiles, goals, usage history, import, marketplace, guardian ──
+
+  /** /review: Codex reviews uncommitted changes, a branch diff, a commit, or custom instructions, inside this thread. */
+  async review(message) {
+    if (!this.started || !this.threadId) { this.notice('error', 'Codex app-server is not ready.', true); return; }
+    if (this.transitioning || this.active) { this.notice('info', 'Wait for the current turn to finish before starting a review.'); return; }
+    const t = message.target || {};
+    const target = t.type === 'uncommittedChanges' ? { type: 'uncommittedChanges' }
+      : t.type === 'baseBranch' && typeof t.branch === 'string' && t.branch.trim() ? { type: 'baseBranch', branch: t.branch.trim() }
+      : t.type === 'commit' && typeof t.sha === 'string' && t.sha.trim() ? { type: 'commit', sha: t.sha.trim(), ...(t.title ? { title: String(t.title) } : {}) }
+      : t.type === 'custom' && typeof t.instructions === 'string' && t.instructions.trim() ? { type: 'custom', instructions: t.instructions.trim() }
+      : null;
+    if (!target) { this.notice('info', 'Usage: /review uncommitted · /review base <branch> · /review commit <sha> · /review <instructions>'); return; }
+    this.items.clear();
+    const turn = { id: null, started: false, ended: false, interruptRequested: false, usage: null };
+    this.active = turn;
+    try {
+      const response = await this.rpc.request('review/start', { threadId: this.threadId, target, delivery: 'inline' });
+      if (response?.turn?.id) turn.id = response.turn.id;
+      if (!turn.ended && !turn.started && response?.turn) this.onTurnStarted({ threadId: this.threadId, turn: response.turn }, { method: 'turn/started', params: { threadId: this.threadId, turn: response.turn } });
+      if (turn.interruptRequested && turn.id) await this.interruptActive();
+    } catch (error) {
+      if (this.active === turn && !turn.ended) this.endTurn(turn, 'error', plainError(error), { type: 'review/start.error', error: plainError(error) });
+    }
+  }
+
+  /** The named permission profiles the server allows; a chosen one replaces the Workspace write / Read only modes. */
+  async loadPermissionProfiles() {
+    try {
+      const out = [];
+      let cursor;
+      do {
+        const result = await this.rpc.request('permissionProfile/list', { cwd: this.config.cwd, limit: 100, ...(cursor ? { cursor } : {}) });
+        out.push(...(result?.data || []));
+        cursor = result?.nextCursor || null;
+      } while (cursor && out.length < 200);
+      this.permissionProfiles = out.filter(profile => profile?.id).map(profile => ({ id: profile.id, description: profile.description || '', allowed: profile.allowed !== false }));
+    } catch (error) { this.permissionProfiles = []; }
+    this.emit('permissionProfiles', { profiles: this.permissionProfiles, active: this.permissionProfile }, { type: 'permissionProfile.list' });
+  }
+
+  async setPermissionProfile(message) {
+    const id = message.id ? String(message.id) : null;
+    if (id && !this.permissionProfiles.some(profile => profile.id === id && profile.allowed)) { this.notice('error', `Permission profile ${id} is not available.`); return; }
+    if (this.active || this.transitioning) { this.notice('info', 'Wait for the current turn to finish before changing the permission profile.'); return; }
+    const previous = this.permissionProfile;
+    this.permissionProfile = id;
+    try {
+      // A profile is a config key, not a per-turn field: resume this thread with it.
+      await this.transition(() => this.openThread({ resume: this.threadId }));
+      this.emit('permissionProfiles', { profiles: this.permissionProfiles, active: this.permissionProfile }, { type: 'permissionProfile.selected' });
+      this.notice('info', id ? `Permission profile: ${id}` : 'Back to the Workspace write / Read only modes.');
+    } catch (error) {
+      this.permissionProfile = previous;
+      this.notice('error', `Could not switch permission profile: ${plainError(error)}`);
+    }
+  }
+
+  /** /goal: set, pause, resume or clear the thread's objective. The panel updates from thread/goal/updated. */
+  async goal(message) {
+    if (!this.started || !this.threadId) return;
+    const threadId = this.threadId;
+    try {
+      switch (message.action) {
+        case 'clear': await this.rpc.request('thread/goal/clear', { threadId }); return;
+        case 'pause': await this.rpc.request('thread/goal/set', { threadId, status: 'paused' }); return;
+        case 'resume': await this.rpc.request('thread/goal/set', { threadId, status: 'active' }); return;
+        case 'set': {
+          const objective = String(message.objective || '').trim();
+          if (!objective) { this.notice('info', 'Usage: /goal <objective> [--budget <tokens>]'); return; }
+          const budget = Number(message.tokenBudget);
+          await this.rpc.request('thread/goal/set', { threadId, objective, status: 'active', ...(Number.isFinite(budget) && budget > 0 ? { tokenBudget: Math.round(budget) } : {}) });
+          return;
+        }
+        default: {
+          const result = await this.rpc.request('thread/goal/get', { threadId });
+          this.surfaceEvent(result?.goal ? 'thread/goal/updated' : 'thread/goal/cleared', { threadId, goal: result?.goal || null });
+        }
+      }
+    } catch (error) { this.notice('warn', `Goal: ${plainError(error)}`); }
+  }
+
+  async usageHistory() {
+    try {
+      const result = await this.rpc.request('account/usage/read', {});
+      this.emit('usageHistory', { summary: result?.summary || {}, daily: (result?.dailyUsageBuckets || []).map(bucket => ({ date: bucket.startDate, tokens: bucket.tokens })) }, { type: 'usage.history' });
+    } catch (error) { this.emit('usageHistory', { summary: {}, daily: [], error: plainError(error) }, { type: 'usage.history.error' }); }
+  }
+
+  /** /import: other agents' configuration found in this folder and the home folder. */
+  async importDetect(message) {
+    try {
+      const result = await this.rpc.request('externalAgentConfig/detect', { cwds: [this.config.cwd], includeHome: true, ...(message.source ? { migrationSource: String(message.source) } : {}) });
+      this.importItems = result?.items || [];
+      this.emit('import', { stage: 'detected', source: message.source || null, items: this.importItems.map((item, id) => ({ id, itemType: item.itemType, description: item.description, cwd: item.cwd || null })) }, { type: 'import.detect' });
+    } catch (error) { this.emit('import', { stage: 'error', message: plainError(error) }, { type: 'import.detect.error' }); }
+  }
+
+  async importRun(message) {
+    const ids = new Set((Array.isArray(message.ids) ? message.ids : []).map(Number));
+    const items = this.importItems.filter((item, id) => ids.has(id));
+    if (!items.length) { this.notice('info', 'Nothing selected to import.'); return; }
+    try {
+      const result = await this.rpc.request('externalAgentConfig/import', { migrationItems: items, ...(message.source ? { migrationSource: String(message.source) } : {}) });
+      this.emit('import', { stage: 'started', importId: result?.importId || null, count: items.length }, { type: 'import.start' });
+    } catch (error) { this.emit('import', { stage: 'error', message: plainError(error) }, { type: 'import.start.error' }); }
+  }
+
+  /** /marketplace and /plugins install|uninstall|share, with one notice for the result. */
+  async marketplace(message) {
+    const say = text => this.notice('info', text);
+    try {
+      switch (message.action) {
+        case 'add': {
+          const source = String(message.source || '').trim();
+          if (!source) return say('Usage: /marketplace add <source>');
+          const r = await this.rpc.request('marketplace/add', { source });
+          say(r?.alreadyAdded ? `Marketplace ${r.marketplaceName} was already added.` : `Added marketplace ${r?.marketplaceName || source}.`); break;
+        }
+        case 'remove': {
+          const name = String(message.name || '').trim();
+          if (!name) return say('Usage: /marketplace remove <name>');
+          await this.rpc.request('marketplace/remove', { marketplaceName: name }); say(`Removed marketplace ${name}.`); break;
+        }
+        case 'upgrade': {
+          const r = await this.rpc.request('marketplace/upgrade', message.name ? { marketplaceName: String(message.name) } : {});
+          const errors = (r?.errors || []).length;
+          say(`Upgraded ${(r?.upgradedRoots || []).length} of ${(r?.selectedMarketplaces || []).length} marketplaces` + (errors ? `; ${errors} failed.` : '.')); break;
+        }
+        case 'install': {
+          const pluginName = String(message.name || '').trim();
+          if (!pluginName) return say('Usage: /plugins install <name>');
+          const list = await this.rpc.request('plugin/list', { cwds: [this.config.cwd] });
+          const market = (list?.marketplaces || []).find(entry => (entry.plugins || []).some(plugin => plugin.name === pluginName || plugin.id === pluginName));
+          const plugin = market?.plugins.find(entry => entry.name === pluginName || entry.id === pluginName);
+          if (!plugin) return say(`No plugin named ${pluginName} in the added marketplaces.`);
+          const r = await this.rpc.request('plugin/install', { pluginName: plugin.name, ...(market.path ? { marketplacePath: market.path } : { remoteMarketplaceName: market.name }) });
+          say(`Installed ${plugin.name}.` + ((r?.appsNeedingAuth || []).length ? ` Sign in needed for: ${r.appsNeedingAuth.map(app => app.name || app.id || app).join(', ')}.` : '')); break;
+        }
+        case 'uninstall': {
+          const id = String(message.name || '').trim();
+          if (!id) return say('Usage: /plugins uninstall <plugin id>');
+          await this.rpc.request('plugin/uninstall', { pluginId: id }); say(`Uninstalled ${id}.`); break;
+        }
+        case 'share': {
+          const pluginPath = String(message.path || '').trim();
+          if (!pluginPath.startsWith('/')) return say('Usage: /plugins share <absolute plugin folder> [private|internal|public]');
+          const discoverability = ['private', 'internal', 'public'].includes(message.visibility) ? message.visibility : undefined;
+          const r = await this.rpc.request('plugin/share/save', { pluginPath, ...(discoverability ? { discoverability } : {}) });
+          say(`Shared plugin. ${r?.shareUrl || r?.remotePluginId || ''}`.trim()); break;
+        }
+        default: return say('Usage: /marketplace add|remove|upgrade …  ·  /plugins install|uninstall|share …');
+      }
+      void this.loadCatalog();
+    } catch (error) { this.notice('error', `${message.action || 'Marketplace'}: ${plainError(error)}`); }
+  }
+
+  /** Guardian review of an approval: risk and rationale for the page; a denial can be overridden by the user. */
+  onGuardianReview(method, params) {
+    const review = params.review || {};
+    const done = method.endsWith('/completed');
+    const ownerId = params.targetItemId ? toolId(params.threadId, params.turnId, params.targetItemId) : null;
+    if (done && review.status === 'denied') this.guardianDenied.set(params.reviewId, params);
+    this.emit('guardian', { reviewId: params.reviewId, status: review.status || (done ? 'completed' : 'inProgress'), riskLevel: review.riskLevel || null,
+      rationale: review.rationale || '', ownerId, canOverride: done && review.status === 'denied' }, { method });
+  }
+
+  async guardianOverride(message) {
+    const params = this.guardianDenied.get(String(message.reviewId));
+    if (!params) { this.notice('info', 'That denied action can no longer be approved.'); return; }
+    try {
+      await this.rpc.request('thread/approveGuardianDeniedAction', { threadId: params.threadId, event: params });
+      this.guardianDenied.delete(String(message.reviewId));
+      this.notice('info', 'Approved the denied action. Codex can retry it.');
+    } catch (error) { this.notice('error', `Could not approve the action: ${plainError(error)}`); }
+  }
+
+  /** Skills, apps, plugins and MCP servers: what `/` and `$` offer, and what the integrations panel lists. */
+  async loadCatalog() {
+    if (!this.rpc || this.rpc.dead || !this.config) return;
+    const cwd = this.config.cwd;
+    const [skills, apps, plugins, mcp] = await Promise.allSettled([
+      this.rpc.request('skills/list', { cwds: [cwd] }),
+      this.rpc.request('app/list', { limit: 100, ...(this.threadId ? { threadId: this.threadId } : {}) }),
+      this.rpc.request('plugin/installed', { cwds: [cwd] }),
+      this.rpc.request('mcpServerStatus/list', { limit: 100 }),
+    ]);
+    const ok = r => r.status === 'fulfilled' ? r.value || {} : {};
+    this.catalog = {
+      skills: (ok(skills).data || []).flatMap(entry => entry.skills || []).filter(skill => skill?.name && skill.path && skill.enabled !== false)
+        .map(skill => ({ name: skill.name, description: skill.interface?.shortDescription || skill.shortDescription || skill.description || '',
+          displayName: skill.interface?.displayName || null, path: skill.path, scope: skill.scope || null, pluginId: skill.pluginId || null })),
+      apps: (ok(apps).data || []).filter(app => app?.id && app.isEnabled !== false && app.isAccessible !== false)
+        .map(app => ({ id: app.id, name: app.name, description: app.description || '', path: 'app://' + app.id })),
+      plugins: (ok(plugins).marketplaces || []).flatMap(market => (market.plugins || []).filter(plugin => plugin.installed && plugin.enabled)
+        .map(plugin => ({ id: plugin.id, name: plugin.interface?.displayName || plugin.name, description: plugin.interface?.shortDescription || '',
+          marketplace: market.name, path: 'plugin://' + plugin.id }))),
+      mcp: (ok(mcp).data || []).map(server => ({ name: server.name, status: server.runtimeStatus || 'notStarted', auth: server.authStatus || null,
+        tools: Object.keys(server.tools || {}), resources: (server.resources || []).length, error: server.toolsError || null, pluginId: server.pluginId || null })),
+    };
+    this.emit('catalog', this.catalog, { type: 'catalog.snapshot' });
+  }
+
+  /** `$name` in the text becomes a structured skill, app or plugin input, as the Codex TUI does. */
+  mentionInputs(text) {
+    const out = [], seen = new Set();
+    for (const match of text.matchAll(/(^|\s)\$([A-Za-z0-9][\w.:-]*)/g)) {
+      const name = match[2].toLowerCase();
+      if (seen.has(name)) continue;
+      seen.add(name);
+      const skill = this.catalog.skills.find(item => item.name.toLowerCase() === name);
+      if (skill) { out.push({ type: 'skill', name: skill.name, path: skill.path }); continue; }
+      const slug = value => String(value || '').toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '');
+      const hit = this.catalog.apps.find(item => slug(item.name) === name) || this.catalog.plugins.find(item => slug(item.name) === name);
+      if (hit) out.push({ type: 'mention', name: hit.name, path: hit.path });
+    }
+    return out;
+  }
+
+  async user(text, images = []) {
     if (!this.started || !this.threadId) { this.notice('error', 'Codex app-server is not ready.', true); return; }
     if (this.transitioning) { this.notice('info', 'Wait for the conversation operation to finish.'); return; }
-    if (this.active) { this.notice('info', 'Codex is already working on a turn.'); return; }
-    if (typeof text !== 'string' || !text.trim()) return;
+    const pictures = (Array.isArray(images) ? images : []).filter(image => image && /^image\/(png|jpeg|gif|webp)$/.test(image.mediaType) && typeof image.data === 'string' && image.data)
+      .map(image => ({ type: 'image', url: `data:${image.mediaType};base64,${image.data}` }));
+    if (typeof text !== 'string' || (!text.trim() && !pictures.length)) return;
+    const input = [...pictures, ...(text.trim() ? [{ type: 'text', text, text_elements: [] }] : []), ...this.mentionInputs(text)];
+    if (this.active) {
+      // A message while it works joins the running turn (turn/steer), as in the Codex TUI.
+      if (!this.active.id || this.active.ended) { this.notice('info', 'Codex is still starting this turn. Try again in a moment.'); return; }
+      try { await this.rpc.request('turn/steer', { threadId: this.threadId, expectedTurnId: this.active.id, input, clientUserMessageId: randomUUID() }); }
+      catch (error) { this.notice('warn', `Could not add to this turn: ${plainError(error)}`, false, { type: 'turn/steer.error' }); }
+      return;
+    }
     this.items.clear();
     const turn = { id: null, started: false, ended: false, interruptRequested: false, usage: null };
     this.active = turn;
@@ -482,10 +776,11 @@ class CodexBridge {
       const summary = this.thinkingOn ? (this.configSummary && this.configSummary !== 'none' ? this.configSummary : 'detailed') : 'none';
       const params = {
         threadId: this.threadId,
-        input: [{ type: 'text', text, text_elements: [] }],
+        input,
         sandboxPolicy: { type: 'workspaceWrite', writableRoots: [], networkAccess: false, excludeTmpdirEnvVar: false, excludeSlashTmp: false },
         approvalPolicy: 'on-request',
         ...(this.permissionMode === 'plan' ? { sandboxPolicy: { type: 'readOnly', networkAccess: false } } : {}),
+        ...(this.permissionProfile ? { sandboxPolicy: undefined } : {}),
         ...(model ? { model } : {}), ...(effort ? { effort } : {}), summary,
         clientUserMessageId: randomUUID(),
       };
@@ -890,6 +1185,25 @@ class CodexBridge {
     this.approvals.clear();
   }
 
+  /** Child agents as tasks: the page draws their avatars and panel from task.start, task.progress and task.end. */
+  emitTasks(item, state, raw) {
+    const ended = { completed: 'completed', errored: 'failed', interrupted: 'stopped', shutdown: 'stopped', notFound: 'failed' };
+    for (const child of item.receiverThreadIds || []) {
+      const agent = item.agentsStates?.[child] || {};
+      const task = this.tasks.get(child) || { started: false, ended: false };
+      this.tasks.set(child, task);
+      const base = { taskId: child, toolId: state.id, description: String(item.prompt || '').replace(/\s+/g, ' ').slice(0, 160) };
+      if (!task.started) { task.started = true; this.emit('task.start', { ...base, taskType: 'agent', subagentType: item.tool === 'spawnAgent' ? 'agent' : String(item.tool || 'agent') }, raw); }
+      if (agent.status && ended[agent.status] && !task.ended) {
+        task.ended = true;
+        this.emit('task.end', { ...base, status: ended[agent.status], summary: agent.message || '' }, raw);
+      } else if (!task.ended && agent.message && agent.message !== task.message) {
+        task.message = agent.message;
+        this.emit('task.progress', { ...base, summary: agent.message }, raw);
+      }
+    }
+  }
+
   ensureItem(params, type, raw) {
     const { item, threadId, turnId } = params;
     if (!item?.id) return null;
@@ -917,6 +1231,7 @@ class CodexBridge {
     if (item.type === 'userMessage') return; // The optimistic prompt already owns this user message.
     if (item.type === 'collabAgentToolCall') {
       for (const child of item.receiverThreadIds || []) this.childParents.set(child, state.id);
+      this.emitTasks(item, state, raw);
     }
     if (item.type === 'imageView' || (item.type === 'imageGeneration' && phase === 'completed')) void this.emitImage(item, state, raw);
     if (['mcpToolCall','dynamicToolCall','webSearch','collabAgentToolCall','functionCallOutput','hookPrompt','enteredReviewMode','exitedReviewMode'].includes(item.type)) this.surfaceEvent(item.type, { ...params, item: safePayload(item) }, { method: item.type });
@@ -1007,9 +1322,9 @@ class CodexBridge {
     const types = { '.png': 'image/png', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.gif': 'image/gif', '.webp': 'image/webp' };
     let url = null, error = null;
     try {
-      if (path && types[extname(path).toLowerCase()] && (await stat(path)).size <= 4 * 1024 * 1024) {
+      if (path && types[extname(path).toLowerCase()] && (await stat(path)).size <= 8 * 1024 * 1024) {
         url = `data:${types[extname(path).toLowerCase()]};base64,${(await readFile(path)).toString('base64')}`;
-      } else if (item.result && /^[A-Za-z0-9+/=]+$/.test(item.result) && item.result.length <= 6 * 1024 * 1024) url = 'data:image/png;base64,' + item.result;
+      } else if (item.result && /^[A-Za-z0-9+/=]+$/.test(item.result) && item.result.length <= 11 * 1024 * 1024) url = 'data:image/png;base64,' + item.result;
       else error = 'Image preview is not available.';
     } catch { error = 'Image could not be loaded.'; }
     this.emit('media.snapshot', { id: state.id, threadId: state.threadId, turnId: state.turnId, parentId: state.parentId,
@@ -1158,6 +1473,14 @@ class CodexBridge {
       case 'thread/compacted':
         this.notice('info', 'Codex conversation context was compacted.', false, message);
         break;
+      case 'item/autoApprovalReview/started': case 'item/autoApprovalReview/completed':
+        this.onGuardianReview(method, params);
+        this.surfaceEvent(method, params, message);
+        break;
+      case 'externalAgentConfig/import/progress': case 'externalAgentConfig/import/completed':
+        this.emit('import', { stage: method.endsWith('completed') ? 'done' : 'progress', importId: params.importId,
+          results: (params.itemTypeResults || []).map(r => ({ itemType: r.itemType, ok: (r.successes || []).length, failed: (r.failures || []).length })) }, { method });
+        break;
       case 'thread/name/updated':
         if (params.threadId === this.threadId && this.thread) this.thread.name = params.threadName || params.name || this.thread.name;
         this.emit('title', { title: params.threadName || params.name || '', sessionId: params.threadId, custom: true }, { method }); break;
@@ -1185,7 +1508,14 @@ class CodexBridge {
       default:
         this.surfaceEvent(method || 'unnamed notification', params);
         if (method === 'thread/queue/changed' || method === 'thread/attachment/updated') void this.refreshSurface(method, params);
+        if (['skills/changed', 'app/list/updated', 'mcpServer/startupStatus/updated'].includes(method)) this.refreshCatalogSoon();
     }
+  }
+
+  refreshCatalogSoon() {
+    clearTimeout(this.catalogTimer);
+    this.catalogTimer = setTimeout(() => void this.loadCatalog(), 400);
+    this.catalogTimer.unref?.();
   }
 
   mergeRateLimit(plan, snapshot) {
@@ -1352,7 +1682,22 @@ class CodexBridge {
     if (!this.started && !['user'].includes(message.type)) return;
     try {
       switch (message.type) {
-        case 'user': return this.user(message.text);
+        case 'user': return this.user(message.text, message.images);
+        case 'catalog': return this.loadCatalog();
+        case 'review': return this.review(message);
+        case 'setPermissionProfile': return this.setPermissionProfile(message);
+        case 'permissionProfiles': return this.loadPermissionProfiles();
+        case 'goal': return this.goal(message);
+        case 'usageHistory': return this.usageHistory();
+        case 'importDetect': return this.importDetect(message);
+        case 'importRun': return this.importRun(message);
+        case 'marketplace': return this.marketplace(message);
+        case 'guardianOverride': return this.guardianOverride(message);
+        case 'files': return this.files(message);
+        case 'title': return this.title();
+        case 'rename': return this.rename(message);
+        case 'shell': return this.runShell(message);
+        case 'shellKill': return this.killShell(message.id);
         case 'interrupt': return this.interruptActive();
         case 'permission': return this.permission(message);
         case 'realtimeStart': return this.startRealtime(message);

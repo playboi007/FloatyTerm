@@ -6,6 +6,7 @@ DerivedData/
 
 # Compiled app bundle (build artifact)
 FloatyTerm.app/
+dist/
 
 # macOS
 .DS_Store

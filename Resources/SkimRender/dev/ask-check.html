@@ -1,0 +1,88 @@
+<!DOCTYPE html>
+<html lang="en"><head>
+<meta charset="utf-8">
+<link rel="stylesheet" href="../fonts.css">
+<link rel="stylesheet" href="../skim.css">
+<link rel="stylesheet" href="../chat.css">
+</head><body>
+<script src="../vendor/marked.min.js"></script>
+<script src="../vendor/purify.min.js"></script>
+<script src="../vendor/highlight.min.js"></script>
+<script src="../skim-classify.js"></script>
+<script src="../skim-render.js"></script>
+<script src="../agent-events.js"></script>
+<script src="../agent-claude.js"></script>
+<script src="../agent-codex.js"></script>
+<script src="../chat.js"></script>
+<script>
+  // Ask about a selection: bar, panel, first question with the passage, follow-up, close.
+  //   swift Resources/SkimRender/dev/snapshot.swift Resources/SkimRender/dev/ask-check.html /tmp/ask.png 700 2 700
+  window.__pending = true;
+  document.documentElement.classList.add('no-motion');
+  const posts = [];
+  window.webkit = { messageHandlers: { skim: { postMessage: m => { if (m.type === 'action') posts.push(m.action); return Promise.resolve(); } } } };
+  ClaudeChat.boot({ cwd: '/tmp/demo', home: '' });
+  ClaudeChat.receive([{ type: 'sdk', msg: { type: 'system', subtype: 'init', model: 'claude-opus-5-5', permissionMode: 'default', session_id: 's1', cwd: '/tmp/demo' } }]);
+  ClaudeChat.showUser('How does the cache expire?');
+  ClaudeChat.receive([{ type: 'sdk', msg: { type: 'assistant', parent_tool_use_id: null, message: { id: 'm1', model: 'claude-opus-5-5', content: [{ type: 'text',
+    text: 'The cache keeps each entry for **ten minutes**. A background sweep removes stale entries every 30 seconds, so memory stays flat under load.\n\nReads never wait for the sweep.' }] } } },
+    { type: 'sdk', msg: { type: 'result', subtype: 'success', duration_ms: 1000, num_turns: 1, total_cost_usd: 0.01 } }]);
+  const $ = s => document.querySelector(s);
+  const tick = () => new Promise(r => setTimeout(r, 30));
+  const btws = () => posts.filter(p => p.type === 'btw');
+  let pass = 0;
+  const check = (name, ok, got) => { if (ok) pass++; else console.error('FAIL ' + name + (got !== undefined ? ' got: ' + JSON.stringify(got) : '')); };
+  const key = (el, k, o = {}) => el.dispatchEvent(new KeyboardEvent('keydown', { key: k, bubbles: true, cancelable: true, ...o }));
+  (async () => { try {
+    await tick();
+    const p = [...document.querySelectorAll('.ck-body p')].find(x => x.textContent.includes('background sweep'));
+    const node = [...p.childNodes].find(n => n.nodeType === 3 && n.textContent.includes('background sweep'));
+    const at = node.textContent.indexOf('A background sweep');
+    const range = document.createRange(); range.setStart(node, at); range.setEnd(node, at + 'A background sweep removes stale entries every 30 seconds'.length);
+    getSelection().removeAllRanges(); getSelection().addRange(range);
+    document.dispatchEvent(new MouseEvent('mouseup')); await tick();
+    const bar = $('.ck-selbar');
+    check('bar shows on a selection', !bar.hidden);
+    const btns = bar.querySelectorAll('.ck-refbtn');
+    check('bar has Reference and Ask', btns.length === 2 && btns[1].textContent.includes('Ask'), [...btns].map(b => b.textContent));
+    btns[1].click(); await tick();
+    const panel = $('.ck-selask');
+    check('panel opens', !panel.hidden);
+    check('bar hides', bar.hidden);
+    check('quote shows the passage', panel.querySelector('.ck-selask-quote').textContent.includes('every 30 seconds'));
+    check('field has focus', document.activeElement === panel.querySelector('.ck-selask-field'));
+    check('passage highlighted', !window.CSS || !CSS.highlights || CSS.highlights.has('ck-selask'));
+    check('composer untouched', $('.ck-input').value === '' && $('.ck-refs').hidden);
+    const field = panel.querySelector('.ck-selask-field');
+    field.value = 'Why 30 seconds?'; key(field, 'Enter');
+    const q1 = btws()[0];
+    check('btw posted with the passage', q1 && q1.question.includes('<selected_text') && q1.question.includes('every 30 seconds') && q1.question.endsWith('Why 30 seconds?'), q1);
+    check('shown question is plain', panel.querySelector('.ck-btw-q').textContent === 'Why 30 seconds?');
+    check('no message sent to the conversation', !posts.some(p => p.type === 'send'));
+    ClaudeChat.receive([{ type: 'btw', id: q1.id, response: 'It trades **freshness** for CPU: shorter sweeps cost more, and ten-minute entries rarely need tighter bounds.' }]);
+    await tick();
+    check('answer rendered', panel.querySelector('.ck-btw-a').textContent.includes('freshness'));
+    field.value = 'And under heavy load?'; key(field, 'Enter');
+    const q2 = btws()[1];
+    check('follow-up is plain, with history', q2 && q2.question === 'And under heavy load?' && q2.history.length === 1 && q2.history[0].question.includes('<selected_text'), q2);
+    ClaudeChat.receive([{ type: 'btw', id: q2.id, response: 'The sweep is incremental, so a burst of writes does not stall reads.' }]);
+    await tick();
+    check('panel sits above the dock', panel.getBoundingClientRect().bottom <= $('.ck-dock').getBoundingClientRect().top);
+    key(field, 'Escape');
+    check('Esc closes', panel.hidden && (!window.CSS || !CSS.highlights || !CSS.highlights.has('ck-selask')));
+    // ⌘I opens it; Reference instead moves the passage to the composer
+    getSelection().removeAllRanges(); getSelection().addRange(range);
+    key(document, 'i', { metaKey: true }); await tick();
+    check('⌘I opens', !panel.hidden);
+    panel.querySelector('.ck-selask-ref').click(); await tick();
+    check('Reference instead: chip, panel closed', panel.hidden && !$('.ck-refs').hidden);
+    // leave it open with an answer, for the snapshot
+    getSelection().removeAllRanges(); getSelection().addRange(range);
+    key(document, 'i', { metaKey: true }); await tick();
+    const field2 = panel.querySelector('.ck-selask-field'); field2.value = 'Why 30 seconds?'; key(field2, 'Enter');
+    ClaudeChat.receive([{ type: 'btw', id: btws().pop().id, response: 'It trades **freshness** for CPU: shorter sweeps cost more, and ten-minute entries rarely need tighter bounds.' }]);
+    console.error(`ask-check: ${pass} passed`);
+  } catch (e) { console.error('ask-check threw: ' + e.message + ' ' + (e.stack || '').split('\n')[0]); }
+  window.__pending = false; })();
+</script>
+</body></html>

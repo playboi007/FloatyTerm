@@ -1,4 +1,4 @@
-import Foundation
+import AppKit
 import WebKit
 
 /// Loads SkimRender into WKWebView as WKUserScripts to avoid HTML parsing;
@@ -89,6 +89,24 @@ enum SkimAssets {
           });
         """
         ucc.addUserScript(WKUserScript(source: hook, injectionTime: .atDocumentStart, forMainFrameOnly: true))
+    }
+
+    /// The renderer's appearance from Settings; nil follows macOS. The pages switch with prefers-color-scheme.
+    static var appearance: NSAppearance? {
+        switch Settings.shared.rendererAppearance {
+        case 1: return NSAppearance(named: .aqua)
+        case 2: return NSAppearance(named: .darkAqua)
+        default: return nil
+        }
+    }
+
+    /// Keeps `webView` on the chosen appearance, now and when Settings change. Remove the token in the owner's cleanup.
+    static func followAppearance(_ webView: WKWebView) -> NSObjectProtocol {
+        webView.appearance = appearance
+        return NotificationCenter.default.addObserver(forName: Settings.didChange, object: nil, queue: .main) { [weak webView] _ in
+            guard let webView, webView.appearance?.name != appearance?.name else { return }
+            webView.appearance = appearance
+        }
     }
 
     /// Removes the bridge — call from the owner's cleanup; the user content

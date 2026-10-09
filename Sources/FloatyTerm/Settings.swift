@@ -88,6 +88,12 @@ final class Settings {
 
     /// When true, the browser URL/navigation bar is collapsed (hidden) so it
     /// doesn't obscure page content. Toggled by the globe icon in the header.
+    /// Colours of the rich renderer (Claude and Codex tabs, Markdown previews): 0 follows macOS, 1 light, 2 dark.
+    var rendererAppearance: Int {
+        get { d.integer(forKey: "rendererAppearance") }
+        set { d.set(newValue, forKey: "rendererAppearance"); notify() }
+    }
+
     var urlBarCollapsed: Bool {
         get { d.bool(forKey: "urlBarCollapsed") }
         set { d.set(newValue, forKey: "urlBarCollapsed"); notify() }

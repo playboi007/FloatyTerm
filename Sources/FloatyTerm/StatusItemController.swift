@@ -220,6 +220,8 @@ final class StatusItemController: NSObject, NSMenuDelegate {
         menu.addItem(.separator())
         menu.addItem(makeItem("Preferences…", action: #selector(preferences),
                               key: ",", mods: [.command]))
+        menu.addItem(makeItem("About FloatyTerm", action: #selector(about),
+                              key: "", mods: []))
         menu.addItem(.separator())
         menu.addItem(makeItem("Quit FloatyTerm", action: #selector(quit),
                               key: "q", mods: [.command]))
@@ -261,6 +263,10 @@ final class StatusItemController: NSObject, NSMenuDelegate {
     @objc private func runBackgroundTask() { onRunBackgroundTask() }
     @objc private func showRuler()     { onShowRuler()        }
     @objc private func preferences()   { onPreferences()     }
+    @objc private func about() {
+        NSApp.activate(ignoringOtherApps: true)
+        NSApp.orderFrontStandardAboutPanel(nil)
+    }
     @objc private func quit()          { NSApp.terminate(nil) }
     @objc private func stopRecording() { onStopRecording()   }
     @objc private func saveRecording() { onSaveRecording()   }

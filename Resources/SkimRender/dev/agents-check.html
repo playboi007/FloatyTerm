@@ -1,0 +1,122 @@
+<!DOCTYPE html>
+<html lang="en"><head>
+<meta charset="utf-8">
+<link rel="stylesheet" href="../fonts.css">
+<link rel="stylesheet" href="../skim.css">
+<link rel="stylesheet" href="../chat.css">
+</head><body>
+<script src="../vendor/marked.min.js"></script>
+<script src="../vendor/purify.min.js"></script>
+<script src="../vendor/highlight.min.js"></script>
+<script src="../skim-classify.js"></script>
+<script src="../skim-render.js"></script>
+<script src="../agent-events.js"></script>
+<script src="../agent-claude.js"></script>
+<script src="../agent-codex.js"></script>
+<script src="../chat.js"></script>
+<script>
+  // Agents: the avatar stack, the hover card, the agent's view, talking to it through Main, state changes.
+  //   swift Resources/SkimRender/dev/snapshot.swift Resources/SkimRender/dev/agents-check.html /tmp/agents.png 760 2 640
+  //   ?card=1 leaves the card open for the picture; ?view=1 leaves the agent's view open.
+  window.__pending = true;
+  document.documentElement.classList.add('no-motion');
+  const posts = [];
+  window.webkit = { messageHandlers: { skim: { postMessage: m => { if (m.type === 'action') posts.push(m.action); return Promise.resolve(); } } } };
+  ClaudeChat.boot({ cwd: '/tmp/demo', home: '' });
+  ClaudeChat.receive([{ type: 'sdk', msg: { type: 'system', subtype: 'init', model: 'claude-opus-5-5', permissionMode: 'default', session_id: 's1', cwd: '/tmp/demo' } }]);
+  const $ = s => document.querySelector(s), $$ = s => [...document.querySelectorAll(s)];
+  const inp = $('.ck-input');
+  const frame = () => new Promise(r => requestAnimationFrame(() => setTimeout(r, 20)));
+  const type = v => { inp.focus(); inp.value = v; inp.dispatchEvent(new Event('input')); };
+  const key = (k, o = {}, el = inp) => el.dispatchEvent(new KeyboardEvent('keydown', { key: k, bubbles: true, cancelable: true, ...o }));
+  const of = t => posts.filter(p => p.type === t);
+  const sdk = msg => ({ type: 'sdk', msg });
+  const asst = (parent, id, content) => sdk({ type: 'assistant', uuid: 'u-' + id, parent_tool_use_id: parent, message: { id: 'm-' + id, model: 'claude-opus-5-5', content } });
+  const res = (parent, id, content) => sdk({ type: 'user', parent_tool_use_id: parent, message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: id, content }] } });
+  const task = (subtype, f) => sdk({ type: 'system', subtype, ...f });
+  const q = new URLSearchParams(location.search);
+  let pass = 0;
+  const check = (name, ok, got) => { if (ok) pass++; else console.error('FAIL ' + name + (got !== undefined ? ' got: ' + JSON.stringify(got) : '')); };
+  (async () => { try {
+    type('Where do we retry failed requests? Use two agents.'); key('Enter');
+    // Explore runs in the background (its row ends at once); general-purpose runs in the foreground.
+    ClaudeChat.receive([asst(null, 'a', [{ type: 'tool_use', id: 'tu-E', name: 'Agent', input: { description: 'Find the retry code', prompt: 'Look in the sidecar and the Swift host for every retry.', subagent_type: 'Explore', run_in_background: true } },
+      { type: 'tool_use', id: 'tu-G', name: 'Agent', input: { description: 'Run the sidecar tests', prompt: 'Run node --test.', subagent_type: 'general-purpose' } }]),
+      task('task_started', { task_id: 'aE1', tool_use_id: 'tu-E', description: 'Find the retry code', task_type: 'local_agent', subagent_type: 'Explore', is_backgrounded: true }),
+      task('task_started', { task_id: 'aG1', tool_use_id: 'tu-G', description: 'Run the sidecar tests', task_type: 'local_agent', subagent_type: 'general-purpose' }),
+      res(null, 'tu-E', 'Async agent launched successfully. agentId: aE1'),
+      asst('tu-E', 'e1', [{ type: 'tool_use', id: 'tu-e1', name: 'Grep', input: { pattern: 'retry', path: 'Resources' } }]), res('tu-E', 'tu-e1', '14 matches'),
+      asst('tu-E', 'e2', [{ type: 'tool_use', id: 'tu-e2', name: 'Read', input: { file_path: '/tmp/demo/Sources/FloatyTerm/CDPBridge.swift' } }]),
+      task('task_progress', { task_id: 'aE1', tool_use_id: 'tu-E', usage: { tool_uses: 2, total_tokens: 9800, duration_ms: 21000 }, last_tool_name: 'Read' }),
+      asst('tu-G', 'g1', [{ type: 'tool_use', id: 'tu-g1', name: 'Bash', input: { command: 'node --test Resources/CodexSidecar' } }])]);
+    await frame();
+    const stack = $('.ck-agents'), avs = () => $$('.ck-agents .ck-av-btn');
+    check('stack shows two agents', !stack.hidden && avs().length === 2, avs().length);
+    check('label: 2 agents working', stack.textContent.startsWith('2 agents working'), stack.textContent);
+    check('background agent is working though its row ended', avs()[0].querySelector('.ck-av').dataset.s === 'running');
+    check('faces: Ex and GP', avs().map(a => a.textContent).join() === 'Ex,GP', avs().map(a => a.textContent));
+    check('the Agent rows carry the same avatars', $$('.ck-row.is-agent > .ck-av').length === 2);
+
+    // hover: the card
+    avs()[0].dispatchEvent(new MouseEvent('mouseenter'));
+    const card = $('.ck-ahc');
+    check('hover opens the card', !card.hidden && card.textContent.includes('Explore') && card.textContent.includes('Find the retry code'), card.textContent.slice(0, 120));
+    check('card: the live step and the numbers', card.querySelector('.ck-ahc-now').textContent.includes('Read') && card.querySelector('.ck-ahc-stats').textContent.includes('2 tools') && card.textContent.includes('9.8k tokens'), card.textContent);
+    check('card: background agent has no ⌃B, has Stop', !card.textContent.includes('⌃B') && [...card.querySelectorAll('button')].some(b => b.textContent === 'Stop'));
+    avs()[1].dispatchEvent(new MouseEvent('mouseenter'));
+    check('moving to the next avatar swaps the card', card.textContent.includes('Run the sidecar tests') && card.textContent.includes('⌃B'));
+    if (q.has('card')) { console.error(`agents-check: ${pass} passed (card left open)`); window.__pending = false; return; }
+    avs()[1].dispatchEvent(new MouseEvent('mouseleave'));
+    await new Promise(r => setTimeout(r, 200));
+    check('leaving closes it', card.hidden);
+
+    // ⌥1: the agent's view, the composer addressed to it
+    key('1', { altKey: true, code: 'Digit1' }, document.body);
+    await frame();
+    const panel = $('.ck-subpanel');
+    check('⌥1 opens Explore', !panel.hidden && panel.querySelector('.ck-sub-type').textContent === 'Explore');
+    check('its avatar is marked', avs()[0].classList.contains('is-here'));
+    check('composer: To Explore', !$('.ck-to').hidden && $('.ck-to-chip').textContent.includes('To Explore') && $('.ck-field').classList.contains('to-agent') && inp.placeholder === 'Message Explore…', $('.ck-to').textContent);
+    type('Also check the WebSocket reconnect'); key('Enter');
+    const relay = of('send').pop();
+    check('Main gets the relay, with the agent ID', relay.text.includes('SendMessage (to: "aE1")') && relay.text.includes('<message_to_agent>\nAlso check the WebSocket reconnect\n</message_to_agent>'), relay.text);
+    check('…shown as what you typed', relay.display === 'Also check the WebSocket reconnect');
+    check('background agent: no background request', of('background').length === 0);
+    check('the agent view shows your message', panel.querySelector('.ck-sub-you').textContent.includes('Also check the WebSocket reconnect'));
+    check('Main shows it marked → Explore', $$('.ck-user-to').some(e => e.textContent === '→ Explore'));
+    // the chip switches to Main
+    $('.ck-to-chip').click();
+    check('chip: To Main', $('.ck-to-chip').textContent.includes('To Main') && !$('.ck-field').classList.contains('to-agent'));
+    type('a question for Main'); key('Enter');
+    check('to Main: plain', of('send').pop().text === 'a question for Main');
+    if (q.has('view')) { $('.ck-to-chip').click(); console.error(`agents-check: ${pass} passed (view left open)`); window.__pending = false; return; }
+    key('Escape');
+    check('Esc closes the view', panel.hidden && $('.ck-to').hidden);
+
+    // the foreground agent: a message backgrounds it first
+    key('2', { altKey: true, code: 'Digit2' }, document.body);
+    type('Skip the slow tests'); key('Enter');
+    check('foreground agent goes to the background first', of('background').pop()?.toolUseId === 'tu-G', of('background'));
+    // Stop from the view
+    [...panel.querySelectorAll('.ck-sub-act')].find(b => b.textContent.startsWith('Stop')).click();
+    check('Stop posts stopTask', of('stopTask').pop()?.taskId === 'aG1');
+    key('Escape');
+
+    // states: an approval inside Explore, then it finishes
+    ClaudeChat.receive([asst('tu-E', 'e3', [{ type: 'tool_use', id: 'tu-e3', name: 'Bash', input: { command: 'rg -n maxRetries' } }]),
+      { type: 'permission_request', id: 'p-e3', toolName: 'Bash', input: { command: 'rg -n maxRetries' }, toolUseID: 'tu-e3', suggestions: [] }]);
+    await frame();
+    check('approval: the avatar needs you', avs()[0].querySelector('.ck-av').dataset.s === 'waiting');
+    ClaudeChat.receive([res('tu-E', 'tu-e3', 'none'), res('tu-E', 'tu-e2', 'swift'),
+      asst('tu-E', 'e4', [{ type: 'text', text: 'Retries: CDPBridge.reconnect() 5 attempts.' }]),
+      task('task_notification', { task_id: 'aE1', tool_use_id: 'tu-E', status: 'completed', summary: 'Retries: CDPBridge.reconnect() 5 attempts.' })]);
+    await frame();
+    check('done: green', avs()[0].querySelector('.ck-av').dataset.s === 'done', avs().map(a => a.textContent + ':' + a.querySelector('.ck-av').dataset.s));
+    avs()[0].dispatchEvent(new MouseEvent('mouseenter'));
+    check('done card: the result, Continue it', card.querySelector('.ck-ahc-result').textContent.includes('5 attempts') && card.textContent.includes('Continue it'));
+    avs()[0].dispatchEvent(new MouseEvent('mouseleave'));
+    console.error(`agents-check: ${pass} passed`);
+  } catch (e) { console.error('agents-check threw: ' + e.message + ' ' + (e.stack || '').split('\n')[0]); }
+  window.__pending = false; })();
+</script>
+</body></html>

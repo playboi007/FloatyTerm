@@ -54,6 +54,18 @@ function doTurn(request) {
   notify('turn/started', { threadId: request.params.threadId, turn: started });
   notify('item/started', { threadId: request.params.threadId, turnId: currentTurn,
     item: { type: 'agentMessage', id: 'message-' + currentTurn, text: '' }, startedAtMs: Date.now() });
+  if (text === 'spawn') {
+    const call = status => ({ type: 'collabAgentToolCall', id: 'collab-1', tool: 'spawnAgent', status, senderThreadId: request.params.threadId,
+      receiverThreadIds: ['child-1'], prompt: 'Review the diff', model: null, reasoningEffort: null,
+      agentsStates: status === 'inProgress' ? { 'child-1': { status: 'running', message: null } } : { 'child-1': { status: 'completed', message: 'Looks fine' } } });
+    notify('item/started', { threadId: request.params.threadId, turnId: currentTurn, item: call('inProgress'), startedAtMs: Date.now() });
+    notify('item/completed', { threadId: request.params.threadId, turnId: currentTurn, item: call('completed'), completedAtMs: Date.now() });
+  }
+  if (text === 'guardian') {
+    const review = (status) => ({ status, riskLevel: 'high', rationale: 'Deletes files outside the workspace', userAuthorization: null });
+    notify('item/autoApprovalReview/started', { threadId: request.params.threadId, turnId: currentTurn, reviewId: 'rev-1', targetItemId: 'cmd-1', startedAtMs: 1, action: { type: 'command' }, review: review('inProgress') });
+    notify('item/autoApprovalReview/completed', { threadId: request.params.threadId, turnId: currentTurn, reviewId: 'rev-1', targetItemId: 'cmd-1', startedAtMs: 1, completedAtMs: 2, decisionSource: 'agent', action: { type: 'command' }, review: review('denied') });
+  }
   if (text === 'reasoning') {
     notify('item/reasoning/textDelta', { threadId: request.params.threadId, turnId: currentTurn, itemId: 'reasoning-1', delta: 'PRIVATE_RAW_REASONING' });
     notify('item/reasoning/summaryTextDelta', { threadId: request.params.threadId, turnId: currentTurn, itemId: 'reasoning-1', summaryIndex: 0, delta: 'Public summary' });
@@ -158,6 +170,28 @@ rl.on('line', line => {
     ], nextCursor: null, backwardsCursor: 'history-new' }); return;
     case 'thread/items/list': respond(request, { data: [], nextCursor: null, backwardsCursor: null }); return;
     case 'thread/compact/start': respond(request, {}); notify('thread/compacted', { threadId: request.params.threadId, turnId: 'compact-turn' }); return;
+    case 'fuzzyFileSearch': respond(request, { files: [{ file_name: 'a.dart', path: 'lib/a.dart', root: process.cwd(), match_type: 'file', score: 5, indices: null }, { file_name: 'b.dart', path: 'lib/b.dart', root: process.cwd(), match_type: 'file', score: 9, indices: null }] }); return;
+    case 'turn/steer': respond(request, { turnId: request.params.expectedTurnId }); return;
+    case 'review/start': { currentTurn = 'turn-' + (++turnNumber); const started = turn(currentTurn);
+      respond(request, { turn: started, reviewThreadId: request.params.threadId });
+      notify('turn/started', { threadId: request.params.threadId, turn: started }); finishTurn(request.params.threadId, 'completed'); return; }
+    case 'permissionProfile/list': respond(request, { data: [{ id: ':workspace', description: 'Workspace write', allowed: true }, { id: ':danger', description: 'No sandbox', allowed: false }], nextCursor: null }); return;
+    case 'thread/goal/set': respond(request, {}); notify('thread/goal/updated', { threadId: request.params.threadId, goal: { threadId: request.params.threadId, objective: request.params.objective || 'kept', status: request.params.status || 'active', tokenBudget: request.params.tokenBudget ?? null, tokensUsed: 0, timeUsedSeconds: 0, createdAt: 1, updatedAt: 2 } }); return;
+    case 'thread/goal/clear': respond(request, {}); notify('thread/goal/cleared', { threadId: request.params.threadId }); return;
+    case 'account/usage/read': respond(request, { summary: { lifetimeTokens: 1234, peakDailyTokens: 99, currentStreakDays: 3 }, dailyUsageBuckets: [{ startDate: '2026-10-05', tokens: 99 }] }); return;
+    case 'externalAgentConfig/detect': respond(request, { items: [{ itemType: 'SKILLS', description: 'Import 2 skills', cwd: null }, { itemType: 'HOOKS', description: 'Import hooks', cwd: process.cwd() }], connectors: [] }); return;
+    case 'externalAgentConfig/import': respond(request, { importId: 'imp-1' }); notify('externalAgentConfig/import/completed', { importId: 'imp-1', itemTypeResults: [{ itemType: 'SKILLS', successes: [{}, {}], failures: [] }] }); return;
+    case 'marketplace/add': respond(request, { alreadyAdded: false, installedRoot: '/m', marketplaceName: 'team' }); return;
+    case 'thread/approveGuardianDeniedAction': respond(request, {}); return;
+    case 'thread/name/set': respond(request, {}); return;
+    case 'skills/list': respond(request, { data: [{ cwd: process.cwd(), errors: [], skills: [
+      { name: 'imagegen', description: 'Make images', enabled: true, path: '/skills/imagegen/SKILL.md', scope: 'user', interface: { shortDescription: 'Generate images' } },
+      { name: 'off', description: 'Disabled', enabled: false, path: '/skills/off/SKILL.md', scope: 'user' }] }] }); return;
+    case 'app/list': respond(request, { data: [{ id: 'connector_1', name: 'Google Drive', description: 'Files', isEnabled: true, isAccessible: true }], nextCursor: null }); return;
+    case 'plugin/installed': respond(request, { marketplaces: [{ name: 'official', plugins: [
+      { id: 'github@official', name: 'github', installed: true, enabled: true, interface: { displayName: 'GitHub', shortDescription: 'Repos' } },
+      { id: 'idle@official', name: 'idle', installed: true, enabled: false }] }] }); return;
+    case 'mcpServerStatus/list': respond(request, { data: [{ name: 'docs', authStatus: 'oAuth', runtimeStatus: 'connected', tools: { search: {} }, resources: [], resourceTemplates: [] }], nextCursor: null }); return;
     default: respond(request, {}); return;
   }
 });
@@ -230,7 +264,7 @@ test('initializes persistent app-server, exposes model catalog by selectable slu
     assert.equal(capabilities.agent, 'codex');
     assert.equal(capabilities.features.approvals, true);
     assert.equal(capabilities.features.history, true);
-    assert.equal(capabilities.features.midTurnInput, false);
+    assert.equal(capabilities.features.midTurnInput, true);
     assert.deepEqual(capabilities.permissionModes, ['default', 'plan']);
     const luna = capabilities.models.find(model => model.value === 'gpt-6-luna');
     assert.equal(luna.resolvedModel, 'gpt-6-luna');
@@ -420,4 +454,155 @@ test('oversized app-server output settles the session and kills the protocol chi
     assert.ok(Number.isInteger(pid) && pid > 0);
     assert.throws(() => process.kill(pid, 0), error => error.code === 'ESRCH');
   }, { FAKE_OVERSIZED_AFTER_START: '1' });
+});
+
+test('catalog lists enabled skills, apps, plugins and MCP servers; $mentions and images go out as structured input', async () => {
+  await harness(async ({ lines, send, until, calls }) => {
+    await until(xs => xs.some(event => event.type === 'catalog'));
+    const catalog = lines.find(event => event.type === 'catalog');
+    assert.deepEqual(catalog.skills.map(skill => skill.name), ['imagegen']);
+    assert.equal(catalog.skills[0].description, 'Generate images');
+    assert.deepEqual(catalog.apps.map(app => app.path), ['app://connector_1']);
+    assert.deepEqual(catalog.plugins.map(plugin => plugin.name), ['GitHub']);
+    assert.deepEqual(catalog.mcp.map(server => [server.name, server.status, server.tools]), [['docs', 'connected', ['search']]]);
+    send({ type: 'user', text: 'make a logo $imagegen and read $google-drive then $github', images: [{ mediaType: 'image/png', data: 'AAAA' }, { mediaType: 'text/plain', data: 'x' }] });
+    await until(xs => xs.some(event => event.type === 'turn.end'));
+    const input = (await calls()).find(request => request.method === 'turn/start').params.input;
+    assert.equal(input[0].type, 'image');
+    assert.equal(input[0].url, 'data:image/png;base64,AAAA');
+    assert.equal(input[1].type, 'text');
+    assert.deepEqual(input.slice(2), [
+      { type: 'skill', name: 'imagegen', path: '/skills/imagegen/SKILL.md' },
+      { type: 'mention', name: 'Google Drive', path: 'app://connector_1' },
+      { type: 'mention', name: 'GitHub', path: 'plugin://github@official' },
+    ]);
+  });
+});
+
+test('child agents become task.start and task.end events joined to the Agent tool row', async () => {
+  await harness(async ({ lines, send, until }) => {
+    send({ type: 'user', text: 'spawn' });
+    await until(xs => xs.some(event => event.type === 'task.end'));
+    const start = lines.find(event => event.type === 'task.start');
+    const end = lines.find(event => event.type === 'task.end');
+    assert.equal(start.taskId, 'child-1');
+    assert.equal(start.description, 'Review the diff');
+    assert.equal(start.toolId, end.toolId);
+    assert.equal(end.status, 'completed');
+    assert.equal(end.summary, 'Looks fine');
+    assert.equal(lines.filter(event => event.type === 'task.start').length, 1);
+  });
+});
+
+test('@file suggestions, /rename and ! shell commands use app-server search, thread names and the session folder', async () => {
+  await harness(async ({ lines, send, until, calls }) => {
+    send({ type: 'files', id: 7, query: 'dart' });
+    await until(xs => xs.some(event => event.type === 'files'));
+    const files = lines.find(event => event.type === 'files');
+    assert.equal(files.id, 7);
+    assert.deepEqual(files.suggestions.map(file => file.path), ['lib/b.dart', 'lib/a.dart']);
+    send({ type: 'rename', title: 'Nice name' });
+    await until(xs => xs.some(event => event.type === 'title' && event.title === 'Nice name'));
+    assert.deepEqual((await calls()).find(request => request.method === 'thread/name/set').params.name, 'Nice name');
+    send({ type: 'shell', id: 'sh1', command: 'echo hello' });
+    await until(xs => xs.some(event => event.type === 'shell' && event.done));
+    assert.ok(lines.some(event => event.type === 'shell' && event.stream === 'stdout' && /hello/.test(event.chunk)));
+    assert.equal(lines.find(event => event.type === 'shell' && event.done).code, 0);
+  });
+});
+
+test('a message sent while a turn runs joins it through turn/steer', async () => {
+  await harness(async ({ lines, send, until, calls }) => {
+    send({ type: 'user', text: 'hang' });
+    await until(xs => xs.some(event => event.type === 'turn.start'));
+    send({ type: 'user', text: 'also check the tests' });
+    await until(async () => true);
+    for (let i = 0; i < 100 && !(await calls()).some(request => request.method === 'turn/steer'); i++) await new Promise(resolve => setTimeout(resolve, 20));
+    const steer = (await calls()).find(request => request.method === 'turn/steer');
+    assert.equal(steer.params.expectedTurnId, 'turn-1');
+    assert.equal(steer.params.input[0].text, 'also check the tests');
+    assert.equal((await calls()).filter(request => request.method === 'turn/start').length, 1);
+  });
+});
+
+test('/review starts a review turn with the chosen target and rejects an incomplete one', async () => {
+  await harness(async ({ lines, send, until, calls }) => {
+    send({ type: 'review', target: { type: 'baseBranch', branch: '' } });
+    await until(xs => xs.some(event => event.type === 'notice' && /Usage: \/review/.test(event.message)));
+    send({ type: 'review', target: { type: 'baseBranch', branch: 'main' } });
+    await until(xs => xs.some(event => event.type === 'turn.end'));
+    const request = (await calls()).find(call => call.method === 'review/start');
+    assert.deepEqual(request.params.target, { type: 'baseBranch', branch: 'main' });
+    assert.equal(request.params.delivery, 'inline');
+    assert.equal((await calls()).filter(call => call.method === 'review/start').length, 1);
+  });
+});
+
+test('permission profiles list, and choosing one resumes the thread with default_permissions and no forced sandbox', async () => {
+  await harness(async ({ lines, send, until, calls }) => {
+    await until(xs => xs.some(event => event.type === 'permissionProfiles'));
+    const list = lines.find(event => event.type === 'permissionProfiles');
+    assert.deepEqual(list.profiles.map(profile => [profile.id, profile.allowed]), [[':workspace', true], [':danger', false]]);
+    send({ type: 'setPermissionProfile', id: ':danger' });
+    await until(xs => xs.some(event => event.type === 'notice' && /not available/.test(event.message)));
+    send({ type: 'setPermissionProfile', id: ':workspace' });
+    await until(xs => xs.filter(event => event.type === 'permissionProfiles').length >= 2);
+    const resume = (await calls()).find(call => call.method === 'thread/resume');
+    assert.equal(resume.params.config.default_permissions, ':workspace');
+    assert.equal('sandbox' in resume.params, false);
+    send({ type: 'user', text: 'hello' });
+    await until(xs => xs.some(event => event.type === 'turn.end' && !event.local));
+    assert.equal('sandboxPolicy' in (await calls()).find(call => call.method === 'turn/start').params, false);
+  });
+});
+
+test('goal controls set, pause, resume and clear through thread/goal', async () => {
+  await harness(async ({ lines, send, until, calls }) => {
+    send({ type: 'goal', action: 'set', objective: 'Ship it', tokenBudget: 5000 });
+    await until(xs => xs.some(event => event.surface === 'goal' && event.data?.goal?.objective === 'Ship it'));
+    send({ type: 'goal', action: 'pause' });
+    send({ type: 'goal', action: 'clear' });
+    await until(async () => true);
+    for (let i = 0; i < 100 && !(await calls()).some(call => call.method === 'thread/goal/clear'); i++) await new Promise(resolve => setTimeout(resolve, 20));
+    const goals = (await calls()).filter(call => call.method.startsWith('thread/goal/'));
+    assert.deepEqual(goals.map(call => call.method), ['thread/goal/set', 'thread/goal/set', 'thread/goal/clear']);
+    assert.equal(goals[0].params.tokenBudget, 5000);
+    assert.equal(goals[1].params.status, 'paused');
+  });
+});
+
+test('usage history, import detect/run and marketplace add return results to the page', async () => {
+  await harness(async ({ lines, send, until, calls }) => {
+    send({ type: 'usageHistory' });
+    await until(xs => xs.some(event => event.type === 'usageHistory'));
+    const usage = lines.find(event => event.type === 'usageHistory');
+    assert.equal(usage.summary.lifetimeTokens, 1234);
+    assert.deepEqual(usage.daily, [{ date: '2026-10-05', tokens: 99 }]);
+    send({ type: 'importDetect' });
+    await until(xs => xs.some(event => event.type === 'import' && event.stage === 'detected'));
+    const detected = lines.find(event => event.type === 'import' && event.stage === 'detected');
+    assert.deepEqual(detected.items.map(item => item.itemType), ['SKILLS', 'HOOKS']);
+    send({ type: 'importRun', ids: [0] });
+    await until(xs => xs.some(event => event.type === 'import' && event.stage === 'done'));
+    const run = (await calls()).find(call => call.method === 'externalAgentConfig/import');
+    assert.deepEqual(run.params.migrationItems.map(item => item.itemType), ['SKILLS']);
+    assert.deepEqual(lines.find(event => event.type === 'import' && event.stage === 'done').results, [{ itemType: 'SKILLS', ok: 2, failed: 0 }]);
+    send({ type: 'marketplace', action: 'add', source: 'github.com/acme/plugins' });
+    await until(xs => xs.some(event => event.type === 'notice' && /Added marketplace team/.test(event.message)));
+  });
+});
+
+test('guardian reviews report risk and rationale, and a denied action can be approved by the user', async () => {
+  await harness(async ({ lines, send, until, calls }) => {
+    send({ type: 'user', text: 'guardian' });
+    await until(xs => xs.some(event => event.type === 'guardian' && event.canOverride));
+    const denied = lines.find(event => event.type === 'guardian' && event.canOverride);
+    assert.equal(denied.riskLevel, 'high');
+    assert.match(denied.rationale, /outside the workspace/);
+    assert.match(denied.ownerId, /cmd-1/);
+    send({ type: 'guardianOverride', reviewId: 'rev-1' });
+    await until(xs => xs.some(event => event.type === 'notice' && /Approved the denied action/.test(event.message)));
+    const call = (await calls()).find(entry => entry.method === 'thread/approveGuardianDeniedAction');
+    assert.equal(call.params.event.reviewId, 'rev-1');
+  });
 });

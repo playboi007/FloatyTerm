@@ -131,18 +131,18 @@
     const select = (a, b) => { const r = document.createRange(); r.setStart(a, 0); r.setEnd(b, b.childNodes.length); const s = getSelection(); s.removeAllRanges(); s.addRange(r); document.dispatchEvent(new MouseEvent('mouseup')); };
     select(paras[1], paras[1]);
     await tick();
-    const btn = $('.ck-refbtn');
-    check('button shows on a reply selection', !btn.hidden);
+    const bar = $('.ck-selbar'), btn = bar.querySelector('.ck-refbtn');
+    check('button shows on a reply selection', !bar.hidden);
     const b = btn.getBoundingClientRect(), p = paras[1].getBoundingClientRect();
     check('button sits by the selection', Math.abs(b.top - p.bottom) < 60 || Math.abs(b.bottom - p.top) < 60, [b.top, p.bottom]);
     btn.click();
     check('chip in the composer', document.querySelectorAll('.ck-refs .ck-ref').length === 1 && !$('.ck-refs').hidden);
     check('chip is a preview', $('.ck-refs .ck-ref-text').textContent.startsWith('Keep the TTL'));
-    check('selection cleared, button hidden', getSelection().isCollapsed && btn.hidden);
+    check('selection cleared, button hidden', getSelection().isCollapsed && bar.hidden);
     // a selection in the user's own message is not offered
     select($('.ck-turn:last-child .ck-user-text'), $('.ck-turn:last-child .ck-user-text'));
     await tick();
-    check('no button on a user message', btn.hidden);
+    check('no button on a user message', bar.hidden);
     getSelection().removeAllRanges();
     // two passages, then remove one with the ×, then Backspace removes the other
     select(paras[0], paras[0]); await tick(); btn.click();
@@ -976,7 +976,7 @@
     agRowA.click();
     check('a click opens the panel', !panel.hidden);
     const ph = () => panel.querySelector('.ck-sub-head').textContent;
-    check('its head: type, description, running', ph().startsWith('Explore') && ph().includes('Find the retry code') && panel.querySelector('.ck-sub-state').dataset.state === 'running', ph());
+    check('its head: ← Main, type, description, running', ph().startsWith('Main') && panel.querySelector('.ck-sub-type').textContent === 'Explore' && ph().includes('Find the retry code') && panel.querySelector('.ck-sub-state').dataset.state === 'running', ph());
     check('the prompt, folded', panel.querySelector('.ck-sub-prompt-h').textContent.startsWith('Prompt · Look in the sidecar') && panel.querySelector('.ck-sub-prompt-t').hidden);
     panel.querySelector('.ck-sub-prompt-h').click();
     check('…a click opens it', !panel.querySelector('.ck-sub-prompt-t').hidden && panel.querySelector('.ck-sub-prompt').classList.contains('is-open'));
@@ -995,8 +995,8 @@
       subMsg('tu-N', 'n1', [{ type: 'text', text: 'Nested agent here.' }])]);
     check('the nested agent\'s words stay in its own transcript', !pl().textContent.includes('Nested agent here.'));
     [...pl().querySelectorAll('.ck-row.is-agent')].pop().click();
-    check('its row opens it, with a back button', ph().includes('Check the tests') && pl().textContent.includes('Nested agent here.') && panel.querySelector('.ck-sub-head .ck-sub-btn:not(.ck-sub-x)'), ph());
-    panel.querySelector('.ck-sub-head .ck-sub-btn:not(.ck-sub-x)').click();
+    check('its row opens it, with a path back: Main › Explore', ph().includes('Check the tests') && pl().textContent.includes('Nested agent here.') && panel.querySelector('.ck-sub-crumb')?.textContent === 'Explore', ph());
+    panel.querySelector('.ck-sub-crumb').click();
     check('back: the first agent again', ph().includes('Find the retry code'));
     ClaudeChat.receive([subRes('tu-A', 'tu-N', 'tests ok'), subMsg('tu-A', 's6', [{ type: 'text', text: 'It is in agent-claude.js.' }]),
       sdkl({ type: 'user', parent_tool_use_id: null, message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'tu-A', content: 'It is in agent-claude.js.' }] } })]);

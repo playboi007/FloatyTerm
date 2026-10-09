@@ -77,24 +77,95 @@ Electron, no web stack — it idles at near-zero CPU and ~30–60 MB RAM.
 
 ## Requirements
 
-- macOS 13 (Ventura) or later
-- Xcode / the Swift toolchain (`swift --version`)
+- macOS 14 (Sonoma) or later
+- Building from source requires Xcode / the Swift toolchain (`swift --version`)
+- Claude/Codex tabs require Node.js and the corresponding installed,
+  authenticated CLI (`claude` / `codex`)
 
 ## Build & run
 
 ```sh
 ./build.sh        # compiles and assembles FloatyTerm.app
 open FloatyTerm.app
+# Include the optional Claude rich renderer and its SDK dependencies:
+./build.sh --RichRenderer-claude
+# Include all optional components (currently Claude rich rendering):
+./build.sh --all
 ```
 
 `build.sh` signs the bundle with the first code-signing identity in your
 keychain (e.g. a free "Apple Development" certificate; override with
-`FLOATY_SIGN_ID`), falling back to ad-hoc if none exists. A **stable identity
+`FLOATY_SIGN_ID`). Without an identity, explicitly set `FLOATY_ALLOW_ADHOC=1`
+for a local test build. A **stable identity
 matters if you use Context Snap**: the Screen Recording grant is keyed to the
 app's code signature, and ad-hoc signatures change on every build — you'd be
-re-prompted after each rebuild. Without a paid Developer ID the first launch
-may show an "unverified developer" prompt — right-click the app → **Open**,
-or allow it under **System Settings → Privacy & Security**.
+re-prompted after each rebuild. A local package may be blocked on first launch;
+use **System Settings → Privacy & Security → Open Anyway** if macOS offers it
+and you trust the package.
+
+## DMG releases and updates
+
+Create a local test installer:
+
+```sh
+./scripts/package-dmg.sh --local
+# Next release (or edit the two version fields in Info.plist first):
+./scripts/package-dmg.sh --local --version 0.1.1 --build 2
+# Same release, with the Claude rich renderer extra bundled:
+./scripts/package-dmg.sh --local --version 0.1.1 --build 2 --RichRenderer-claude
+# Include all optional components:
+./scripts/package-dmg.sh --local --version 0.1.1 --build 2 --all
+```
+
+`Info.plist` is the default version source: `CFBundleShortVersionString` is
+the public `X.Y.Z` version; `CFBundleVersion` is a positive, increasing build
+number. Command-line overrides affect the packaged app, leaving the source
+plist unchanged. Increase the build number for every shared build, including
+rebuilds of the same public version. **About FloatyTerm** in the menu bar shows
+the installed version and build.
+
+Each core release creates `dist/FloatyTerm-VERSION-BUILD-ARCH/` containing the DMG,
+`SHA256SUMS`, and `BUILD.txt` (commit, worktree changes, and signing details).
+Claude-enabled releases append `-claude` to the directory and DMG name, so both
+variants can coexist. `--RichRenderer-claude` and `--all` currently create the
+same variant; `--all` will include any future optional components too.
+The command refuses to overwrite an existing release. It compiles for the
+build Mac's architecture: `arm64` for Apple silicon, `x86_64` for Intel. The
+current Apple-silicon package is not an Intel installer. The default build
+excludes the entire ClaudeSidecar directory and does not require npm. When
+selected, production Claude SDK dependencies are installed from the lockfile
+into the new bundle. Node.js and the user’s CLI installations and credentials
+are not bundled. The shared renderer and dependency-free Codex sidecar remain
+in the core app.
+
+To add Claude rich rendering later, replace the core app with the Claude-enabled
+DMG of the desired version. The optional component is selected at build time;
+installing the expanded app preserves its code signature. The core build's
+Claude tab explains how to get the extra rather than loading a sidecar from a
+local source checkout. The ordinary terminal can still run an installed `claude`
+CLI without the rich renderer extra.
+
+To install, open the DMG and drag **FloatyTerm.app → Applications**. Eject the
+DMG and launch from Applications. To update, quit FloatyTerm from its menu bar,
+save sessions if prompted, then repeat the drag and choose **Replace**.
+Preferences, notes, and snapshots live outside the app bundle. Updates are
+manual; automatic in-app updates are not included in this release workflow.
+
+For distribution with Apple notarization, install a **Developer ID Application**
+certificate and store your notarization credentials in Keychain using
+`xcrun notarytool store-credentials FloatyTerm-notary`. Then run:
+
+```sh
+FLOATY_SIGN_ID='Developer ID Application: Your Name (TEAMID)' \
+  ./scripts/package-dmg.sh --notarize FloatyTerm-notary --version 0.1.1 --build 2
+```
+
+This mode uses the hardened runtime and timestamped signing, submits the app
+and DMG to Apple, staples their tickets, and verifies them. It requires network
+access and working Apple credentials. A local/ad-hoc or Apple Development
+certificate does not replace Developer ID distribution signing. See Apple's
+[packaging guide](https://developer.apple.com/documentation/xcode/packaging-mac-software-for-distribution)
+and [notarization workflow](https://developer.apple.com/documentation/security/customizing-the-notarization-workflow).
 
 ## Keyboard shortcuts
 

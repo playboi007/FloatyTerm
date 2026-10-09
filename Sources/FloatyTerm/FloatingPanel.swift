@@ -195,9 +195,12 @@ final class FloatingPanel: NSPanel {
     /// Places this window cascaded down-right from `reference` (another window's
     /// frame), clamped onto the screen that frame sits on. Used so a new window
     /// appears near the one the user is looking at — not at a stale global spot.
+    /// The size a new window opens at; a cascaded one is never narrower than this.
+    static let newWindowSize = NSSize(width: 900, height: 540)
+
     func cascade(from reference: NSRect) {
         var f = frame
-        f.size = NSSize(width: reference.width, height: reference.height)
+        f.size = NSSize(width: max(reference.width, Self.newWindowSize.width), height: reference.height)
         f.origin = NSPoint(x: reference.minX + 26, y: reference.minY - 26)
         setFrame(clampToVisibleScreen(f), display: false)
     }

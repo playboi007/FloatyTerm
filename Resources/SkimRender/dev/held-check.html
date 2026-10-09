@@ -1,0 +1,75 @@
+<!DOCTYPE html>
+<html lang="en"><head>
+<meta charset="utf-8">
+<link rel="stylesheet" href="../fonts.css">
+<link rel="stylesheet" href="../skim.css">
+<link rel="stylesheet" href="../chat.css">
+</head><body>
+<script src="../vendor/marked.min.js"></script>
+<script src="../vendor/purify.min.js"></script>
+<script src="../vendor/highlight.min.js"></script>
+<script src="../skim-classify.js"></script>
+<script src="../skim-render.js"></script>
+<script src="../agent-events.js"></script>
+<script src="../agent-claude.js"></script>
+<script src="../agent-codex.js"></script>
+<script src="../chat.js"></script>
+<script>
+  window.__pending = true;
+  document.documentElement.classList.add('no-motion');
+  const posts = [];
+  window.webkit = { messageHandlers: { skim: { postMessage: m => { if (m.type === 'action') posts.push(m.action); return Promise.resolve(); } } } };
+  ClaudeChat.boot({ cwd: '/tmp/demo', home: '' });
+  ClaudeChat.receive([{ type: 'sdk', msg: { type: 'system', subtype: 'init', model: 'claude-opus-5-5', permissionMode: 'default', session_id: 's1', cwd: '/tmp/demo' } }]);
+  const $ = s => document.querySelector(s);
+  const inp = $('.ck-input');
+  const type = v => { inp.focus(); inp.value = v; inp.dispatchEvent(new Event('input')); };
+  const altEnter = () => inp.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', altKey: true, bubbles: true, cancelable: true }));
+  const sends = () => posts.filter(p => p.type === 'send').map(p => p.text);
+  const tool = id => [{ type: 'sdk', msg: { type: 'assistant', parent_tool_use_id: null, message: { id: 'm' + id, model: 'claude-opus-5-5', content: [{ type: 'tool_use', id, name: 'Bash', input: { command: 'ls' } }] } } },
+    { type: 'sdk', msg: { type: 'user', parent_tool_use_id: null, message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: id, content: 'ok' }] } } }];
+  const result = (subtype = 'success') => ({ type: 'sdk', msg: { type: 'result', subtype, is_error: subtype !== 'success', duration_ms: 1000, num_turns: 1, total_cost_usd: 0.01 } });
+  let pass = 0;
+  const check = (name, ok, got) => { if (ok) pass++; else console.error('FAIL ' + name + (got !== undefined ? ' got: ' + JSON.stringify(got) : '')); };
+  (async () => { try {
+    // busy turn; hold a message
+    type('first'); inp.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true, cancelable: true }));
+    check('first sent', sends().length === 1);
+    check('hold button hidden on empty', $('.ck-hold').hidden);
+    type('later note'); check('hold button shown with text', !$('.ck-hold').hidden);
+    altEnter();
+    check('composer cleared', inp.value === '');
+    check('held chip shown', document.querySelectorAll('.ck-held-item').length === 1);
+    check('not sent yet', sends().length === 1);
+    ClaudeChat.receive(tool('t1'));
+    check('tool call does not release a turn hold', sends().length === 1);
+    ClaudeChat.receive([result()]);
+    check('released after the turn', sends().length === 2 && sends()[1] === 'later note', sends());
+    check('…as later: it waits for any turn already queued', posts.filter(p => p.type === 'send')[1].priority === 'later');
+    check('chip gone', $('.ck-held').hidden);
+    // a stopped turn keeps it
+    type('after stop'); altEnter();
+    ClaudeChat.receive([result('error_during_execution')]);
+    check('error turn keeps held', sends().length === 2 && document.querySelectorAll('.ck-held-item').length === 1);
+    // switch to 2 tool calls
+    const sel = $('.ck-held-when'); sel.value = 'tool2'; sel.dispatchEvent(new Event('change'));
+    ClaudeChat.showUser('go'); ClaudeChat.receive(tool('t2'));
+    check('1 to go shown', $('.ck-held-item').textContent.includes('1 to go'));
+    ClaudeChat.receive(tool('t3'));
+    check('released mid-turn after 2 tools', sends().length === 3 && sends()[2] === 'after stop', sends());
+    // two turns, plus send now
+    type('two turns'); altEnter();
+    const s2 = $('.ck-held-when'); s2.value = 'turn2'; s2.dispatchEvent(new Event('change'));
+    ClaudeChat.receive([result()]);
+    check('not after 1 turn', sends().length === 3);
+    $('.ck-held-now').click();
+    check('send now', sends().length === 4 && sends()[3] === 'two turns', sends());
+    // edit puts it back
+    type('edit me'); altEnter(); $('.ck-held-text').click();
+    check('edit restores composer', inp.value === 'edit me' && $('.ck-held').hidden);
+    inp.value = ""; type("Also check the migration script once the tests pass"); altEnter(); type("draft");
+    console.error(`held-check: ${pass} passed`);
+  } catch (e) { console.error('held-check threw: ' + e.message + ' ' + (e.stack || '').split('\n')[0]); }
+  window.__pending = false; })();
+</script>
+</body></html>

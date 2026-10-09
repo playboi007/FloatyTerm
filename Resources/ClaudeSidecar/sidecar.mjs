@@ -8,7 +8,9 @@
 //     (thinking: true/false shows or hides thinking summaries; omitted, it follows showThinkingSummaries in the settings)
 //     (fork: with resume, start a new session from a copy of that transcript — a side chat)
 //     (appendSystemPrompt defaults to prompt-contract.md; pass '' for none)
-//   { type: 'user', text, images?, uuid? }  images: [{ mediaType, data }] (base64), sent before the text; uuid: the prompt's ID (rewind uses it)
+//   { type: 'user', text, images?, uuid?, priority?, shouldQuery?, display? }  images: [{ mediaType, data }] (base64), sent before the text; uuid: the prompt's ID (rewind uses it)
+//     (priority: while a turn runs, 'now' ends it after the current step and answers this; 'later' waits for the turn to end; omitted, it joins the turn at its next step)
+//     (shouldQuery: false adds it to the conversation without a turn: the next prompt carries it; display: the typed text, for the prompt history)
 //   { type: 'permission', id, decision: 'allow' | 'allowAlways' | 'deny', message?, updatedInput?, updatedPermissions? }
 //     (updatedInput: e.g. AskUserQuestion's answers; updatedPermissions: e.g. a plan approval's mode change)
 //   { type: 'interrupt' }
@@ -24,6 +26,11 @@
 //   { type: 'btw', id, question, history? } a side question (/btw): answered from the conversation so far, no tools,
 //                                          not saved to it; history: the earlier [{ question, response }] of this side thread
 //   { type: 'rewindFiles', uuid, dryRun?, id }   files back to how they were before that prompt (dryRun: only say what would change)
+//   { type: 'background', toolUseId? }    Ctrl+B: running Bash commands and subagents go on in the background
+//   { type: 'stopTask', taskId }          stop one subagent or background command (task_notification follows)
+//   { type: 'shell', id, command }        ! in the composer: run a shell command in the session folder
+//   { type: 'shellKill', id }             stop that command
+//   { type: 'promptHistory' }             the prompts typed in this folder (shared with the TUI), newest first
 //
 // Sidecar → host (stdout), each stamped with `t` (ms since epoch):
 //   { type: 'sdk', msg }                    every SDK message, unchanged
@@ -40,13 +47,18 @@
 //   { type: 'btw', id, response, synthetic?, error? }   answer to btw
 //   { type: 'rewind', id, uuid, dryRun, canRewind, filesChanged?, insertions?, deletions?, error? }   answer to rewindFiles
 //   { type: 'title', sessionId, title, custom }   answer to title and rename (custom: named by the user, not the first prompt)
+//   { type: 'shell', id, stream, chunk } · { type: 'shell', id, done, code, signal?, error? }   a ! command's output, then its end
+//   { type: 'promptHistory', list }          answer to promptHistory
+//   (an MCP server's input request is a permission_request with kind 'elicitation'; its answer's `response` is the MCP result)
 //   { type: 'error', message }              { type: 'end' }
 //
 // Nothing else is written to stdout. The session ends when stdin closes.
 import { query, listSessions, getSessionMessages, getSessionInfo, renameSession } from '@anthropic-ai/claude-agent-sdk';
 import readline from 'node:readline';
 import fs from 'node:fs';
-import { execFile } from 'node:child_process';
+import os from 'node:os';
+import path from 'node:path';
+import { execFile, spawn } from 'node:child_process';
 
 // Output shapes the Claude tab renders specially (prompt-contract.md); a host appendSystemPrompt replaces it.
 const CONTRACT = (() => {
@@ -100,10 +112,30 @@ async function canUseTool(toolName, input, opts) {
   });
 }
 
+/** An MCP server asks the user for input (a form, or a page to open): a card, answered with the MCP result. */
+function onElicitation(request, opts) {
+  const id = 'elicit-' + opts.requestId;
+  send({ type: 'permission_request', id, kind: 'elicitation', toolName: request.displayName || request.serverName, input: request, title: request.title });
+  return new Promise(resolve => {
+    pending.set(id, { resolve, elicitation: true });
+    opts.signal?.addEventListener('abort', () => {
+      if (!pending.delete(id)) return;
+      send({ type: 'permission_cancelled', id });
+      resolve({ action: 'cancel' });
+    }, { once: true });
+  });
+}
+
 function answer(m) {
   const p = pending.get(m.id);
   if (!p) return;
   pending.delete(m.id);
+  if (p.elicitation) {
+    const r = m.response && typeof m.response === 'object' ? m.response : {};
+    const action = ['accept', 'decline', 'cancel'].includes(r.action) ? r.action : m.decision === 'deny' ? 'decline' : 'accept';
+    p.resolve(action === 'accept' && r.content && typeof r.content === 'object' ? { action, content: r.content } : { action });
+    return;
+  }
   if (m.decision === 'deny') {
     p.resolve({ behavior: 'deny', message: m.message || 'The user declined this action.' });
   } else {
@@ -141,6 +173,7 @@ function start(m) {
         ? { type: 'preset', preset: 'claude_code', append: m.appendSystemPrompt ?? CONTRACT }
         : { type: 'preset', preset: 'claude_code' },
       canUseTool,
+      onElicitation,
       abortController: abort,
       stderr: line => process.stderr.write(line.endsWith('\n') ? line : line + '\n')
     }
@@ -291,6 +324,64 @@ async function history(sessionId) {
   return { type: 'history', sessionId, messages, omitted: from, before: from > 0 ? all[from - 1].uuid || null : null };
 }
 
+// ── ! commands: run in the session folder; output streams to the page ──
+
+const shells = new Map();   // id → child process
+const SHELL_MAX = 1 << 20;  // output kept per stream; the page shows and sends less
+
+function runShell(m) {
+  const id = String(m.id || '');
+  const command = String(m.command || '').trim();
+  if (!id || !command) return send({ type: 'shell', id, done: true, code: null, error: 'no command' });
+  const sh = process.env.SHELL || '/bin/zsh';
+  let child;
+  try { child = spawn(sh, ['-lc', command], { cwd, env: process.env, stdio: ['ignore', 'pipe', 'pipe'], detached: true }); }
+  catch (e) { return send({ type: 'shell', id, done: true, code: null, error: e.message }); }
+  shells.set(id, child);
+  const sizes = { stdout: 0, stderr: 0 };
+  for (const stream of ['stdout', 'stderr']) child[stream].on('data', d => {
+    if (sizes[stream] >= SHELL_MAX) return;
+    const chunk = d.toString('utf8').slice(0, SHELL_MAX - sizes[stream]);
+    sizes[stream] += chunk.length;
+    send({ type: 'shell', id, stream, chunk });
+  });
+  child.on('error', e => { shells.delete(id); send({ type: 'shell', id, done: true, code: null, error: e.message }); });
+  child.on('close', (code, signal) => { if (shells.delete(id)) send({ type: 'shell', id, done: true, code, signal: signal || null }); });
+}
+
+function killShell(id) {
+  const child = shells.get(String(id || ''));
+  if (!child) return;
+  // The whole group: the login shell and what it started.
+  try { process.kill(-child.pid, 'SIGINT'); } catch { child.kill('SIGINT'); }
+  setTimeout(() => { if (shells.has(String(id))) { try { process.kill(-child.pid, 'SIGKILL'); } catch {} } }, 2000);
+}
+
+// ── prompt history: Claude Code's own file, so ↑ and Ctrl+R match the TUI ──
+
+const HISTORY_FILE = path.join(process.env.CLAUDE_CONFIG_DIR || path.join(os.homedir(), '.claude'), 'history.jsonl');
+
+function promptHistory() {
+  let lines = [];
+  try { lines = fs.readFileSync(HISTORY_FILE, 'utf8').split('\n'); } catch {}
+  const seen = new Set(), list = [];
+  for (let i = lines.length - 1; i >= 0 && list.length < 500; i--) {
+    let e; try { e = JSON.parse(lines[i]); } catch { continue; }
+    if (!e || e.project !== cwd || typeof e.display !== 'string' || !e.display.trim() || seen.has(e.display)) continue;
+    seen.add(e.display);
+    list.push({ text: e.display, at: e.timestamp || 0 });
+  }
+  return { type: 'promptHistory', list };
+}
+
+/** A prompt the user typed here goes into the same file, so the TUI's ↑ finds it too. */
+function rememberPrompt(display) {
+  const text = String(display || '').trim();
+  if (!text) return;
+  const line = JSON.stringify({ display: text, pastedContents: {}, timestamp: Date.now(), project: cwd, ...(sessionId ? { sessionId } : {}) });
+  fs.appendFile(HISTORY_FILE, line + '\n', { mode: 0o600 }, () => {});
+}
+
 /**
  * @-mention suggestions: the same fuzzy file search the TUI shows. There is no
  * public method for it, so this sends the control request directly.
@@ -324,9 +415,22 @@ rl.on('line', line => {
     switch (m.type) {
       case 'start': start(m); break;
       case 'user':
-        inbox.push({ type: 'user', ...(m.uuid ? { uuid: m.uuid } : {}), message: { role: 'user', content: userContent(m) }, parent_tool_use_id: null });
+        if (typeof m.display === 'string') rememberPrompt(m.display);
+        inbox.push({ type: 'user', ...(m.uuid ? { uuid: m.uuid } : {}), message: { role: 'user', content: userContent(m) }, parent_tool_use_id: null,
+          ...(['now', 'next', 'later'].includes(m.priority) ? { priority: m.priority } : {}), ...(m.shouldQuery === false ? { shouldQuery: false } : {}) });
         break;
       case 'permission': answer(m); break;
+      case 'background':
+        if (!session) break;
+        session.backgroundTasks(m.toolUseId || undefined).then(ok => { if (!ok) send({ type: 'error', message: 'Background: that command is not running in the foreground' }); },
+          e => send({ type: 'error', message: 'Background: ' + e.message }));
+        break;
+      case 'stopTask':
+        if (session && m.taskId) session.stopTask(String(m.taskId)).catch(e => send({ type: 'error', message: 'Stop: ' + e.message }));
+        break;
+      case 'shell': runShell(m); break;
+      case 'shellKill': killShell(m.id); break;
+      case 'promptHistory': send(promptHistory()); break;
       case 'interrupt': session?.interrupt().catch(e => send({ type: 'error', message: 'interrupt: ' + e.message })); break;
       case 'setModel': control('Model', () => session.setModel(m.model || undefined), { type: 'model', model: m.model }); break;
       case 'setPermissionMode':
@@ -369,7 +473,8 @@ rl.on('line', line => {
 });
 rl.on('close', () => {
   // The host went away: deny anything still waiting, stop the session, exit.
-  for (const [id, p] of pending) p.resolve({ behavior: 'deny', message: 'FloatyTerm closed the session.' });
+  for (const [id, p] of pending) p.resolve(p.elicitation ? { action: 'cancel' } : { behavior: 'deny', message: 'FloatyTerm closed the session.' });
+  for (const id of shells.keys()) killShell(id);
   pending.clear();
   inbox.close();
   abort.abort();

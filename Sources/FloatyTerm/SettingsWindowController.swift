@@ -26,6 +26,7 @@ final class SettingsWindowController: NSObject {
     private var summonGridButtons: [NSButton] = []   // 9 buttons, row-major
     private let retentionPopup = NSPopUpButton()
     private let capPopup = NSPopUpButton()
+    private let appearancePopup = NSPopUpButton()
     private let usageStack = NSStackView()           // per-category usage rows
 
     // Hotkey recording state.
@@ -75,6 +76,16 @@ final class SettingsWindowController: NSObject {
         fontSlider.allowsTickMarkValuesOnly = true
         fontSlider.widthAnchor.constraint(equalToConstant: 200).isActive = true
         stack.addArrangedSubview(row("Font size", fontSlider, fontValueLabel))
+
+        // Rich renderer colours: the Claude and Codex tabs and Markdown previews
+        for (title, tag) in [("Follow macOS", 0), ("Light", 1), ("Dark", 2)] {
+            appearancePopup.addItem(withTitle: title)
+            appearancePopup.lastItem?.tag = tag
+        }
+        appearancePopup.target = self
+        appearancePopup.action = #selector(appearanceChanged(_:))
+        appearancePopup.widthAnchor.constraint(equalToConstant: 200).isActive = true
+        stack.addArrangedSubview(row("Rich view colours", appearancePopup))
 
         // Background blur toggle
         blurCheckbox.target = self
@@ -302,6 +313,7 @@ final class SettingsWindowController: NSObject {
     }
 
     private func syncControls() {
+        _ = appearancePopup.selectItem(withTag: Settings.shared.rendererAppearance)
         fontValueLabel.stringValue = "\(Int(Settings.shared.fontSize)) pt"
         blurCheckbox.state = Settings.shared.backgroundBlur ? .on : .off
         focusedSlider.doubleValue = Settings.shared.focusedOpacity
@@ -422,6 +434,10 @@ final class SettingsWindowController: NSObject {
     @objc private func opacityChanged(_ sender: NSSlider) {
         Settings.shared.unfocusedOpacity = sender.doubleValue
         opacityValueLabel.stringValue = "\(Int(sender.doubleValue * 100))%"
+    }
+
+    @objc private func appearanceChanged(_ sender: NSPopUpButton) {
+        Settings.shared.rendererAppearance = sender.selectedTag()
     }
 
     @objc private func retentionChanged(_ sender: NSPopUpButton) {

@@ -1,0 +1,550 @@
+<!DOCTYPE html>
+<html lang="en"><head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Subagents as avatars — mockup</title>
+<link rel="stylesheet" href="../../fonts.css">
+<style>
+  /* A mockup of the Claude tab: subagents as avatars at the top right. A hover grows an avatar into
+     a card; a click opens the agent's conversation, where you talk to it.
+     Self-contained: the tokens are a copy of skim.css :root. */
+  :root {
+    color-scheme: dark;
+    --bg: #121211; --surface: #1a1917; --surface-2: #161614; --surface-3: #211f1c; --inset: #0e0e0d;
+    --line: #24221f; --line-2: #2c2a26; --line-3: #3a3732;
+    --text: #ebe7de; --text-2: #e3dfd6; --text-3: #d9d4c9; --muted: #a8a397; --faint: #77726a; --ghost: #4d4a44;
+    --accent: #e08a5f; --accent-2: #f0a57f; --code: #f0b597; --path: #8fb3e6; --good: #86c28a; --bad: #ec7f72; --warn: #e2bd62;
+    --sans: 'Rubik', system-ui, -apple-system, sans-serif;
+    --mono: 'JetBrains Mono', 'SF Mono', ui-monospace, Menlo, monospace;
+    --spring: cubic-bezier(.34, 1.4, .64, 1);
+    --ease: cubic-bezier(.2, .8, .2, 1);
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; background: var(--bg); color: var(--text); font: 14px/1.55 var(--sans); }
+  button { font: inherit; color: inherit; }
+  .app { display: flex; flex-direction: column; height: 100vh; max-width: 760px; margin: 0 auto; border-left: 1px solid var(--line); border-right: 1px solid var(--line); }
+
+  /* ── the top bar: where you are on the left, the agents on the right ── */
+  .top { flex: none; display: flex; align-items: center; gap: 10px; height: 50px; padding: 0 12px; border-bottom: 1px solid var(--line); position: relative; z-index: 3; }
+  .crumbs { flex: 1; min-width: 0; display: flex; align-items: center; gap: 6px; font-size: 12.5px; color: var(--faint); white-space: nowrap; overflow: hidden; }
+  .crumbs button { border: 0; background: none; padding: 2px 5px; border-radius: 5px; color: var(--muted); cursor: pointer; }
+  .crumbs button:hover { background: var(--surface-3); color: var(--text); }
+  .crumbs .here { color: var(--text); font-weight: 600; }
+  .crumbs .sep { color: var(--ghost); }
+  .crumbs .meta { color: var(--faint); }
+  .crumbs .state { font-size: 11.5px; padding: 1px 7px; border-radius: 9px; background: var(--surface-3); }
+  .crumbs .state[data-s="running"] { color: var(--accent); }
+  .crumbs .state[data-s="waiting"] { color: var(--warn); }
+  .crumbs .state[data-s="done"] { color: var(--good); }
+  .crumbs .state[data-s="error"] { color: var(--bad); }
+
+  /* the avatar stack: overlapped when at rest, spread apart under the pointer */
+  .stack { flex: none; display: flex; align-items: center; padding: 4px 2px 4px 10px; }
+  .stack-label { font: 10.5px var(--mono); color: var(--ghost); margin-right: 10px; transition: opacity .2s var(--ease); }
+  .stack:hover .stack-label, .stack.force-hover .stack-label { opacity: 0; }
+  .av { --c: var(--accent); position: relative; flex: none; width: 30px; height: 30px; margin-left: -9px; padding: 0; border: 0; border-radius: 50%;
+    background: none; cursor: pointer; transition: margin .26s var(--spring), transform .26s var(--spring), opacity .2s var(--ease); }
+  .av:first-of-type { margin-left: 0; }
+  .stack:hover .av, .stack.force-hover .av { margin-left: 5px; }
+  .stack:hover .av:first-of-type, .stack.force-hover .av:first-of-type { margin-left: 0; }
+  .av:hover, .av.is-open { transform: translateY(1px) scale(1.18); z-index: 2; }
+  .av[data-s="done"] { opacity: .62; }
+  .stack:hover .av[data-s="done"], .stack.force-hover .av[data-s="done"], .av.is-open { opacity: 1; }
+  /* the face: the agent's type, on its colour */
+  .face { position: absolute; inset: 3px; border-radius: 50%; display: grid; place-items: center; background: color-mix(in srgb, var(--c) 26%, #151413);
+    color: color-mix(in srgb, var(--c) 70%, white); font: 600 10.5px var(--mono); letter-spacing: -.02em; box-shadow: 0 0 0 2px var(--bg); }
+  /* the ring says the state: it turns while the agent works */
+  .ring { position: absolute; inset: 0; border-radius: 50%; }
+  .av[data-s="running"] .ring { background: conic-gradient(from 0deg, transparent 0 40%, color-mix(in srgb, var(--c) 35%, transparent) 60%, var(--c) 100%); animation: spin 1.1s linear infinite;
+    -webkit-mask: radial-gradient(circle, transparent 11.5px, #000 12px); mask: radial-gradient(circle, transparent 11.5px, #000 12px); }
+  .av[data-s="waiting"] .ring { box-shadow: inset 0 0 0 2px var(--warn); animation: nudge 2.4s var(--ease) infinite; }
+  .av[data-s="done"] .ring { box-shadow: inset 0 0 0 2px color-mix(in srgb, var(--good) 70%, transparent); }
+  .av[data-s="error"] .ring { box-shadow: inset 0 0 0 2px var(--bad); }
+  .av.is-here .face { box-shadow: 0 0 0 2px var(--bg), 0 0 0 3.5px var(--text-3); }
+  .badge { position: absolute; right: -3px; bottom: -3px; width: 14px; height: 14px; border-radius: 50%; display: grid; place-items: center;
+    font: 700 9px var(--sans); color: #151413; box-shadow: 0 0 0 2px var(--bg); }
+  .av[data-s="waiting"] .badge { background: var(--warn); }
+  .av[data-s="done"] .badge { background: var(--good); }
+  .av[data-s="error"] .badge { background: var(--bad); }
+  .av[data-s="running"] .badge { display: none; }
+  .unread { position: absolute; top: -1px; right: -1px; width: 8px; height: 8px; border-radius: 50%; background: var(--accent-2); box-shadow: 0 0 0 2px var(--bg); }
+  .av.is-new { animation: pop .42s var(--spring); }
+  .av.is-ping .ring::after { content: ''; position: absolute; inset: 0; border-radius: 50%; box-shadow: 0 0 0 2px var(--good); animation: ping .9s var(--ease) forwards; }
+  @keyframes spin { to { transform: rotate(1turn); } }
+  @keyframes nudge { 0%, 70%, 100% { transform: none; } 78% { transform: translateY(-3px); } 86% { transform: none; } 92% { transform: translateY(-1.5px); } }
+  @keyframes pop { from { transform: scale(0); opacity: 0; } }
+  @keyframes ping { to { transform: scale(1.9); opacity: 0; } }
+
+  /* the hover card: the avatar grows into it (and shrinks back on leave) */
+  .hc { position: fixed; z-index: 10; width: 300px; padding: 12px; border: 1px solid var(--line-3); border-radius: 14px; background: #1c1b18;
+    box-shadow: 0 18px 40px rgba(0,0,0,.55); pointer-events: auto; }
+  .hc[hidden] { display: none; }
+  .hc-h { display: flex; align-items: center; gap: 10px; }
+  .hc .av { margin: 0 !important; width: 40px; height: 40px; transform: none !important; opacity: 1 !important; cursor: default; }
+  .hc .av .face { font-size: 13px; }
+  .hc .av[data-s="running"] .ring { -webkit-mask: radial-gradient(circle, transparent 17.5px, #000 18px); mask: radial-gradient(circle, transparent 17.5px, #000 18px); }
+  .hc-name { min-width: 0; }
+  .hc-type { font-weight: 600; font-size: 14px; }
+  .hc-state { font-size: 11.5px; color: var(--faint); }
+  .hc-state b { font-weight: 500; }
+  .hc-state b[data-s="running"] { color: var(--accent); } .hc-state b[data-s="waiting"] { color: var(--warn); }
+  .hc-state b[data-s="done"] { color: var(--good); } .hc-state b[data-s="error"] { color: var(--bad); }
+  .hc-desc { margin: 10px 0 8px; color: var(--text-2); font-size: 13.5px; line-height: 1.4; }
+  .hc-now { display: flex; gap: 7px; align-items: baseline; padding: 7px 9px; border-radius: 8px; background: var(--inset); font: 11.5px var(--mono); color: var(--text-3); }
+  .hc-now .k { color: var(--faint); flex: none; }
+  .hc-now .v { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .hc-steps { margin: 8px 0 0; padding: 0; list-style: none; display: flex; flex-direction: column; gap: 2px; }
+  .hc-steps li { font: 11px var(--mono); color: var(--faint); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .hc-steps li::before { content: '✓  '; color: var(--good); }
+  .hc-ask { margin-top: 8px; padding: 7px 9px; border-radius: 8px; border: 1px solid rgba(226,189,98,.35); background: rgba(226,189,98,.07); font-size: 12.5px; }
+  .hc-ask code { display: block; margin-top: 3px; font: 11px var(--mono); color: var(--code); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .hc-result { margin-top: 8px; padding: 7px 9px; border-radius: 8px; background: var(--inset); font-size: 12.5px; color: var(--text-3);
+    display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical; overflow: hidden; }
+  .hc-stats { display: flex; gap: 12px; margin-top: 10px; font: 11px var(--mono); color: var(--faint); }
+  .hc-stats b { color: var(--text-3); font-weight: 500; }
+  .hc-f { display: flex; gap: 6px; margin-top: 11px; }
+  .hc-f .grow { flex: 1; }
+  /* card content arrives a beat after the card has grown */
+  .hc.is-in .hc-body > * { animation: rise .28s var(--ease) both; }
+  .hc.is-in .hc-body > *:nth-child(2) { animation-delay: .04s; } .hc.is-in .hc-body > *:nth-child(3) { animation-delay: .08s; }
+  .hc.is-in .hc-body > *:nth-child(4) { animation-delay: .12s; } .hc.is-in .hc-body > *:nth-child(5) { animation-delay: .16s; }
+  @keyframes rise { from { opacity: 0; transform: translateY(4px); } }
+
+  .act { flex: none; height: 26px; padding: 0 9px; border: 1px solid var(--line-3); border-radius: 7px; background: none; color: var(--text-3); font-size: 12px; cursor: pointer;
+    display: inline-flex; align-items: center; gap: 6px; transition: border-color .15s, color .15s; }
+  .act:hover { border-color: var(--accent); color: var(--text); }
+  .act kbd { font: 10px var(--mono); color: var(--faint); }
+  .act.main { border-color: var(--accent); color: var(--text); }
+  .act.stop:hover { border-color: var(--bad); }
+
+  /* ── the log ── */
+  .log { flex: 1; min-height: 0; overflow: auto; padding: 16px 18px 24px; display: flex; flex-direction: column; gap: 12px; }
+  .log > * { flex-shrink: 0; }
+  .view-in { animation: viewin .3s var(--ease); }
+  @keyframes viewin { from { opacity: 0; transform: translateX(10px); } }
+  .you { align-self: flex-start; max-width: 88%; padding: 8px 12px; border-left: 2px solid var(--accent); background: var(--surface); border-radius: 0 8px 8px 0; }
+  .you .who { display: block; font: 10.5px var(--mono); color: var(--faint); margin-bottom: 2px; }
+  .from-main { border-left-color: var(--path); }
+  .from-main .who { color: var(--path); }
+  .fold summary { cursor: pointer; color: var(--muted); font-size: 13px; list-style: none; }
+  .fold summary::before { content: '▸ '; color: var(--faint); }
+  .fold[open] summary::before { content: '▾ '; }
+  .say p { margin: 0 0 6px; color: var(--text-2); }
+  .say code { font: 12.5px var(--mono); color: var(--code); }
+  .row { display: flex; align-items: center; gap: 8px; font: 12px var(--mono); color: var(--muted); padding: 2px 0; }
+  .row .ic { width: 16px; height: 16px; border-radius: 4px; display: grid; place-items: center; font-size: 9px; background: var(--surface-3); color: var(--faint); flex: none; }
+  .row[data-s="done"] .ic { background: rgba(134,194,138,.16); color: var(--good); }
+  .row[data-s="running"] .ic { background: rgba(224,138,95,.16); color: var(--accent); }
+  .row .name { color: var(--text-3); }
+  .row .arg { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--faint); }
+  .row .meta { margin-left: auto; color: var(--ghost); flex: none; }
+  .note { font-size: 12px; color: var(--faint); text-align: center; }
+  /* in Main, an Agent call is one line with its avatar; the avatar up top has the rest */
+  .arow { display: flex; align-items: center; gap: 10px; padding: 7px 10px; border: 1px solid var(--line-2); border-radius: 10px; background: var(--surface); cursor: pointer;
+    transition: border-color .15s, background .15s; }
+  .arow:hover { border-color: var(--line-3); background: var(--surface-3); }
+  .arow .av { margin: 0 !important; width: 26px; height: 26px; transform: none !important; opacity: 1 !important; }
+  .arow .av[data-s="running"] .ring { -webkit-mask: radial-gradient(circle, transparent 10.5px, #000 11px); mask: radial-gradient(circle, transparent 10.5px, #000 11px); }
+  .arow .t { font-weight: 600; font-size: 13px; flex: none; }
+  .arow .d { flex: 1; min-width: 0; color: var(--muted); font-size: 13px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .arow .n { flex: none; font: 11px var(--mono); color: var(--faint); max-width: 45%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .result { padding: 9px 11px; border-radius: 8px; background: var(--inset); color: var(--text-3); font-size: 13px; }
+  .result .k { display: block; font: 10.5px var(--mono); color: var(--good); margin-bottom: 4px; }
+  .result table { border-collapse: collapse; font-size: 12px; width: 100%; }
+  .result td, .result th { text-align: left; padding: 3px 10px 3px 0; border-bottom: 1px solid var(--line-2); }
+  .result th { color: var(--faint); font-weight: 500; }
+  .ask { border: 1px solid rgba(226,189,98,.35); border-radius: 10px; background: var(--surface); padding: 10px 12px; }
+  .ask h4 { margin: 0 0 4px; font-size: 13px; }
+  .ask code { display: block; margin: 6px 0 10px; padding: 6px 9px; background: var(--inset); border-radius: 6px; font: 12px var(--mono); color: var(--code); }
+  .ask .btns { display: flex; gap: 6px; flex-wrap: wrap; }
+
+  /* ── the dock: addressed to the conversation in view ── */
+  .dock { flex: none; border-top: 1px solid var(--line); padding: 8px 12px 12px; }
+  .status { display: flex; align-items: center; gap: 8px; height: 22px; margin-bottom: 6px; font: 11.5px var(--mono); color: var(--muted); }
+  .status .s-text { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .status .keys { color: var(--ghost); }
+  .dot { flex: none; width: 7px; height: 7px; border-radius: 50%; background: var(--ghost); }
+  .dot[data-s="running"] { background: var(--accent); animation: blink 1.2s ease-in-out infinite; }
+  .dot[data-s="waiting"] { background: var(--warn); } .dot[data-s="done"] { background: var(--good); } .dot[data-s="error"] { background: var(--bad); }
+  @keyframes blink { 50% { opacity: .35; } }
+  .composer { display: flex; gap: 8px; align-items: flex-end; }
+  .field { flex: 1; min-width: 0; display: flex; flex-direction: column; border: 1px solid var(--line-3); border-radius: 10px; background: var(--surface); transition: border-color .2s; }
+  .field.to-agent { border-color: color-mix(in srgb, var(--c, var(--accent)) 55%, transparent); }
+  .to { display: flex; align-items: center; gap: 7px; padding: 6px 8px 0 8px; font-size: 11.5px; color: var(--ghost); }
+  .to-chip { display: inline-flex; align-items: center; gap: 6px; height: 22px; padding: 0 8px 0 3px; border-radius: 11px; border: 1px solid var(--line-3); background: var(--surface-3);
+    color: var(--text-3); font-size: 11.5px; cursor: pointer; }
+  .to-chip:hover { border-color: var(--accent); }
+  .to-chip .av { margin: 0 !important; width: 17px; height: 17px; transform: none !important; opacity: 1 !important; }
+  .to-chip .av .face { inset: 1.5px; font-size: 7px; box-shadow: none; }
+  .to-chip .av .ring, .to-chip .av .badge { display: none; }
+  textarea { width: 100%; min-height: 40px; max-height: 140px; resize: none; padding: 8px 12px; border: 0; outline: none; background: none; color: var(--text); font: 14px/1.45 var(--sans); }
+  textarea::placeholder { color: var(--faint); }
+  .send { flex: none; width: 38px; height: 38px; border-radius: 9px; border: 1px solid var(--line-3); background: var(--surface-3); cursor: pointer; display: grid; place-items: center; }
+  .send:hover { border-color: var(--accent); }
+  .send i { width: 0; height: 0; border-left: 9px solid var(--text); border-top: 6px solid transparent; border-bottom: 6px solid transparent; margin-left: 2px; }
+  .menu { position: fixed; z-index: 12; min-width: 220px; padding: 4px; border: 1px solid var(--line-3); border-radius: 10px; background: #1f1d1a; box-shadow: 0 12px 28px rgba(0,0,0,.5);
+    animation: rise .18s var(--ease); }
+  .menu button { display: flex; align-items: center; gap: 8px; width: 100%; padding: 6px 8px; border: 0; border-radius: 6px; background: none; text-align: left; font-size: 12.5px; cursor: pointer; }
+  .menu button:hover { background: var(--surface-3); }
+  .menu .m-sub { color: var(--faint); margin-left: auto; font-size: 11px; }
+  .menu .av { margin: 0 !important; width: 20px; height: 20px; transform: none !important; opacity: 1 !important; }
+  .menu .av .face { font-size: 7.5px; inset: 2px; }
+
+  /* ── mockup controls (not part of the design) ── */
+  .mock { position: fixed; left: 12px; bottom: 12px; z-index: 20; width: 270px; padding: 10px 12px; border: 1px dashed var(--line-3); border-radius: 10px;
+    background: rgba(14,14,13,.94); font-size: 12px; color: var(--muted); }
+  .mock h5 { margin: 0 0 6px; font: 600 11px var(--mono); color: var(--faint); text-transform: uppercase; letter-spacing: .06em; }
+  .mock .scen { display: flex; flex-wrap: wrap; gap: 4px; margin-bottom: 8px; }
+  .mock .scen button { height: 22px; padding: 0 8px; border: 1px solid var(--line-3); border-radius: 5px; background: none; color: var(--text-3); font-size: 11px; cursor: pointer; }
+  .mock .scen button.is-on { border-color: var(--accent); color: var(--text); }
+  .mock ul { margin: 6px 0 0; padding-left: 16px; } .mock li { margin: 3px 0; }
+  .mock .min { float: right; border: 0; background: none; color: var(--faint); cursor: pointer; }
+  .mock.is-min { width: auto; padding: 4px 10px; left: 50%; bottom: auto; top: 10px; transform: translateX(-50%); } .mock.is-min h5 { margin: 0 18px 0 0; } .mock.is-min .body { display: none; }
+
+  @media (prefers-reduced-motion: reduce) {
+    *, *::before, *::after { animation-duration: .01ms !important; animation-iteration-count: 1 !important; transition-duration: .01ms !important; }
+  }
+</style>
+</head><body>
+<div class="app" id="app"></div>
+<div class="hc" id="hc" hidden></div>
+
+<div class="mock" id="mock">
+  <button class="min" onclick="this.parentElement.classList.toggle('is-min')" title="Fold">▾</button>
+  <h5>Mockup · scenario</h5>
+  <div class="body">
+    <div class="scen" id="scen"></div>
+    <details open><summary>What changes</summary><ul>
+      <li>Agents are <b>avatars at the top right</b>. The ring says the state: it turns while the agent works, yellow when it needs you, green when done.</li>
+      <li><b>Hover</b> the stack: it spreads. Hover an avatar: it <b>grows into a card</b> with the task, the live step, the last steps and the numbers.</li>
+      <li><b>Click</b> an avatar: its conversation opens in the column. The composer says <b>“To Explore”</b>: you talk to that agent, as in the TUI.</li>
+      <li>In Main, an Agent call is <b>one line</b> with the same avatar.</li>
+      <li>Keys: <b>⌥1…9</b> open an agent, <b>Esc</b> back to Main, <b>⌃B</b> background, <b>⌃X</b> stop.</li>
+    </ul></details>
+  </div>
+</div>
+
+<script>
+(() => {
+  'use strict';
+  const h = (tag, props, ...kids) => {
+    const el = document.createElement(tag);
+    for (const [k, v] of Object.entries(props || {})) {
+      if (v == null || v === false) continue;
+      if (k === 'class') el.className = v; else if (k === 'text') el.textContent = v; else if (k === 'html') el.innerHTML = v;
+      else if (k === 'style' && typeof v === 'object') Object.assign(el.style, v);
+      else if (k.startsWith('on')) el.addEventListener(k.slice(2), v); else el.setAttribute(k, v === true ? '' : v);
+    }
+    for (const kid of kids.flat()) if (kid != null && kid !== false) el.append(kid instanceof Node ? kid : document.createTextNode(String(kid)));
+    return el;
+  };
+  const reduce = matchMedia('(prefers-reduced-motion: reduce)').matches;
+
+  // ── the mock world ──
+  const COLORS = { Explore: '#8fb3e6', Verify: '#86c28a', 'general-purpose': '#e08a5f', Plan: '#e2bd62' };
+  const INITIALS = { Explore: 'Ex', Verify: 'Ve', 'general-purpose': 'GP', Plan: 'Pl' };
+  const PROMPT = 'Look in the sidecar and the Swift host for every place that retries a failed request. For each, say the file, the function, how many attempts it makes and what delay it uses. Do not change any code. Report as a table.';
+  let W, view = 'main', toAgent = true, scen = 'running';
+
+  function world(s) {
+    const explore = { id: 'a1', type: 'Explore', desc: 'Find the retry code', state: 'running', tools: 4, tokens: 9.8, secs: 21, prompt: PROMPT,
+      steps: [
+        { k: 'row', name: 'Grep', arg: '"retry|attempt" in Resources/', meta: '14 matches', s: 'done' },
+        { k: 'row', name: 'Read', arg: 'Resources/ClaudeSidecar/sidecar.mjs', meta: '377 lines', s: 'done' },
+        { k: 'say', text: 'The sidecar has no retry of its own: it relays Claude Code’s <code>api_retry</code> events. Checking the Swift host next.' },
+        { k: 'row', name: 'Grep', arg: '"retry" in Sources/FloatyTerm/', meta: '6 matches', s: 'done' },
+        { k: 'row', name: 'Read', arg: 'Sources/FloatyTerm/CDPBridge.swift', meta: '', s: 'running' }] };
+    const verify = { id: 'a2', type: 'Verify', desc: 'Check the backoff numbers', state: 'running', tools: 2, tokens: 3.1, secs: 8, parent: 'a1',
+      prompt: 'Confirm the delays in CDPBridge.reconnect() by reading the code. Report the numbers only.',
+      steps: [{ k: 'row', name: 'Read', arg: 'Sources/FloatyTerm/CDPBridge.swift:210-260', meta: '', s: 'running' }] };
+    const tests = { id: 'a3', type: 'general-purpose', desc: 'Run the sidecar tests', state: 'done', tools: 3, tokens: 5.2, secs: 34,
+      prompt: 'Run node --test in Resources/CodexSidecar and report failures.',
+      steps: [{ k: 'row', name: 'Bash', arg: 'node --test Resources/CodexSidecar', meta: 'exit 0', s: 'done' }, { k: 'say', text: 'All 41 tests pass.' }],
+      result: 'All 41 tests pass in Resources/CodexSidecar. No failures, no skips.' };
+    W = { agents: [explore, tests] };
+    if (s === 'approval') { explore.state = 'waiting'; explore.steps[4].s = 'done'; explore.approval = { tool: 'Bash', cmd: 'rg -n "maxRetries" ~/Library/Developer/Xcode/DerivedData' }; }
+    if (s === 'done') {
+      explore.state = 'done'; explore.steps[4].s = 'done'; explore.tools = 7; explore.tokens = 18.4; explore.secs = 52;
+      explore.steps.push({ k: 'say', text: 'Found three places. Table below.' });
+      explore.result = '| File | Function | Attempts | Delay |\n|---|---|---|---|\n| CDPBridge.swift | reconnect() | 5 | 0.5 s × 2ⁿ |\n| DevtoolsRelay.swift | sendWithRetry() | 3 | 1 s fixed |\n| sidecar.mjs | — (relays api_retry) | — | — |';
+    }
+    if (s === 'nested') { W.agents.splice(1, 0, verify); explore.steps.push({ k: 'spawn', id: 'a2' }); }
+    W.byId = Object.fromEntries(W.agents.map(a => [a.id, a]));
+  }
+
+  const agentOf = id => W.byId[id];
+  const busy = a => a.state === 'running' || a.state === 'waiting';
+  const WORD = { running: 'working', waiting: 'needs you', done: 'done', error: 'stopped' };
+  const live = a => { const r = [...a.steps].reverse().find(s => s.k === 'row' && s.s === 'running'); return r ? `${r.name} ${r.arg}` : a.state === 'waiting' ? `Waiting: wants to run ${a.approval.tool}` : ''; };
+  const working = () => { const n = W.agents.filter(busy).length; return n ? `${n} ${n === 1 ? 'agent' : 'agents'} working` : 'agents done'; };
+
+  /** An avatar: the face (type initials on its colour), the state ring, a badge. */
+  function avatar(a, extra = {}) {
+    const el = h('button', { class: 'av', type: 'button', 'data-s': a.state, 'aria-label': `${a.type}: ${a.desc}, ${WORD[a.state]}`, ...extra },
+      h('span', { class: 'ring' }), h('span', { class: 'face', text: INITIALS[a.type] || a.type.slice(0, 2) }),
+      h('span', { class: 'badge', text: a.state === 'done' ? '✓' : a.state === 'waiting' ? '!' : a.state === 'error' ? '×' : '' }));
+    el.style.setProperty('--c', COLORS[a.type] || 'var(--accent)');
+    return el;
+  }
+
+  // ── the skeleton is built once; parts repaint in place (so hovers and animations survive) ──
+  const app = document.getElementById('app');
+  const crumbs = h('div', { class: 'crumbs' });
+  const stack = h('div', { class: 'stack' }, h('span', { class: 'stack-label' }));
+  const top = h('header', { class: 'top' }, crumbs, stack);
+  const logEl = h('div', { class: 'log' });
+  const dockEl = h('div', { class: 'dock' });
+  app.append(top, logEl, dockEl);
+  const avs = new Map();   // agent id → its avatar in the stack
+
+  function paintStack() {
+    stack.firstChild.textContent = working();
+    const ids = new Set(W.agents.map(a => a.id));
+    for (const [id, el] of avs) if (!ids.has(id)) { el.remove(); avs.delete(id); }
+    W.agents.forEach((a, i) => {
+      let el = avs.get(a.id);
+      if (!el) {
+        el = avatar(a);
+        el.addEventListener('mouseenter', () => openCard(a.id, el));
+        el.addEventListener('mouseleave', () => closeCardSoon());
+        el.addEventListener('click', () => { closeCard(true); go(a.id); });
+        el.addEventListener('focus', () => openCard(a.id, el));
+        el.addEventListener('blur', () => closeCardSoon());
+        if (!reduce && W.ready) el.classList.add('is-new');
+        avs.set(a.id, el); stack.append(el);
+      }
+      if (el.dataset.s !== a.state) {
+        if (a.state === 'done' && el.dataset.s) { el.classList.remove('is-ping'); void el.offsetWidth; el.classList.add('is-ping'); }
+        el.dataset.s = a.state;
+        el.querySelector('.badge').textContent = a.state === 'done' ? '✓' : a.state === 'waiting' ? '!' : a.state === 'error' ? '×' : '';
+      }
+      el.classList.toggle('is-here', view === a.id);
+      el.title = '';
+      let u = el.querySelector('.unread');
+      if (a.unread && view !== a.id) { if (!u) el.append(h('span', { class: 'unread' })); } else if (u) u.remove();
+      el.setAttribute('aria-keyshortcuts', 'Alt+' + (i + 1));
+    });
+    W.ready = true;
+  }
+
+  // ── the hover card: grows out of the avatar ──
+  const hc = document.getElementById('hc');
+  let hcFor = null, hcFrom = null, hcTimer = 0, hcAnim = null;
+
+  function cardBody(a) {
+    const steps = a.steps.filter(s => s.k === 'row' && s.s === 'done').slice(-3);
+    return h('div', { class: 'hc-body' },
+      h('div', { class: 'hc-h' }, avatar(a, { tabindex: -1 }),
+        h('div', { class: 'hc-name' }, h('div', { class: 'hc-type', text: a.type }),
+          h('div', { class: 'hc-state' }, h('b', { 'data-s': a.state, text: WORD[a.state] }), ' · started by ' + (a.parent ? agentOf(a.parent).type : 'Main')))),
+      h('div', { class: 'hc-desc', text: a.desc }),
+      a.approval ? h('div', { class: 'hc-ask' }, `Wants to run ${a.approval.tool}`, h('code', { text: a.approval.cmd }))
+        : a.result ? h('div', { class: 'hc-result', text: a.result.replace(/\|/g, ' ').replace(/-{3,}/g, '').replace(/\s+/g, ' ').trim() })
+        : h('div', { class: 'hc-now' }, h('span', { class: 'k', text: 'now' }), h('span', { class: 'v', text: live(a) || 'Starting…' })),
+      steps.length && !a.result ? h('ul', { class: 'hc-steps' }, steps.map(s => h('li', { text: `${s.name} ${s.arg}` }))) : null,
+      h('div', { class: 'hc-stats' }, h('span', null, h('b', { text: a.tools }), ' tools'), h('span', null, h('b', { text: a.tokens.toFixed(1) + 'k' }), ' tokens'), h('span', null, h('b', { text: a.secs + 's' }))),
+      h('div', { class: 'hc-f' },
+        h('button', { class: 'act main', onclick: () => { closeCard(true); go(a.id); } }, a.approval ? 'Review' : a.state === 'done' ? 'Open' : 'Open and talk', h('kbd', { text: '⌥' + (W.agents.indexOf(a) + 1) })),
+        h('span', { class: 'grow' }),
+        busy(a) ? h('button', { class: 'act', title: 'Send to the background', onclick: () => toast(a.type + ' goes on in the background') }, h('kbd', { text: '⌃B' })) : null,
+        busy(a) ? h('button', { class: 'act stop', onclick: () => stopAgent(a) }, 'Stop') : a.state === 'done' ? h('button', { class: 'act', onclick: () => { closeCard(true); go(a.id); } }, 'Continue it') : null));
+  }
+
+  function placeCard(from) {
+    const r = from.getBoundingClientRect(), w = hc.offsetWidth;
+    const left = Math.max(8, Math.min(r.right + 10 - w, innerWidth - w - 8));
+    hc.style.left = left + 'px'; hc.style.top = (r.bottom + 10) + 'px';
+    return { r, left };
+  }
+
+  function openCard(id, from) {
+    clearTimeout(hcTimer);
+    const a = agentOf(id);
+    if (hcFor === id && !hc.hidden) return;
+    avs.forEach(el => el.classList.toggle('is-open', el === from));
+    const swap = !hc.hidden;
+    hcFor = id; hcFrom = from;
+    hc.replaceChildren(cardBody(a));
+    hc.hidden = false;
+    const { r, left } = placeCard(from);
+    hc.classList.remove('is-in'); void hc.offsetWidth; hc.classList.add('is-in');
+    if (reduce) return;
+    if (hcAnim) hcAnim.cancel();
+    if (swap) { hcAnim = hc.animate([{ opacity: .6, transform: 'translateY(-2px)' }, { opacity: 1, transform: 'none' }], { duration: 160, easing: 'ease-out' }); return; }
+    // From the avatar's own circle to the card: scale about the avatar's centre, round to square.
+    const ox = r.left + r.width / 2 - left, oy = -10 - r.height / 2;
+    hc.style.transformOrigin = `${ox}px ${oy}px`;
+    hcAnim = hc.animate([
+      { opacity: 0, transform: 'scale(.12)', borderRadius: '50%' },
+      { opacity: 1, offset: .45 },
+      { opacity: 1, transform: 'scale(1)', borderRadius: '14px' }], { duration: 340, easing: 'cubic-bezier(.34,1.3,.64,1)' });
+  }
+
+  function closeCardSoon() { clearTimeout(hcTimer); hcTimer = setTimeout(() => closeCard(), 140); }
+  function closeCard(now) {
+    clearTimeout(hcTimer);
+    if (hc.hidden) return;
+    avs.forEach(el => el.classList.remove('is-open'));
+    const done = () => { hc.hidden = true; hcFor = null; hc.replaceChildren(); };
+    if (now || reduce) { if (hcAnim) hcAnim.cancel(); done(); return; }
+    hcAnim = hc.animate([{ opacity: 1, transform: 'scale(1)' }, { opacity: 0, transform: 'scale(.12)', borderRadius: '50%' }], { duration: 200, easing: 'cubic-bezier(.4,0,.8,.4)' });
+    hcAnim.onfinish = done;
+  }
+  hc.addEventListener('mouseenter', () => clearTimeout(hcTimer));
+  hc.addEventListener('mouseleave', () => closeCardSoon());
+
+  // ── painting ──
+  function paintCrumbs() {
+    const a = view === 'main' ? null : agentOf(view);
+    if (!a) { crumbs.replaceChildren(h('span', { class: 'here', text: 'Main' }), h('span', { class: 'sep', text: '·' }), h('span', { class: 'meta', text: 'Opus 5.5 · Ask' })); return; }
+    const chain = []; for (let x = a; x; x = x.parent ? agentOf(x.parent) : null) chain.unshift(x);
+    const parts = [h('button', { text: '← Main', onclick: () => go('main') })];
+    chain.forEach((x, i) => { parts.push(h('span', { class: 'sep', text: '›' })); parts.push(i === chain.length - 1 ? h('span', { class: 'here', text: x.type }) : h('button', { text: x.type, onclick: () => go(x.id) })); });
+    parts.push(h('span', { class: 'state', 'data-s': a.state, text: WORD[a.state] }));
+    crumbs.replaceChildren(...parts);
+  }
+
+  function table(md) {
+    const rows = md.trim().split('\n').filter(l => !/^\|[-| ]+\|$/.test(l)).map(l => l.split('|').slice(1, -1).map(c => c.trim()));
+    if (rows.length < 2) return h('div', { text: md });
+    return h('table', null, rows.map((r, i) => h('tr', null, r.map(c => h(i ? 'td' : 'th', { text: c })))));
+  }
+
+  function agentLine(a) {
+    return h('div', { class: 'arow', onclick: () => go(a.id) }, avatar(a, { tabindex: -1 }), h('span', { class: 't', text: a.type }), h('span', { class: 'd', text: a.desc }),
+      h('span', { class: 'n', text: a.state === 'done' ? `done · ${a.tools} tools · ${a.secs}s` : a.state === 'waiting' ? 'needs you' : live(a) }));
+  }
+
+  function steps(list) {
+    return list.map(s => s.k === 'row' ? h('div', { class: 'row', 'data-s': s.s }, h('span', { class: 'ic', text: s.s === 'done' ? '✓' : '●' }), h('span', { class: 'name', text: s.name }), h('span', { class: 'arg', text: s.arg }), h('span', { class: 'meta', text: s.s === 'running' ? 'running…' : s.meta }))
+      : s.k === 'say' ? h('div', { class: 'say', html: '<p>' + s.text + '</p>' })
+      : s.k === 'you' ? h('div', { class: 'you' }, h('span', { class: 'who', text: 'You → ' + s.to }), s.text)
+      : s.k === 'note' ? h('div', { class: 'note', text: s.text })
+      : s.k === 'spawn' ? agentLine(agentOf(s.id)) : null);
+  }
+
+  function paintLog(entering) {
+    const atEnd = logEl.scrollTop + logEl.clientHeight >= logEl.scrollHeight - 30;
+    const a = view === 'main' ? null : agentOf(view);
+    const kids = [];
+    if (!a) {
+      kids.push(h('div', { class: 'you' }, h('span', { class: 'who', text: 'You' }), 'Where do we retry failed requests? Use agents: one to find the code, one to run the sidecar tests.'),
+        h('div', { class: 'say', html: '<p>I’ll send two agents in parallel.</p>' }));
+      for (const x of W.agents) if (!x.parent) kids.push(agentLine(x));
+      for (const x of W.agents) if (x.result && !x.parent) kids.push(h('div', { class: 'result' }, h('span', { class: 'k', text: x.type + ' returned' }), table(x.result)));
+      if (W.agents.every(x => !busy(x))) kids.push(h('div', { class: 'say', html: '<p>Both agents are done. Retries live in two places in the Swift host; the sidecar only relays Claude Code’s own retries.</p>' }));
+    } else {
+      kids.push(h('div', { class: 'you from-main' }, h('span', { class: 'who', text: (a.parent ? agentOf(a.parent).type : 'Main') + ' → ' + a.type + ' · the task' }),
+        a.prompt.length > 160 ? h('details', { class: 'fold' }, h('summary', { text: a.prompt.slice(0, 150) + '…' }), a.prompt) : a.prompt));
+      kids.push(...steps(a.steps));
+      if (a.approval) kids.push(h('div', { class: 'ask' }, h('h4', { text: `${a.type} wants to run ${a.approval.tool}` }), h('code', { text: a.approval.cmd }),
+        h('div', { class: 'btns' },
+          h('button', { class: 'act main', onclick: () => { a.approval = null; a.state = 'running'; a.steps.push({ k: 'row', name: 'Bash', arg: 'rg -n "maxRetries" …/DerivedData', meta: '', s: 'running' }); repaint(); } }, 'Allow', h('kbd', { text: '↩' })),
+          h('button', { class: 'act', onclick: () => { a.approval = null; a.state = 'running'; a.steps.push({ k: 'note', text: 'Declined. It goes on without it.' }); repaint(); } }, 'Decline'),
+          h('button', { class: 'act', onclick: () => dockEl.querySelector('textarea').focus() }, 'Tell it what to do instead'))));
+      if (a.result) kids.push(h('div', { class: 'result' }, h('span', { class: 'k', text: 'Returned to ' + (a.parent ? agentOf(a.parent).type : 'Main') }), table(a.result)));
+    }
+    logEl.replaceChildren(...kids);
+    if (entering && !reduce) { logEl.classList.remove('view-in'); void logEl.offsetWidth; logEl.classList.add('view-in'); }
+    if (entering || atEnd) logEl.scrollTop = logEl.scrollHeight;
+  }
+
+  function paintDock() {
+    const ta0 = dockEl.querySelector('textarea'), draft = ta0 ? ta0.value : '', focused = document.activeElement === ta0;
+    const a = view === 'main' ? null : agentOf(view);
+    const target = a && toAgent ? a : null;
+    const status = a ? (a.state === 'done' ? `${a.type} finished · ${a.tools} tools · ${a.secs}s` : live(a) || 'Working') : W.agents.some(busy) ? 'Waiting on ' + working() : 'Ready';
+    const field = h('div', { class: 'field' + (target ? ' to-agent' : '') });
+    if (target) field.style.setProperty('--c', COLORS[target.type]);
+    const hint = !a ? 'Main reads this after its current step' : !target ? 'Main reads this; the agent is not told'
+      : a.state === 'done' ? 'It finished: this continues it, with all it knew' : 'It reads this at its next step, then goes on';
+    const ta = h('textarea', { rows: 1, placeholder: target ? `Message ${target.type}…` : 'Message Claude…' });
+    ta.value = draft;
+    ta.addEventListener('keydown', e => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); send(ta.value, a, target); } });
+    const chip = a ? h('button', { class: 'to-chip', onclick: e => toMenu(e, a) }, target ? avatar(target, { tabindex: -1 }) : h('span', { class: 'dot', 'data-s': 'running', style: { marginLeft: '5px' } }), 'To ' + (target ? target.type : 'Main'), ' ▾') : null;
+    field.append(h('div', { class: 'to' }, chip, h('span', { text: hint })), ta);
+    dockEl.replaceChildren(
+      h('div', { class: 'status' }, h('span', { class: 'dot', 'data-s': a ? a.state : W.agents.some(busy) ? 'running' : 'idle' }), h('span', { class: 's-text', text: status }),
+        a && busy(a) ? h('span', { class: 'keys', text: '⌃B background · Esc to Main' }) : null),
+      h('div', { class: 'composer' }, field, h('button', { class: 'send', onclick: () => send(ta.value, a, target) }, h('i'))));
+    if (focused) ta.focus();
+  }
+
+  function repaint(entering) { paintCrumbs(); paintStack(); paintLog(entering); paintDock(); if (!hc.hidden && hcFor) { hc.replaceChildren(cardBody(agentOf(hcFor))); placeCard(hcFrom); } }
+
+  function toMenu(e, a) {
+    document.querySelectorAll('.menu').forEach(m => m.remove());
+    const r = e.currentTarget.getBoundingClientRect();
+    const m = h('div', { class: 'menu', style: { left: r.left + 'px', bottom: (innerHeight - r.top + 6) + 'px' } },
+      h('button', { onclick: () => { toAgent = true; m.remove(); paintDock(); } }, avatar(a, { tabindex: -1 }), a.type, h('span', { class: 'm-sub', text: 'this agent' })),
+      h('button', { onclick: () => { toAgent = false; m.remove(); paintDock(); } }, h('span', { class: 'dot', 'data-s': 'running', style: { margin: '0 6px' } }), 'Main', h('span', { class: 'm-sub', text: 'the lead agent' })));
+    document.body.append(m);
+    setTimeout(() => document.addEventListener('mousedown', ev => { if (!m.contains(ev.target)) m.remove(); }, { once: true }));
+  }
+
+  function send(text, a, target) {
+    text = String(text || '').trim();
+    if (!text) return;
+    dockEl.querySelector('textarea').value = '';
+    if (!a) { toast('In Main: as today'); return; }
+    if (!target) { a.steps.push({ k: 'note', text: 'Sent to Main, not to this agent.' }); repaint(); return; }
+    a.steps.push({ k: 'you', to: target.type, text });
+    if (a.approval) { a.approval = null; a.steps.push({ k: 'note', text: 'Declined with your note. It reads it next.' }); }
+    const wasDone = a.state === 'done';
+    a.state = 'running'; if (wasDone) a.result = null;
+    repaint();
+    setTimeout(() => {
+      a.steps.push({ k: 'say', text: wasDone ? 'Continuing with what I found before. Checking the case you asked about.' : 'Understood. I’ll include that and keep going.' });
+      a.steps.push({ k: 'row', name: 'Grep', arg: '"timeout" in Sources/FloatyTerm/', meta: '', s: 'running' });
+      a.tools++; if (view !== a.id) a.unread = true; repaint();
+    }, 900);
+  }
+
+  function stopAgent(a) { closeCard(true); a.state = 'error'; a.approval = null; a.steps.push({ k: 'note', text: 'You stopped this agent. Main gets “stopped by the user”.' }); repaint(); }
+  function go(id) { if (view === id) return; view = id; toAgent = true; const a = W.byId[id]; if (a) a.unread = false; repaint(true); }
+
+  function toast(text) {
+    const t = h('div', { style: { position: 'fixed', left: '50%', top: '62px', transform: 'translateX(-50%)', padding: '7px 12px', borderRadius: '8px', background: '#26241f', border: '1px solid var(--line-3)', fontSize: '12.5px', zIndex: 30 }, text });
+    document.body.append(t); setTimeout(() => t.remove(), 1600);
+  }
+
+  // A running agent moves on by itself: rings turn, cards and lines show live state.
+  function tick() {
+    let changed = false;
+    for (const a of W.agents) {
+      if (a.state !== 'running') continue;
+      a.secs++; a.tokens += .3; changed = true;
+      if (a.secs % 6 === 0) {
+        const run = a.steps.find(s => s.k === 'row' && s.s === 'running');
+        if (run) { run.s = 'done'; run.meta = 'done'; }
+        const n = a.secs % 3;
+        a.steps.push({ k: 'row', name: ['Read', 'Grep', 'Glob'][n], arg: ['Sources/FloatyTerm/DevtoolsRelay.swift', '"backoff" in Sources/', '**/*Retry*'][n], meta: '', s: 'running' });
+        a.tools++; if (view !== a.id) a.unread = true;
+      }
+      if (a.id === 'a2' && a.secs > 20) { a.state = 'done'; const run = a.steps.find(s => s.s === 'running'); if (run) run.s = 'done'; a.result = 'reconnect(): 5 attempts, 0.5 s doubling (0.5, 1, 2, 4, 8 s).'; }
+    }
+    if (changed) repaint();
+  }
+
+  document.addEventListener('keydown', e => {
+    if (e.altKey && /^[1-9]$/.test(e.key)) { const a = W.agents[+e.key - 1]; if (a) { e.preventDefault(); closeCard(true); go(a.id); } }
+    if (e.key === 'Escape') { if (!hc.hidden) closeCard(); else if (view !== 'main') go('main'); }
+  });
+
+  const SCEN = [['running', 'Running'], ['approval', 'Needs approval'], ['done', 'Finished'], ['nested', 'Nested agent']];
+  function setScen(s) {
+    scen = s; view = 'main'; closeCard(true); W = null; avs.forEach(el => el.remove()); avs.clear();
+    world(s);
+    document.getElementById('scen').replaceChildren(...SCEN.map(([k, l]) => h('button', { class: k === scen ? 'is-on' : '', text: l, onclick: () => setScen(k) })));
+    repaint(true);
+  }
+  const q = new URLSearchParams(location.search);
+  if (innerWidth < 1250 || q.has('min')) document.getElementById('mock').classList.add('is-min');
+  setScen(q.get('s') || 'running');
+  if (q.get('v')) go(q.get('v'));
+  if (q.get('say')) { const a = W.byId[view]; send(q.get('say'), a, a); }
+  if (q.get('hover')) { const el = avs.get(q.get('hover')); openCard(q.get('hover'), el); el.closest('.stack').classList.add('force-hover'); }
+  if (!q.has('still')) setInterval(tick, 1000);
+})();
+</script>
+</body></html>

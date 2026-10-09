@@ -1,0 +1,41 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><title>Codex parity check</title>
+<link rel="stylesheet" href="../fonts.css"><link rel="stylesheet" href="../skim.css"><link rel="stylesheet" href="../chat.css">
+<script src="../vendor/marked.min.js"></script><script src="../vendor/purify.min.js"></script><script src="../vendor/highlight.min.js"></script>
+<script src="../skim-classify.js"></script><script src="../skim-render.js"></script>
+<script src="../agent-events.js"></script><script src="../agent-claude.js"></script><script src="../agent-codex.js"></script>
+<script src="../chat.js"></script>
+</head><body>
+<script>
+  // Codex parity: $ popup, /goal, /review, guardian verdict, import card, usage history, mode menu with profiles.
+  //   Open in a browser, or headless: chrome --headless --screenshot=/tmp/parity.png --window-size=760,1500 <this file>
+  //   ?pop=dollar | ?pop=mode | ?usage=1 shows those open.
+  document.documentElement.classList.add('no-motion');
+  const q = new URLSearchParams(location.search);
+  const posts = [];
+  window.webkit = { messageHandlers: { skim: { postMessage: m => { if (m.type === 'action') posts.push(m.action); return Promise.resolve(); } } } };
+  AgentChat.boot({ agent: 'codex', cwd: '/Users/demo/project', home: '/Users/demo' });
+  const ev = (type, f = {}) => ({ v: 1, agent: 'codex', t: Date.now(), type, ...f });
+  AgentChat.receive([
+    ev('session', { sessionId: 'thread-1' }),
+    ev('capabilities', { features: { approvals: true, slashCommands: true, midTurnInput: true, images: true, mentions: true, rename: true, shell: true, usage: true, permissionMode: true, models: true, effort: true }, commands: [], models: [], mode: 'default' }),
+    ev('catalog', { skills: [{ name: 'imagegen', description: 'Generate images', path: '/s/imagegen/SKILL.md' }, { name: 'pdf', description: 'Work with PDFs', path: '/s/pdf/SKILL.md' }], apps: [{ id: 'c1', name: 'Google Drive', description: 'Files', path: 'app://c1' }], plugins: [{ id: 'gh@o', name: 'GitHub', description: 'Repos', path: 'plugin://gh@o' }], mcp: [] }),
+    ev('permissionProfiles', { profiles: [{ id: ':workspace', description: 'Workspace write', allowed: true }, { id: ':danger', description: '', allowed: false }], active: null }),
+    ev('turn.start'),
+    ev('tool.start', { id: 'cmd-1', name: 'Bash', input: { command: 'rm -rf ../old' } }),
+    ev('guardian', { reviewId: 'r1', status: 'denied', riskLevel: 'high', rationale: 'Deletes files outside the workspace', ownerId: 'cmd-1', canOverride: true }),
+    ev('surface.snapshot', { id: 'goal-1', surface: 'goal', title: 'Goal', method: 'thread/goal/updated', threadId: 'thread-1', placement: 'session', data: { goal: { objective: 'Ship the parity work', status: 'active', tokensUsed: 1200, tokenBudget: 5000, timeUsedSeconds: 42 } } }),
+    ev('import', { stage: 'detected', items: [{ id: 0, itemType: 'SKILLS', description: 'Import 3 skills', cwd: null }, { id: 1, itemType: 'HOOKS', description: 'Import hooks', cwd: '/Users/demo/project' }] }),
+    ev('usageHistory', { summary: { lifetimeTokens: 48200000, peakDailyTokens: 3100000, currentStreakDays: 6 }, daily: [{ date: '2026-10-04', tokens: 2100000 }, { date: '2026-10-05', tokens: 3100000 }] }),
+    ev('turn.end', { status: 'success' })
+  ]);
+  const input = document.querySelector('textarea');
+  const type = v => { input.focus(); input.value = v; input.setSelectionRange(v.length, v.length); input.dispatchEvent(new Event('input', { bubbles: true })); };
+  if (q.get('pop') === 'dollar') type('use $i');
+  if (q.get('pop') === 'mode') document.querySelector('.ck-mode')?.click();
+  if (q.get('usage')) [...document.querySelectorAll('button')].find(b => b.textContent.trim() === 'Usage')?.click();
+  // ?cmd=/goal%20Ship%20it%20--budget%205k : types it, presses Enter, and puts what the page posted in the title.
+  if (q.get('cmd')) { type(q.get('cmd')); input.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true, cancelable: true })); }
+  setTimeout(() => { document.title = JSON.stringify(posts.filter(a => !['state', 'ready'].includes(a.type))); }, 300);
+  window.__posts = posts;
+</script></body></html>
