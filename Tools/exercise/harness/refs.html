@@ -1,0 +1,15 @@
+<!doctype html><html><head><title>p3</title></head><body style="margin:0;font:14px sans-serif">
+<div id="top"><h1>Shop</h1>
+<label for="email">Email address</label> <input id="email" value="old@x.y">
+<select id="size"><option value="s">Small</option><option value="m">Medium</option></select>
+<button id="add" onclick="window.__added=(window.__added||0)+1">Add to cart</button>
+<a href="#cart" id="cartlink">Cart</a>
+<button id="al" onclick="alert('Saved!')">Save</button>
+<div id="menu" onmouseover="window.__hovered=1" style="width:80px;height:20px;background:#eee">Menu</div>
+<section id="sec"><button id="inner1">Inner one</button><button id="inner2">Inner two</button></section>
+</div>
+<div style="height:3000px"></div>
+<button id="far" onclick="window.__far=1">Far away</button>
+<script>
+window.__log=[];['mousemove','pointerdown','click','keydown','input','change'].forEach(function(t){document.addEventListener(t,function(e){window.__log.push({type:e.type,id:e.target.id||null,tr:e.isTrusted,key:e.key||null})},true)});
+</script></body></html>

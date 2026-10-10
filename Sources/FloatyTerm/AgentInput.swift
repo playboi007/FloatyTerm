@@ -119,6 +119,9 @@ enum AgentInput {
             return true   // no target → inject into whatever is frontmost
         }
         let label = identifier ?? "pid \(app.processIdentifier)"
+        // Already in front: nothing to raise and no window to settle. The
+        // 40 ms settle below was paid on EVERY targeted click and key before.
+        if NSWorkspace.shared.frontmostApplication?.processIdentifier == app.processIdentifier { return true }
 
         // macOS 14 made activation COOPERATIVE: .activateIgnoringOtherApps is a
         // no-op, so a background/accessory app (which FloatyTerm is) can no
@@ -187,6 +190,15 @@ enum AgentInput {
         var dragType: CGEventType {
             switch self { case .left: return .leftMouseDragged; case .right: return .rightMouseDragged; case .center: return .otherMouseDragged }
         }
+    }
+
+    /// The point lies on an active display (global, top-left origin — the
+    /// CGEvent space). Off every display, a click would land nowhere useful.
+    nonisolated static func onAnyDisplay(_ p: CGPoint) -> Bool {
+        var ids = [CGDirectDisplayID](repeating: 0, count: 16)
+        var n: UInt32 = 0
+        guard CGGetActiveDisplayList(16, &ids, &n) == .success else { return true }
+        return ids.prefix(Int(n)).contains { CGDisplayBounds($0).contains(p) }
     }
 
     /// Current cursor position in CGEvent (top-left, y-down) coords.
@@ -428,9 +440,9 @@ enum AgentInput {
 
     /// Whether `name` maps to a key we can synthesize — lets callers reject an
     /// unknown key with a precise error before attempting (and failing) to press.
-    static func isKnownKey(_ name: String) -> Bool { keycode(for: name) != nil }
+    nonisolated static func isKnownKey(_ name: String) -> Bool { keycode(for: name) != nil }
 
-    static func keycode(for name: String) -> CGKeyCode? {
+    nonisolated static func keycode(for name: String) -> CGKeyCode? {
         keyCodes[name.lowercased()]
     }
 
@@ -440,7 +452,7 @@ enum AgentInput {
     /// keys, and F1–F20. Letters/digits/punct are reachable both by the literal
     /// character ("l", "/", "5") and, where natural, a word ("slash"). For
     /// arbitrary text use `type`, not `key`.
-    private static let keyCodes: [String: CGKeyCode] = {
+    nonisolated private static let keyCodes: [String: CGKeyCode] = {
         var m: [String: CGKeyCode] = [
             "return": CGKeyCode(kVK_Return), "enter": CGKeyCode(kVK_Return),
             "tab": CGKeyCode(kVK_Tab),

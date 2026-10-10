@@ -36,6 +36,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         DevtoolsRelay.shared.onAgentMove = { [weak self] b in
             guard let self, let p = self.point(b) else { return ["error": "expected {x,y}"] }
+            if let refusal = self.inputBoundsError(b) ?? self.offDisplay(p, "move") { return refusal }
             let ok = AgentInput.move(to: p, pacing: self.pacing(b),
                                      target: self.target(b), targetPID: self.targetPID(b))
             return ok ? ["ok": true] : self.inputFailure("move", b)
@@ -57,6 +58,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             guard let self else { return ["error": "no self"] }
             if AgentBackground.isBackground(b) { return await self.backgroundType(b) }
             guard let text = b["text"] as? String else { return ["error": "expected {text}"] }
+            if let refusal = self.terminalGuard(b, verb: "type") { return refusal }
             // --human sessions get overlaid replay controls (play/pause/stop/
             // speed) on the terminal window; --no-controls opts out.
             let noControls = (b["no_controls"] as? NSNumber)?.boolValue ?? false
@@ -342,7 +344,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 let background = AgentBackground.isBackground(b)
                 // Validate the WHOLE plan before acting — a malformed step 5
                 // must not leave steps 1–4 half-executed.
-                var steps: [(doPart: [String: Any], verb: String, expect: [String: Any]?, retry: Int)] = []
+                var steps: [(doPart: [String: Any], verb: String, expect: [String: Any]?, retry: Int, pauseMs: Int)] = []
+                // The pause after a step with no expect: --pace for the plan,
+                // "pause" on the step. 300 ms by default (lets the UI catch up);
+                // 0 for tight sequences whose effects need no settling.
+                let paceMs = min(max((b["pace"] as? NSNumber)?.intValue ?? 300, 0), 10_000)
                 for (i, step) in rawSteps.enumerated() {
                     guard var doPart = step["do"] as? [String: Any] else {
                         reply(["error": "step \(i + 1): missing {do:{verb,…}}"]); return
@@ -383,7 +389,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                         expect = e
                     }
                     let retry = min(max((step["retry"] as? NSNumber)?.intValue ?? 0, 0), 3)
-                    steps.append((doPart, verb, expect, retry))
+                    let pauseMs = min(max((step["pause"] as? NSNumber)?.intValue ?? paceMs, 0), 10_000)
+                    steps.append((doPart, verb, expect, retry, pauseMs))
                 }
                 // Pixel checkpoints (watch/settle) and the endgame capture need
                 // an observable window; resolve once up front.
@@ -444,6 +451,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                         } catch { return ["error": error.localizedDescription] }
                     case "type":
                         guard let text = d["text"] as? String else { return ["error": "type step needs {text}"] }
+                        if let refusal = self.terminalGuard(d, verb: "type") { return refusal }
                         let r = await AgentInput.type(text, pacing: self.pacing(d),
                                                       target: self.target(d), targetPID: self.targetPID(d),
                                                       showControls: false)
@@ -513,9 +521,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 }
                 // Wait for a checkpoint: (satisfied, why-not description).
                 @MainActor
-                func awaitExpect(_ e: [String: Any]?, preHash: String?) async -> (Bool, String) {
+                func awaitExpect(_ e: [String: Any]?, preHash: String?, pauseMs: Int) async -> (Bool, String) {
                     guard let e else {
-                        try? await Task.sleep(nanoseconds: 300_000_000)   // bare pacing
+                        if pauseMs > 0 { try? await Task.sleep(nanoseconds: UInt64(pauseMs) * 1_000_000) }   // bare pacing
                         return (true, "")
                     }
                     let timeout = min(max((e["timeout"] as? NSNumber)?.doubleValue ?? 8, 1), 60)
@@ -675,7 +683,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                             } else {
                                 if let v = verdict { ledger["verified"] = v }
                                 else if !why.isEmpty { ledger["verified"] = "unverifiable"; stepUnverifiable = why }
-                                let (ok, why2) = await awaitExpect(step.expect, preHash: preHash)
+                                let (ok, why2) = await awaitExpect(step.expect, preHash: preHash, pauseMs: step.pauseMs)
                                 satisfied = ok
                                 if !ok { lastReason = "expect not met: \(why2)" }
                             }
@@ -708,7 +716,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     "retries_total": retriesTotal,
                     "waited_ms": Int(Date().timeIntervalSince(runStart) * 1000),
                 ]
-                if let wid = observedWID,
+                // --no-capture: the caller verifies some other way (a read-text,
+                // an eval) and doesn't want a PNG written for every plan.
+                if (b["no_capture"] as? NSNumber)?.boolValue != true,
+                   let wid = observedWID,
                    let r = try? await AgentCapture.captureWindow(named: nil, windowID: wid),
                    let f = r.frame {
                     out["path"] = r.imagePath; out["frame_id"] = f.id
@@ -797,6 +808,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             let port = UInt16((b["port"] as? NSNumber)?.intValue ?? 9222)
             let match = b["match"] as? String
             let viaExt = (b["via_extension"] as? NSNumber)?.boolValue ?? false
+            return await AgentDOM.withDialogPolicy(b) {
             do {
                 let matches = try await AgentDOM.screenRects(selector: selector, port: port, match: match, viaExtension: viaExt)
                 // Top-level fields mirror the FIRST match (back-compat with the
@@ -811,16 +823,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     out["matches"] = matches.map { m -> [String: Any] in
                         ["x": m.rect.origin.x, "y": m.rect.origin.y,
                          "width": m.rect.size.width, "height": m.rect.size.height,
-                         "center_x": m.center.x, "center_y": m.center.y, "text": m.text]
+                         "center_x": m.center.x, "center_y": m.center.y, "text": m.text, "ref": m.ref]
                     }
                 } else {
                     out["elements"] = Self.elementLines(
                         matches.enumerated().map { (id: $0.offset + 1, role: "",
                                                     name: $0.element.text, rect: $0.element.rect) },
-                        brief: (b["brief"] as? NSNumber)?.boolValue ?? false)
+                        brief: (b["brief"] as? NSNumber)?.boolValue ?? false,
+                        refs: matches.map(\.ref), refOnly: true)
                 }
                 return out
             } catch { return ["error": error.localizedDescription] }
+            }
         }
         DevtoolsRelay.shared.onAgentEval = { b in
             guard let expr = (b["expression"] as? String) ?? (b["js"] as? String) else {
@@ -829,6 +843,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             let port = UInt16((b["port"] as? NSNumber)?.intValue ?? 9222)
             let match = b["match"] as? String
             let viaExt = (b["via_extension"] as? NSNumber)?.boolValue ?? false
+            return await AgentDOM.withDialogPolicy(b) {
             do {
                 let json = try await AgentDOM.runJavaScript(expression: expr, port: port, match: match, viaExtension: viaExt)
                 // Re-parse so the value embeds natively in the response (an
@@ -839,9 +854,112 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 }
                 return ["ok": true, "result": NSNull()]
             } catch { return ["error": error.localizedDescription] }
+            }
+        }
+        // input: trusted page input over CDP on a host clock (CDPInputScript +
+        // AgentCDPInput). Never touches the real cursor or the frontmost app,
+        // so it is the same call in foreground and background mode. Runs
+        // detached: a busy main thread must not make a note late.
+        DevtoolsRelay.shared.onAgentInput = { b in
+            var steps: [[String: Any]] = []
+            if let arr = b["steps"] as? [[String: Any]] { steps = arr }
+            else if let s = b["steps"] as? String {
+                guard let d = s.data(using: .utf8),
+                      let arr = (try? JSONSerialization.jsonObject(with: d)) as? [[String: Any]] else {
+                    return ["error": "input: --steps must be a JSON array of steps"]
+                }
+                steps = arr
+            }
+            guard !steps.isEmpty else {
+                return ["error": "input: expected --steps '[{\"click\":\"#save\"}, {\"key\":\"Enter\"}, …]' "
+                    + "(or --file / --steps -), or a shorthand: --click SEL | --key K | --text T"]
+            }
+            let port = UInt16((b["port"] as? NSNumber)?.intValue ?? 9222)
+            let match = b["match"] as? String
+            let viaExt = (b["via_extension"] as? NSNumber)?.boolValue ?? false
+            return await AgentDOM.withDialogPolicy(b) {
+                // Detached tasks don't inherit task-locals: hand the policy over.
+                let policy = AgentDOM.dialogPolicy, log = AgentDOM.dialogLog
+                return await Task.detached(priority: .userInitiated) {
+                    await AgentDOM.$dialogPolicy.withValue(policy) {
+                        await AgentDOM.$dialogLog.withValue(log) {
+                            await AgentCDPInput.run(steps: steps, port: port, match: match, viaExtension: viaExt)
+                        }
+                    }
+                }.value
+            }
+        }
+        // find: "where is the thing called X" without reading the whole tree —
+        // the top matches by plain words, each with a ref to act on.
+        DevtoolsRelay.shared.onAgentFind = { b in
+            guard let query = (b["query"] as? String) ?? (b["q"] as? String),
+                  !query.trimmingCharacters(in: .whitespaces).isEmpty else {
+                return ["error": "expected --query \"words that name the element\" (e.g. \"add to cart button\")"]
+            }
+            let app = b["app"] as? String
+            var pid = (b["pid"] as? NSNumber).map { pid_t($0.intValue) }
+            let under = b["under"] as? String
+            let brief = (b["brief"] as? NSNumber)?.boolValue ?? false
+            do {
+                let hits: [ElementFind.Hit]
+                let source: String
+                if app != nil || pid != nil || (under.map(AXRefs.isRef) ?? false) {
+                    var root: AXUIElement? = nil
+                    if let u = under {
+                        let look = AXRefs.lookup(u)
+                        guard case .found(let rp, let el) = look else { return ["error": AXRefs.staleMessage(u, look)] }
+                        root = el
+                        if pid == nil, app == nil { pid = rp }
+                    }
+                    if let rp = try? AgentAX.resolvePID(app: app, pid: pid) { await AgentBackground.surface(pid: rp, b) }
+                    hits = try await AgentFind.ax(query: query, app: app, pid: pid, under: root)
+                    source = "ax"
+                } else {
+                    let port = UInt16((b["port"] as? NSNumber)?.intValue ?? 9222)
+                    let viaExt = (b["via_extension"] as? NSNumber)?.boolValue ?? false
+                    let found = await AgentDOM.withDialogPolicy(b) { () -> [String: Any] in
+                        do {
+                            return ["hits": try await AgentFind.dom(query: query, port: port, match: b["match"] as? String,
+                                                                    viaExtension: viaExt, under: under)]
+                        } catch { return ["error": error.localizedDescription] }
+                    }
+                    if let e = found["error"] as? String { return ["error": e] }
+                    hits = found["hits"] as? [ElementFind.Hit] ?? []
+                    source = "cdp"
+                }
+                var out: [String: Any] = ["ok": true, "source": source, "count": hits.count]
+                var rows: [(id: Int, role: String, name: String, rect: CGRect)] = []
+                for (i, h) in hits.enumerated() {
+                    rows.append((id: i + 1, role: h.candidate.role, name: h.candidate.name, rect: h.candidate.rect))
+                }
+                let refs: [String] = hits.map { $0.candidate.ref }
+                out["elements"] = Self.elementLines(rows, brief: brief, refs: refs, refOnly: true)
+                out["note"] = hits.isEmpty
+                    ? "nothing matched those words — try the visible label, fewer words, or read the tree (query-ax / som)"
+                    : "best match first; act with " + (source == "ax" ? "`query-ax --ref REF --press`" : "`input --click REF`")
+                return out
+            } catch { return ["error": error.localizedDescription] }
+        }
+        // dialog: a JavaScript alert/confirm/prompt blocks its page — every CDP
+        // verb reports it instead of hanging. This reads or answers it.
+        DevtoolsRelay.shared.onAgentDialog = { b in
+            let accept: Bool? = (b["accept"] as? NSNumber)?.boolValue == true ? true
+                : (b["dismiss"] as? NSNumber)?.boolValue == true ? false : nil
+            let port = UInt16((b["port"] as? NSNumber)?.intValue ?? 9222)
+            let viaExt = (b["via_extension"] as? NSNumber)?.boolValue ?? false
+            do {
+                return try await AgentDOM.dialog(accept: accept, promptText: b["text"] as? String,
+                                                 reload: (b["reload"] as? NSNumber)?.boolValue == true, port: port,
+                                                 match: b["match"] as? String, viaExtension: viaExt)
+            } catch { return ["error": error.localizedDescription] }
         }
         DevtoolsRelay.shared.onAgentNavigate = { b in
-            guard let url = b["url"] as? String else { return ["error": "expected {url}"] }
+            guard let raw = b["url"] as? String else { return ["error": "expected {url}"] }
+            let url: String
+            switch AgentDOM.navigableURL(raw, allowAnyScheme: (b["allow_scheme"] as? NSNumber)?.boolValue == true) {
+            case .success(let u): url = u
+            case .failure(let e): return ["error": e.localizedDescription]
+            }
             // Background: CDP (--port / --via-extension) doesn't activate, so it
             // stays as is. Without it, drive the browser's address bar via AX —
             // `open -g` and AppleScript both ACTIVATED Chrome when measured.
@@ -860,8 +978,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             let port = UInt16((b["port"] as? NSNumber)?.intValue ?? 9222)
             let match = b["match"] as? String
             let viaExt = (b["via_extension"] as? NSNumber)?.boolValue ?? false
-            do { try await AgentDOM.navigate(url: url, port: port, match: match, viaExtension: viaExt); return ["ok": true, "url": url] }
-            catch { return ["error": error.localizedDescription] }
+            return await AgentDOM.withDialogPolicy(b) {
+                do { return try await AgentDOM.navigate(url: url, port: port, match: match, viaExtension: viaExt) }
+                catch { return ["error": error.localizedDescription] }
+            }
         }
         DevtoolsRelay.shared.onAgentTabs = { b in
             let port = UInt16((b["port"] as? NSNumber)?.intValue ?? 9222)
@@ -903,11 +1023,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             let wantJSON = (b["json"] as? NSNumber)?.boolValue ?? false
             let brief = (b["brief"] as? NSNumber)?.boolValue ?? false
             let wantDiff = (b["diff"] as? NSNumber)?.boolValue ?? false
+            // read_page-style scope: --all (off-screen too / every named AX element),
+            // --under REF (one element's subtree).
+            let somAll = (b["all"] as? NSNumber)?.boolValue ?? false
+            let somUnder = b["under"] as? String
 
             func emitMarks(_ stored: [AgentCapture.Mark], into out: inout [String: Any]) {
                 if wantJSON {
                     out["marks"] = stored.map { m -> [String: Any] in
-                        ["id": m.id, "role": m.role, "name": m.name,
+                        ["id": m.id, "ref": m.ref, "role": m.role, "name": m.name,
                          "x": m.rect.origin.x, "y": m.rect.origin.y,
                          "width": m.rect.size.width, "height": m.rect.size.height,
                          "center_x": m.center.x, "center_y": m.center.y]
@@ -915,7 +1039,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 } else {
                     out["elements"] = Self.elementLines(
                         stored.map { (id: $0.id, role: $0.role, name: $0.name, rect: $0.rect) },
-                        brief: brief)
+                        brief: brief, refs: stored.map(\.ref))
                 }
             }
 
@@ -941,7 +1065,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                         if !addedMarks.isEmpty {
                             out["elements_added"] = Self.elementLines(
                                 addedMarks.map { (id: $0.id, role: $0.role, name: $0.name, rect: $0.rect) },
-                                brief: brief)
+                                brief: brief, refs: addedMarks.map(\.ref))
                         }
                         if !d.removed.isEmpty {
                             out["elements_removed"] = Self.elementLines(
@@ -981,14 +1105,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                         return ["error": "no window for that app/pid (it may have no open windows — ⌘N in the app)"]
                     }
                     // Query generously, then keep only this window's elements.
-                    let (matches, _) = try await AgentAX.query(app: nil, pid: pid, role: nil,
-                                                               title: nil, max: 500, press: false)
+                    var axRoot: AXUIElement? = nil
+                    if let u = somUnder {
+                        let look = AXRefs.lookup(u)
+                        guard case .found(_, let el) = look else { return ["error": AXRefs.staleMessage(u, look)] }
+                        axRoot = el
+                    }
+                    let matches = try await AgentAX.queryAct(app: nil, pid: pid, role: nil, title: nil, max: 500,
+                                                             act: nil, root: axRoot, all: somAll).matches
                     let winRect = win.bounds
                     var stored: [AgentCapture.Mark] = []
                     for m in matches {
                         guard winRect.contains(m.center) else { continue }   // this window's elements only
                         stored.append(AgentCapture.Mark(id: stored.count + 1, role: m.role, name: m.name,
-                                                        rect: m.rect, center: m.center))
+                                                        rect: m.rect, center: m.center, ref: m.ref))
                         if stored.count >= maxMarks { break }
                     }
                     let named = stored.filter { !$0.name.isEmpty }.count
@@ -1047,7 +1177,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             let viaExt = (b["via_extension"] as? NSNumber)?.boolValue ?? false
             do {
                 var r = try await AgentDOM.setOfMarks(port: port, match: match,
-                                                      max: maxMarks, includeImage: false, viaExtension: viaExt)
+                                                      max: maxMarks, includeImage: false, viaExtension: viaExt,
+                                                      all: somAll, under: somUnder)
                 let named = r.marks.filter { !$0.name.isEmpty }.count
                 // --diff is a text feature: no auto-image (only --image forces one).
                 let needImage = wantImage
@@ -1056,14 +1187,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     // Re-run with the overlay + screenshot; ITS marks are the
                     // authoritative set (the page may have shifted between passes).
                     r = try await AgentDOM.setOfMarks(port: port, match: match,
-                                                      max: maxMarks, includeImage: true, viaExtension: viaExt)
+                                                      max: maxMarks, includeImage: true, viaExtension: viaExt,
+                                                      under: somUnder)
                 }
 
                 // Assign 1-based ids (matching the drawn labels) and store the frame.
                 var stored: [AgentCapture.Mark] = []
                 for (i, m) in r.marks.enumerated() {
                     stored.append(AgentCapture.Mark(id: i + 1, role: m.role, name: m.name,
-                                                    rect: m.rect, center: m.center))
+                                                    rect: m.rect, center: m.center, ref: m.ref))
                 }
 
                 var out: [String: Any] = ["ok": true, "source": "cdp", "count": stored.count]
@@ -1112,7 +1244,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // ignores which window is frontmost.
         DevtoolsRelay.shared.onAgentQueryAX = { b in
             let app = b["app"] as? String
-            let pid = (b["pid"] as? NSNumber).map { pid_t($0.intValue) }
+            var pid = (b["pid"] as? NSNumber).map { pid_t($0.intValue) }
+            // A ref carries its process: --ref / --under need no --pid.
+            if pid == nil, app == nil, let r = (b["under"] as? String) ?? (b["ref"] as? String),
+               case .found(let rp, _) = AXRefs.lookup(r) {
+                pid = rp
+            }
             guard app != nil || pid != nil else {
                 return ["error": "expected {app} or {pid} (see `floaty list-windows` for pids)"]
             }
@@ -1133,6 +1270,49 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 act = .action(a.hasPrefix("AX") ? a : "AX" + a.prefix(1).uppercased() + a.dropFirst())
             }
             let background = AgentBackground.isBackground(b)
+            // --ref ax_N: act on THAT element — no walk, no title match.
+            if let ref = b["ref"] as? String {
+                guard let act else {
+                    return ["error": "--ref names one element to act on: add --press, --focus, --set-value, "
+                        + "--scroll-to or --action (to read a subtree, use --under \(ref))"]
+                }
+                let look = AXRefs.lookup(ref)
+                guard case .found(let rpid, let el) = look else { return ["error": AXRefs.staleMessage(ref, look)] }
+                let ticket = background ? FocusShield.shared.begin(target: rpid) : nil
+                if !background { await AgentBackground.surface(pid: rpid, b) }
+                let (m, code) = AgentAX.act(act, on: el)
+                var out: [String: Any] = ["ok": code == .success, "acted": ["action": act.label, "role": m.role,
+                                                                            "name": m.name, "ref": ref]]
+                if code != .success {
+                    out["ok"] = false
+                    out["error"] = "\(act.label) on \(ref) (\(m.role)) failed: AX error \(code.rawValue) — the element "
+                        + "may not support it"
+                }
+                AgentBackground.noteActed(el, pid: rpid)
+                if case .setValue(let text) = act, code == .success {
+                    var value = ""
+                    for _ in 0..<8 {
+                        value = AgentAX.copyString(el, kAXValueAttribute as CFString) ?? ""
+                        if value == text || (!text.isEmpty && value.contains(text)) { break }
+                        try? await Task.sleep(nanoseconds: 120_000_000)
+                    }
+                    out["value"] = String(value.prefix(300))
+                    out["landed"] = value == text || (!text.isEmpty && value.contains(text))
+                }
+                if let ticket {
+                    out["mode"] = "background"
+                    out["interference"] = await FocusShield.shared.finish(ticket)
+                }
+                return out
+            }
+            // --under ax_N: read only that element's subtree.
+            var under: AXUIElement? = nil
+            if let u = b["under"] as? String {
+                let look = AXRefs.lookup(u)
+                guard case .found(_, let el) = look else { return ["error": AXRefs.staleMessage(u, look)] }
+                under = el
+            }
+            let all = (b["all"] as? NSNumber)?.boolValue ?? false
             do {
                 // Auto-raise (foreground default for --pid/--app): surface an
                 // off-Space window first. Background mode never raises — and
@@ -1148,14 +1328,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 let ticket = (background && act != nil) ? resolvedPID.map { FocusShield.shared.begin(target: $0) } : nil
                 // Background acts stay inside the agent's window — never a
                 // match in the human's own window of the same app.
-                let root = (background && act != nil) ? resolvedPID.flatMap { AgentBackground.agentWindow(pid: $0) } : nil
+                let root = under ?? ((background && act != nil) ? resolvedPID.flatMap { AgentBackground.agentWindow(pid: $0) } : nil)
                 let qr = try await AgentAX.queryAct(
-                    app: app, pid: pid, role: role, title: title, max: maxN, act: act, root: root)
+                    app: app, pid: pid, role: role, title: title, max: maxN, act: act, root: root, all: all)
                 let matches = qr.matches
                 let pressed: AgentAX.AXMatch? = press ? qr.acted : nil
                 var out: [String: Any] = ["ok": true, "count": matches.count]
                 if let act, let acted = qr.acted {
-                    out["acted"] = ["action": act.label, "role": acted.role, "name": acted.name]
+                    out["acted"] = ["action": act.label, "role": acted.role, "name": acted.name, "ref": acted.ref]
                     if let code = qr.axResult, code != .success {
                         out["ax_error"] = Int(code.rawValue)
                         out["note"] = "the AX call returned error \(code.rawValue) — \(acted.role) may not support "
@@ -1193,10 +1373,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                         out["removed"] = d.removed.count
                         out["unchanged"] = d.unchangedCount
                         if !d.added.isEmpty {
+                            var refByHash: [String: String] = [:]
+                            for m in matches {
+                                refByHash[AgentPerception.Element(role: m.role, name: m.name, rect: m.rect).hash] = m.ref
+                            }
                             out["elements_added"] = Self.elementLines(
                                 d.added.enumerated().map { (id: $0.offset + 1, role: $0.element.role,
                                                             name: $0.element.name, rect: $0.element.rect) },
-                                brief: brief)
+                                brief: brief, refs: d.added.map { refByHash[$0.hash] ?? "" }, refOnly: true)
                         }
                         if !d.removed.isEmpty {
                             out["elements_removed"] = Self.elementLines(
@@ -1219,7 +1403,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 if !emittedDiff {
                     if (b["json"] as? NSNumber)?.boolValue ?? false {
                         out["matches"] = matches.map { m -> [String: Any] in
-                            ["role": m.role, "name": m.name,
+                            ["ref": m.ref, "role": m.role, "name": m.name,
                              "x": m.rect.origin.x, "y": m.rect.origin.y,
                              "width": m.rect.size.width, "height": m.rect.size.height,
                              "center_x": m.center.x, "center_y": m.center.y]
@@ -1228,8 +1412,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                         out["elements"] = Self.elementLines(
                             matches.enumerated().map { (id: $0.offset + 1, role: $0.element.role,
                                                         name: $0.element.name, rect: $0.element.rect) },
-                            brief: brief)
+                            brief: brief, refs: matches.map(\.ref), refOnly: true)
                     }
+                }
+                if matches.count >= maxN, act == nil {
+                    out["truncated"] = true
+                    let n = (out["note"] as? String).map { $0 + "; " } ?? ""
+                    out["note"] = n + "capped at \(maxN) rows — narrow with --role/--title/--under REF, or raise --max"
                 }
                 if let f = matches.first {   // mirror first match (parity with query-dom)
                     out["x"] = f.rect.origin.x; out["y"] = f.rect.origin.y
@@ -1255,6 +1444,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             // because an older host ignores `mode` and would run the call in
             // the FOREGROUND (activate + real cursor) while reporting success.
             if b["probe"] != nil { return ["ok": true, "background_mode": true] }
+            // The user's approval policy (agent-policy.json), so the agent can
+            // plan around what will ask or be refused.
+            if b["policy"] != nil { return ["ok": true].merging(AgentPolicy.shared.describe()) { a, _ in a } }
             let on: Bool
             if let s = b["ghost"] as? String { on = ["on", "true", "1", "yes"].contains(s.lowercased()) }
             else if let n = b["ghost"] as? NSNumber { on = n.boolValue }
@@ -2531,13 +2723,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// spatial reasoning; centers are host-side concerns (the model acts by
     /// mark id / --press / first-match mirror, never by emitting a coordinate).
     /// `brief` drops geometry too: id, role, name only.
+    /// `refs` (parallel to rows) adds each element's ref after the id;
+    /// `refOnly` shows the ref INSTEAD of the id (query-ax / query-dom / find,
+    /// whose row numbers were never actionable — the ref is).
     static func elementLines(_ rows: [(id: Int, role: String, name: String, rect: CGRect)],
-                             brief: Bool) -> String {
-        rows.map { r in
+                             brief: Bool, refs: [String]? = nil, refOnly: Bool = false) -> String {
+        rows.enumerated().map { (i, r) in
             let name = r.name
                 .replacingOccurrences(of: "\n", with: " ")
                 .replacingOccurrences(of: "\t", with: " ")
-            var line = r.role.isEmpty ? "\(r.id)\t\"\(name)\"" : "\(r.id)\t\(r.role)\t\"\(name)\""
+            var id = "\(r.id)"
+            if let refs, i < refs.count, !refs[i].isEmpty { id = refOnly ? refs[i] : id + "\t" + refs[i] }
+            var line = r.role.isEmpty ? "\(id)\t\"\(name)\"" : "\(id)\t\(r.role)\t\"\(name)\""
             if !brief {
                 line += "\t@\(Int(r.rect.origin.x.rounded())),\(Int(r.rect.origin.y.rounded()))"
                     + " \(Int(r.rect.width.rounded()))x\(Int(r.rect.height.rounded()))"
@@ -2597,9 +2794,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// act-until edge loop (which repeats it verbatim).
     @MainActor
     private func performAction(_ action: String, _ b: [String: Any]) -> [String: Any] {
+        if let refusal = inputBoundsError(b) { return refusal }
         switch action {
         case "click":
             guard let p = point(b) else { return ["error": "expected {x,y}"] }
+            if let refusal = offDisplay(p, "click") { return refusal }
             let clicks = (b["clicks"] as? NSNumber)?.intValue ?? 1
             let ok = AgentInput.click(at: p, button: button(b), modifiers: mods(b),
                                       clicks: clicks, pacing: pacing(b),
@@ -2611,27 +2810,36 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                   let tx = (b["to_x"] as? NSNumber)?.doubleValue,
                   let ty = (b["to_y"] as? NSNumber)?.doubleValue
             else { return ["error": "expected {from_x,from_y,to_x,to_y}"] }
+            if let refusal = offDisplay(CGPoint(x: fx, y: fy), "drag start") ?? offDisplay(CGPoint(x: tx, y: ty), "drag end") {
+                return refusal
+            }
             let ok = AgentInput.drag(from: CGPoint(x: fx, y: fy), to: CGPoint(x: tx, y: ty),
                                      button: button(b), modifiers: mods(b),
                                      pacing: pacing(b), target: target(b),
                                      targetPID: targetPID(b))
             return ok ? ["ok": true] : inputFailure("drag", b)
         case "key":
-            guard let key = b["key"] as? String else { return ["error": "expected {key}"] }
-            // Check the key name first so an unknown key reports its own precise
+            // Check the key spec first so an unknown key reports its own precise
             // cause instead of being lumped under the activation failure path.
-            guard AgentInput.isKnownKey(key) else {
-                return ["error": "key failed: \"\(key)\" is not a known key name. Use a single "
-                    + "character (a–z, 0–9, punctuation like / or -), a function key (f1–f12), or a "
-                    + "named key (return, tab, space, delete, escape, left/right/up/down, home, end, "
-                    + "pgup, pgdown). For arbitrary text use `type`, not `key`."]
+            let strokes: [KeySpec.Stroke]
+            switch keyStrokes(b) {
+            case .failure(let refusal): return refusal.reply
+            case .success(let s): strokes = s
             }
-            let ok = AgentInput.pressKey(key, modifiers: mods(b),
-                                         target: target(b), targetPID: targetPID(b))
-            return ok ? ["ok": true, "key": key] : inputFailure("key", b)
+            if let refusal = terminalGuard(b, verb: "key") { return refusal }
+            for n in 0..<keyRepeat(b) * strokes.count {
+                let s = strokes[n % strokes.count]
+                if n > 0 { usleep(8_000) }      // a beat between strokes, like a hand
+                guard AgentInput.pressKey(s.key, modifiers: s.modifiers,
+                                          target: target(b), targetPID: targetPID(b)) else {
+                    return inputFailure("key", b)
+                }
+            }
+            return ["ok": true]
         case "scroll":
             let dx = (b["dx"] as? NSNumber)?.intValue ?? 0
             let dy = (b["dy"] as? NSNumber)?.intValue ?? 0
+            if let p = point(b), let refusal = offDisplay(p, "scroll") { return refusal }
             let ok = AgentInput.scroll(dx: dx, dy: dy, at: point(b),
                                        pacing: pacing(b), target: target(b),
                                        targetPID: targetPID(b))
@@ -2661,29 +2869,38 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             }
             return await backgroundPress(at: p, b, verb: action)
         case "key":
-            guard let key = b["key"] as? String else { return ["error": "expected {key}"] }
-            guard AgentInput.isKnownKey(key) else {
-                return ["error": "key failed: \"\(key)\" is not a known key name (see `floaty help`)"]
+            if let refusal = inputBoundsError(b) { return refusal }
+            let strokes: [KeySpec.Stroke]
+            switch keyStrokes(b) {
+            case .failure(let refusal): return refusal.reply
+            case .success(let s): strokes = s
             }
             guard let pid = AgentBackground.targetPID(b) else {
                 return ["error": "key (background) needs --pid or --target: keys are posted to one process, "
                     + "never to whatever is frontmost", "mode": "background"]
             }
-            let modifiers = mods(b)
+            let total = keyRepeat(b) * strokes.count
             return await backgroundKeystrokes(pid: pid, verb: "key") { _ in
-                AgentBackground.postKey(key, modifiers: modifiers, pid: pid)
-                return ["key": key]
+                for n in 0..<total {
+                    let s = strokes[n % strokes.count]
+                    if n > 0 { try? await Task.sleep(nanoseconds: 8_000_000) }
+                    AgentBackground.postKey(s.key, modifiers: s.modifiers, pid: pid)
+                }
+                return [:]
             }
         case "move", "move-in-frame":
             return AgentBackground.needsForeground(action, "hovering needs the real cursor, which you share with the human",
-                hint: "Run this call with --foreground if the hover state matters.")
+                hint: "On a web page (Chrome tab, Electron) hover with `floaty input --move SELECTOR` — no cursor. "
+                    + "Otherwise run this call with --foreground if the hover state matters.")
         case "drag":
             return AgentBackground.needsForeground("drag", "a drag needs the real pointer and button",
-                hint: "Run it with --foreground (it will take the pointer for the drag).")
+                hint: "On a web page use `floaty input` with a {\"drag\":{\"from\":…,\"to\":…}} step — no cursor. "
+                    + "Otherwise run it with --foreground (it will take the pointer for the drag).")
         case "scroll":
             return AgentBackground.needsForeground("scroll", "wheel events go to whatever is under the REAL cursor",
-                hint: "Bring a control into view with `query-ax --title … --scroll-to`, or focus something in the "
-                    + "page and send `key --key pgdown --background --pid N`. AXPress also works on off-screen elements.")
+                hint: "On a web page use `floaty input` with a {\"wheel\":SELECTOR,\"dy\":400} step. Else bring a "
+                    + "control into view with `query-ax --title … --scroll-to`, or focus something in the page and send "
+                    + "`key --key pgdown --background --pid N`. AXPress also works on off-screen elements.")
         default:
             return ["error": "unknown action \"\(action)\""]
         }
@@ -2696,12 +2913,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         return AgentBackground.needsForeground(verb,
             "only a plain left single click maps to an AXPress (got \(button(b).rawValue) ×\(clicks)"
                 + (mods(b).isEmpty ? "" : " with \(mods(b).joined(separator: "+"))") + ")",
-            hint: "Context menu: `query-ax --title … --action AXShowMenu`. Otherwise use --foreground.")
+            hint: "On a web page `floaty input --click SELECTOR` takes \"button\":\"right\", \"count\":2 and "
+                + "modifiers. Context menu elsewhere: `query-ax --title … --action AXShowMenu`. Otherwise use --foreground.")
     }
 
     /// Click → AXPress on the element under `p`, inside the focus shield.
     @MainActor
     private func backgroundPress(at p: CGPoint, _ b: [String: Any], verb: String) async -> [String: Any] {
+        if let refusal = offDisplay(p, verb) { return refusal }
         guard let pid = AgentBackground.targetPID(b, at: p) else {
             return ["error": "\(verb) (background): no window under \(Int(p.x)),\(Int(p.y)) and no --pid/--target",
                     "mode": "background"]
@@ -2713,8 +2932,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         var out: [String: Any]
         do {
             let pressed = try await AgentBackground.press(at: p, pid: pid)
+            // No echo of the input point: the reply carries what is new —
+            // which element was pressed, and where its centre is (a centre far
+            // from the point means the wrong control).
             out = ["ok": true, "mode": "background", "via": "ax-press",
-                   "screen_x": p.x, "screen_y": p.y,
                    "pressed": ["role": pressed.role, "name": pressed.name,
                                "center_x": pressed.center.x, "center_y": pressed.center.y]]
         } catch {
@@ -2779,6 +3000,92 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 + "edit session on a press), check `floaty focused --pid \(pid)`, then retry."
         }
         return out
+    }
+
+    /// Terminals by bundle id. FloatyTerm itself is one: an agent running in
+    /// its tab that types with no target types into its own prompt.
+    private static let terminalBundles: Set<String> = [
+        "com.apple.Terminal", "com.googlecode.iterm2", "net.kovidgoyal.kitty", "org.alacritty",
+        "io.alacritty", "com.github.wez.wezterm", "dev.warp.Warp-Stable", "dev.warp.Warp",
+        "co.zeit.hyper", "com.mitchellh.ghostty", "org.tabby", "com.raphaelamorim.rio",
+    ]
+
+    /// Foreground keys go to the FRONT app. When that is a terminal and the
+    /// call didn't name it, the keys would run as a command — a focused
+    /// terminal executes what is typed. Refuse, unless the call names its
+    /// target (`--target` / `--pid`: typing there is then on purpose) or says
+    /// `--allow-terminal`. Background keys are posted to a named pid, so they
+    /// never reach this.
+    private func terminalGuard(_ b: [String: Any], verb: String) -> [String: Any]? {
+        guard target(b) == nil, targetPID(b) == nil,
+              (b["allow_terminal"] as? NSNumber)?.boolValue != true,
+              let front = NSWorkspace.shared.frontmostApplication else { return nil }
+        let isSelf = front.processIdentifier == ProcessInfo.processInfo.processIdentifier
+        guard isSelf || Self.terminalBundles.contains(front.bundleIdentifier ?? "") else { return nil }
+        let name = isSelf ? "FloatyTerm (your own terminal)" : (front.localizedName ?? "a terminal")
+        return ["error": "\(verb) refused: the front app is \(name), and a focused terminal runs what is typed. "
+            + "Name the app the keys are for (--target App or --pid N — it is brought forward first), or pass "
+            + "--allow-terminal if typing into that terminal is the task.", "terminal": true]
+    }
+
+    /// A point on no display is refused, never clamped: moving it into range
+    /// would act where the agent did not aim, and the error shows the mistake.
+    private func offDisplay(_ p: CGPoint, _ what: String) -> [String: Any]? {
+        guard !AgentInput.onAnyDisplay(p) else { return nil }
+        return ["error": "\(what) point \(Int(p.x)),\(Int(p.y)) is on no display — screen points are global, "
+            + "top-left origin (`floaty list-windows` gives window bounds in the same space). Nothing was done."]
+    }
+
+    /// Ranges the actuators accept. Out of range → an error naming the field,
+    /// not a silent clamp.
+    private func inputBoundsError(_ b: [String: Any]) -> [String: Any]? {
+        if let c = (b["clicks"] as? NSNumber)?.intValue, !(1...3).contains(c) {
+            return ["error": "--clicks is 1, 2 or 3 (got \(c))"]
+        }
+        if let d = (b["duration"] as? NSNumber)?.doubleValue, !(0...30).contains(d) {
+            return ["error": "--duration is 0–30 seconds (got \(d))"]
+        }
+        for k in ["dx", "dy"] {
+            if let v = (b[k] as? NSNumber)?.intValue, abs(v) > 20_000 {
+                return ["error": "--\(k) is at most 20000 px per call (got \(v)) — scroll in several calls"]
+            }
+        }
+        if let r = (b["repeat"] as? NSNumber)?.intValue, !(1...100).contains(r) {
+            return ["error": "--repeat is 1–100 (got \(r))"]
+        }
+        return nil
+    }
+
+    /// `key` accepts what models write: "cmd+s", "Tab Tab Enter", Page_Up …
+    /// (KeySpec), plus --modifiers on every stroke. A capital letter is
+    /// Shift + that letter. Every key is checked before anything is pressed.
+    private func keyStrokes(_ b: [String: Any]) -> Result<[KeySpec.Stroke], KeyRefusal> {
+        guard let spec = b["key"] as? String, !spec.isEmpty else { return .failure(KeyRefusal(["error": "expected {key}"])) }
+        var strokes: [KeySpec.Stroke]
+        do { strokes = try KeySpec.parse(spec, extra: mods(b)) }
+        catch { return .failure(KeyRefusal(["error": "key failed: \(error.localizedDescription)"])) }
+        for i in strokes.indices {
+            let k = strokes[i].key
+            if k.count == 1, let c = k.first, c.isASCII, c.isUppercase, !strokes[i].modifiers.contains("shift") {
+                strokes[i].modifiers.append("shift")
+            }
+            guard AgentInput.isKnownKey(k) else {
+                return .failure(KeyRefusal(["error": "key failed: \"\(k)\" is not a known key name. Use a single "
+                    + "character (a–z, 0–9, punctuation like / or -), a function key (f1–f20), or a named key "
+                    + "(return, tab, space, delete, escape, left/right/up/down, home, end, pgup, pgdown). "
+                    + "Chords: \"cmd+s\"; sequences: \"Tab Tab Enter\". For text use `type`, not `key`."]))
+            }
+        }
+        return .success(strokes)
+    }
+
+    private struct KeyRefusal: Error {
+        let reply: [String: Any]
+        init(_ r: [String: Any]) { reply = r }
+    }
+
+    private func keyRepeat(_ b: [String: Any]) -> Int {
+        min(max((b["repeat"] as? NSNumber)?.intValue ?? 1, 1), 100)
     }
 
     /// Optional pacing from the JSON body: `duration` (seconds) wins, else a

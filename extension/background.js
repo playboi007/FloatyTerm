@@ -16,6 +16,26 @@ let reconnectTimer = null;
 let keepaliveTimer = null;
 const attached = new Set();        // tabIds we currently hold a debugger on
 const detachTimers = new Map();    // tabId -> setTimeout handle
+// A JavaScript alert/confirm/prompt blocks the page: every command for that
+// tab would hang until someone answers it. We watch for dialogs (Page events)
+// and answer FloatyTerm at once with what the dialog says instead.
+const dialogs = new Map();         // tabId -> {type, message, url, defaultPrompt}
+const inflight = new Map();        // tabId -> Set of command ids waiting on that tab
+const DIALOG_TAG = "FLOATY_DIALOG ";
+// What to do with a dialog that opens while a command runs ("accept" /
+// "dismiss" from FloatyTerm's --on-dialog; absent = leave it and report).
+// Chrome lets only the session that saw a dialog answer it, so the answer
+// must come from here; it rides back on the command's result.
+const policyByTab = new Map();     // tabId -> "accept" | "dismiss"
+const answeredByTab = new Map();   // tabId -> [{type, message, answered}]
+
+function answerDialog(tabId, d, policy) {
+  const accept = policy === "accept";
+  chrome.debugger.sendCommand({ tabId }, "Page.handleJavaScriptDialog", { accept }).catch(() => {});
+  if (!answeredByTab.has(tabId)) answeredByTab.set(tabId, []);
+  answeredByTab.get(tabId).push({ type: d.type, message: String(d.message || "").slice(0, 500),
+                                  answered: accept ? "accepted" : "dismissed" });
+}
 
 function log(...a) { console.log("[floaty-cdp]", ...a); }
 
@@ -120,7 +140,12 @@ async function ensureAttached(tabId) {
     }
   }
   attached.add(tabId);
+  // Page events tell us when a dialog opens. Not awaited: on a page whose
+  // dialog is ALREADY open the enable never answers (and reports nothing).
+  chrome.debugger.sendCommand({ tabId }, "Page.enable").catch(() => {});
 }
+
+function dialogError(d) { return DIALOG_TAG + JSON.stringify(d); }
 
 function cancelDetach(tabId) {
   const t = detachTimers.get(tabId);
@@ -131,6 +156,8 @@ function scheduleDetach(tabId) {
   // A recording tab holds its debugger for the whole session. The idle
   // detach would otherwise end every recording 8s in, silently.
   if (recordings.has(tabId)) return;
+  // An open dialog can be answered only by the session that saw it: keep it.
+  if (dialogs.has(tabId)) return;
   const prev = detachTimers.get(tabId);
   if (prev) clearTimeout(prev);
   detachTimers.set(tabId, setTimeout(async () => {
@@ -172,6 +199,27 @@ async function handleCommand(raw) {
       return;
     }
 
+    // Is a JavaScript dialog open on the tab? (Attaching enables Page events,
+    // which report a dialog that is already showing.)
+    if (method === "Floaty.dialog") {
+      const tab = pinned != null ? await chrome.tabs.get(pinned) : await resolveTab(match);
+      await ensureAttached(tab.id);
+      let d = dialogs.get(tab.id) || null;
+      if (!d) {
+        // A dialog opened before we attached is never reported; a page that
+        // can't answer a trivial evaluate is blocked by one.
+        const answered = await Promise.race([
+          chrome.debugger.sendCommand({ tabId: tab.id }, "Runtime.evaluate", { expression: "0" })
+            .then(() => true, () => true),
+          new Promise((r) => setTimeout(() => r(false), 1500)),
+        ]);
+        if (!answered) d = { type: "unknown", message: "", unresponsive: true };
+      }
+      reply(id, { dialog: d }, null, tab.id);
+      scheduleDetach(tab.id);
+      return;
+    }
+
     // Network recording — answered here, not forwarded as raw CDP.
     if (method === "Floaty.netStatus") { reply(id, netStatus()); return; }
     if (method === "Floaty.netStop") {
@@ -191,7 +239,34 @@ async function handleCommand(raw) {
     // the error reply is the honest answer ("re-run", not silent drift).
     const tab = pinned != null ? await chrome.tabs.get(pinned) : await resolveTab(match);
     await ensureAttached(tab.id);
-    const result = await chrome.debugger.sendCommand({ tabId: tab.id }, method, params || {});
+    const policy = cmd.onDialog === "accept" || cmd.onDialog === "dismiss" ? cmd.onDialog : null;
+    if (dialogs.has(tab.id) && method !== "Page.handleJavaScriptDialog") {
+      if (method === "Page.reload") {
+        dialogs.delete(tab.id);                        // a reload clears it
+      } else if (policy) {
+        answerDialog(tab.id, dialogs.get(tab.id), policy);
+        dialogs.delete(tab.id);
+      } else {
+        reply(id, null, dialogError(dialogs.get(tab.id)), tab.id);
+        return;
+      }
+    }
+    if (policy) policyByTab.set(tab.id, policy); else policyByTab.delete(tab.id);
+    if (!inflight.has(tab.id)) inflight.set(tab.id, new Set());
+    inflight.get(tab.id).add(id);
+    let result;
+    try {
+      result = await chrome.debugger.sendCommand({ tabId: tab.id }, method, params || {});
+    } finally {
+      const waiting = inflight.get(tab.id);
+      if (waiting) waiting.delete(id);
+    }
+    if (method === "Page.handleJavaScriptDialog") dialogs.delete(tab.id);
+    const answered = answeredByTab.get(tab.id);
+    if (answered && answered.length) {
+      result = Object.assign({}, result || {}, { __floatyDialogs: answered });
+      answeredByTab.delete(tab.id);
+    }
     reply(id, result || {}, null, tab.id);
     scheduleDetach(tab.id);   // auto-detach when idle → banner clears
   } catch (e) {
@@ -417,6 +492,26 @@ async function rearmRecordings() {
 
 // Top level, so Chrome can wake the worker for these events.
 chrome.debugger.onEvent.addListener((source, method, params) => {
+  if (!source.sessionId && method === "Page.javascriptDialogOpening") {
+    const d = { type: params.type, message: params.message || "", url: params.url || "",
+                defaultPrompt: params.defaultPrompt || "" };
+    const policy = policyByTab.get(source.tabId);
+    if (policy && (inflight.get(source.tabId) || new Set()).size > 0) {
+      answerDialog(source.tabId, d, policy);           // the waiting command then completes normally
+      return;
+    }
+    dialogs.set(source.tabId, d);
+    // Commands already waiting on this tab will not return until the dialog
+    // is answered — answer FloatyTerm now, with what the dialog says.
+    for (const waiting of inflight.get(source.tabId) || []) reply(waiting, null, dialogError(d), source.tabId);
+    inflight.delete(source.tabId);
+    return;
+  }
+  if (!source.sessionId && method === "Page.javascriptDialogClosed") {
+    dialogs.delete(source.tabId);
+    scheduleDetach(source.tabId);              // the session was kept for the dialog
+    return;
+  }
   const rec = recordings.get(source.tabId);
   if (!rec) return;
   if (method === "Target.attachedToTarget") { armChild(source.tabId, params); return; }
@@ -444,11 +539,16 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
 chrome.debugger.onDetach.addListener((source, reason) => {
   if (source.tabId == null || source.sessionId) return;   // a child frame leaving is not the tab leaving
   attached.delete(source.tabId);
+  dialogs.delete(source.tabId);
   endRecordingEarly(source.tabId, `debugger detached (${reason})` +
     (reason === "canceled_by_user" ? " — the \"is debugging this browser\" banner was dismissed" : ""));
 });
 chrome.tabs.onRemoved.addListener((tabId) => {
   attached.delete(tabId);
+  dialogs.delete(tabId);
+  inflight.delete(tabId);
+  policyByTab.delete(tabId);
+  answeredByTab.delete(tabId);
   endRecordingEarly(tabId, "tab closed");
 });
 

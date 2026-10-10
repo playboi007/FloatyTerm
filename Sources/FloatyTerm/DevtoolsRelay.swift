@@ -90,6 +90,13 @@ final class DevtoolsRelay {
     /// shield are async, so they leave the sync fast path. The body carries
     /// "_action" = the route name.
     var onAgentBackground: (([String: Any]) async -> [String: Any])?
+    /// input: a timed script of trusted CDP input events (Input.*) for one
+    /// page — Chrome via the extension, Electron/Chrome via a debug port.
+    var onAgentInput: (([String: Any]) async -> [String: Any])?
+    /// find: rank elements by a plain-words query; each hit carries a ref.
+    var onAgentFind: (([String: Any]) async -> [String: Any])?
+    /// dialog: report or answer a JavaScript alert/confirm/prompt on a tab.
+    var onAgentDialog: (([String: Any]) async -> [String: Any])?
 
     private var listener: NWListener?
     private let queue = DispatchQueue(label: "floatyterm.devtools-relay")
@@ -280,6 +287,9 @@ final class DevtoolsRelay {
         case ("POST", "/agent/host"):       return agentSync("host", onAgentHost,       bodyData)
         case ("POST", "/agent/sessions"):   return agentAsync("sessions", onAgentSessions, bodyData)
         case ("POST", "/agent/net"):        return agentAsync("net", onAgentNet, bodyData)
+        case ("POST", "/agent/input"):      return agentAsync("input", onAgentInput, bodyData)
+        case ("POST", "/agent/find"):       return agentAsync("find", onAgentFind, bodyData)
+        case ("POST", "/agent/dialog"):     return agentAsync("dialog", onAgentDialog, bodyData)
         case ("POST", "/agent/run"):
             agentDeferred("run", onAgentRun, bodyData, conn: conn)
             return Self.deferredMarker
@@ -384,14 +394,27 @@ final class DevtoolsRelay {
         return agentSync(route, sync, body)
     }
 
+    /// The "what changed" list for an actuator reply (AgentChanges).
+    private static func attach(_ ticket: AgentChanges.Ticket?, to result: inout [String: Any]) {
+        guard let ticket else { return }
+        let changes = AgentChanges.shared.finish(ticket)
+        if !changes.isEmpty { result["changes"] = changes }
+    }
+
     private func agentSync(_ route: String, _ handler: (([String: Any]) -> [String: Any])?, _ body: Data) -> Data {
         guard let obj = parseBody(body) else { return jsonResponse(["error": "invalid JSON body"], status: 400) }
         var result: [String: Any] = ["error": "no handler"]
         let start = Date()
         markAgentCallStart(); defer { markAgentCallEnd() }
+        if let refusal = AgentPolicy.shared.gate(route: route, args: obj) {
+            logAgentCall(route: route, args: obj, ms: Int(Date().timeIntervalSince(start) * 1000), result: refusal)
+            return jsonResponse(refusal, status: 400)
+        }
+        let changes = AgentChanges.shared.begin(route: route, args: obj)
         let sem = DispatchSemaphore(value: 0)
         DispatchQueue.main.async { result = handler?(obj) ?? ["error": "no handler"]; sem.signal() }
         sem.wait()
+        Self.attach(changes, to: &result)
         logAgentCall(route: route, args: obj, ms: Int(Date().timeIntervalSince(start) * 1000), result: result)
         return jsonResponse(result, status: result["error"] == nil ? 200 : 400)
     }
@@ -401,9 +424,15 @@ final class DevtoolsRelay {
         var result: [String: Any] = ["error": "no handler"]
         let start = Date()
         markAgentCallStart(); defer { markAgentCallEnd() }
+        if let refusal = AgentPolicy.shared.gate(route: route, args: obj) {
+            logAgentCall(route: route, args: obj, ms: Int(Date().timeIntervalSince(start) * 1000), result: refusal)
+            return jsonResponse(refusal, status: 400)
+        }
+        let changes = AgentChanges.shared.begin(route: route, args: obj)
         let sem = DispatchSemaphore(value: 0)
         Task { @MainActor in result = await handler?(obj) ?? ["error": "no handler"]; sem.signal() }
         sem.wait()
+        Self.attach(changes, to: &result)
         logAgentCall(route: route, args: obj, ms: Int(Date().timeIntervalSince(start) * 1000), result: result)
         return jsonResponse(result, status: result["error"] == nil ? 200 : 400)
     }
@@ -425,8 +454,14 @@ final class DevtoolsRelay {
             send(["error": "invalid JSON body"]); return
         }
         guard let handler else { send(["error": "no handler"]); return }
+        if let refusal = AgentPolicy.shared.gate(route: route, args: obj) {
+            logAgentCall(route: route, args: obj, ms: 0, result: refusal)
+            send(refusal)
+            return
+        }
         let start = Date()
         markAgentCallStart()
+        let changes = AgentChanges.shared.begin(route: route, args: obj)
         // One-shot guard: the handler contract is a single reply, but a
         // misbehaving double-call must not double-send on the connection or
         // unbalance the in-flight counter.
@@ -438,6 +473,8 @@ final class DevtoolsRelay {
                 let first = !done; done = true
                 replied.unlock()
                 guard first, let self else { return }
+                var result = result
+                Self.attach(changes, to: &result)
                 self.markAgentCallEnd()
                 self.logAgentCall(route: route, args: obj,
                                   ms: Int(Date().timeIntervalSince(start) * 1000),
@@ -561,7 +598,10 @@ final class DevtoolsRelay {
                        // on run.step ledger lines.
                        "step", "verb", "attempt", "retry",
                        // Background mode + element actions on query-ax.
-                       "mode", "background", "focus", "scroll_to", "action"]
+                       "mode", "background", "focus", "scroll_to", "action",
+                       // run pacing; input scripts.
+                       "pace", "no_capture", "repeat", "ref", "under", "all", "query", "allow_scheme",
+                       "on_dialog", "allow_terminal", "reload", "accept", "dismiss"]
         for k in scalars where b[k] != nil {
             if let s = b[k] as? String { o[k] = String(s.prefix(120)) } else { o[k] = b[k] }
         }
@@ -570,6 +610,7 @@ final class DevtoolsRelay {
         for k in ["text", "expression", "js", "steps", "set_value"] {
             if let s = b[k] as? String { o["\(k)_len"] = s.count; o["\(k)_head"] = String(s.prefix(48)) }
         }
+        if let arr = b["steps"] as? [Any] { o["steps_count"] = arr.count }
         return o
     }
 

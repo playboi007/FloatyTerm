@@ -1,0 +1,24 @@
+<!doctype html><html><head><meta charset="utf-8"><title>floaty-exercise</title><style>
+body{margin:0;font:14px sans-serif}
+#kb{position:relative;width:200px;height:120px;margin:8px}
+.w{position:absolute;top:0;width:40px;height:120px;border:1px solid #000;box-sizing:border-box;background:#fff}
+.b{position:absolute;top:0;width:24px;height:70px;background:#000;z-index:2}
+</style></head><body>
+<h1>Shop</h1>
+<label for="email">Email address</label> <input id="email" value="old@x.y">
+<select id="size"><option value="s">Small</option><option value="m">Medium</option></select>
+<button id="add" onclick="window.__added=(window.__added||0)+1">Add to cart</button>
+<button id="al" onclick="alert('Saved!')">Save</button>
+<div id="menu" onmouseover="window.__hovered=1" style="width:80px;height:20px;background:#eee">Menu</div>
+<section id="sec"><button>Inner one</button><button>Inner two</button></section>
+<div id="kb">
+ <div class="w" data-midi="60" style="left:0"></div><div class="w" data-midi="62" style="left:40px"></div>
+ <div class="b" data-midi="61" style="left:28px"></div>
+</div>
+<div style="height:3000px"></div>
+<button id="far" onclick="window.__far=1">Far away</button>
+<script>
+window.__log=[];
+['pointerdown','keydown','input'].forEach(function(t){document.addEventListener(t,function(e){
+  window.__log.push({type:e.type,tr:e.isTrusted,t:performance.now(),midi:(e.target.dataset&&e.target.dataset.midi)||null,key:e.key||null})},true)});
+</script></body></html>

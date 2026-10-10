@@ -120,6 +120,13 @@ enum AgentBackground {
         return el
     }
 
+    /// The element's frame covers the point (2 pt slack for rounding). An
+    /// element with no frame passes — there is nothing to check against.
+    private static func covers(_ el: AXUIElement, _ p: CGPoint) -> Bool {
+        guard let r = AgentAX.rectOf(el), r.width > 0, r.height > 0 else { return true }
+        return r.insetBy(dx: -2, dy: -2).contains(p)
+    }
+
     private static func near(_ a: CGRect, _ b: CGRect, _ tol: CGFloat = 4) -> Bool {
         abs(a.minX - b.minX) <= tol && abs(a.minY - b.minY) <= tol
             && abs(a.width - b.width) <= tol && abs(a.height - b.height) <= tol
@@ -155,6 +162,7 @@ enum AgentBackground {
         case otherApp(CGPoint, String)
         case nothingPressable(CGPoint, String)
         case pressFailed(String, Int32)
+        case missedPoint(CGPoint, String, CGRect)
         var errorDescription: String? {
             switch self {
             case .otherApp(let p, let owner):
@@ -166,6 +174,11 @@ enum AgentBackground {
                     + "(`query-ax --title … --press`) or use --foreground for coordinate clicks"
             case .pressFailed(let role, let code):
                 return "AXPress on \(role) failed (AX error \(code))"
+            case .missedPoint(let p, let role, let r):
+                return "the control accessibility offers at \(Int(p.x)),\(Int(p.y)) is a \(role) at "
+                    + "\(Int(r.minX)),\(Int(r.minY)) \(Int(r.width))×\(Int(r.height)), which doesn't cover the point — "
+                    + "pressing it would click a different control. On a web page use `floaty input` "
+                    + "(trusted CDP clicks at the exact point); else target the control by name or use --foreground"
             }
         }
     }
@@ -224,6 +237,7 @@ enum AgentBackground {
         let appEl = app(pid)
         var target: AXUIElement?
         var unadvertised: AXUIElement?     // a non-surface hit that advertises no AXPress
+        var missed: AXUIElement?           // a control that doesn't cover the point
         var lastRole = ""
         for attempt in 0..<5 {
             var hit: AXUIElement?
@@ -237,7 +251,13 @@ enum AgentBackground {
                 }
                 lastRole = roleOf(hit)
                 if !isSurface(hit), let p = controlAncestor(hit) ?? AgentAX.nearestPressable(hit), !isSurface(p) {
-                    target = p
+                    // Chromium presses an element at ITS centre. When the control
+                    // the tree offers doesn't cover the point (keys drawn over
+                    // other keys — a piano's black keys pressed the white key
+                    // beside them, measured), that is a different control.
+                    if covers(p, point) { target = p; break }
+                    missed = p
+                    if covers(hit, point) { unadvertised = hit; break }
                     break
                 }
                 if !isSurface(hit) {
@@ -258,6 +278,9 @@ enum AgentBackground {
             noteActed(hit, pid: pid)
             let r = AgentAX.rectOf(hit) ?? CGRect(origin: point, size: .zero)
             return Pressed(role: roleOf(hit), name: nameOf(hit), center: CGPoint(x: r.midX, y: r.midY))
+        }
+        if target == nil, let m = missed {
+            throw BGError.missedPoint(point, roleOf(m), AgentAX.rectOf(m) ?? .zero)
         }
         guard let target else { throw BGError.nothingPressable(point, lastRole) }
         let role = roleOf(target)
@@ -515,9 +538,19 @@ enum AgentBackground {
 /// beat late, so the shield stays armed for 1.5 s and catches those too
 /// (reported as late_restores on the next reply). A physical mouse click in
 /// that window means the human chose the app — the shield stands down.
+///
+/// The 180 ms wait before the check is paid only until an app has earned
+/// trust: after `trustAfter` clean actions in a row the check runs at once
+/// (the armed observer still catches and undoes a late steal). The fixed wait
+/// was most of every background click and key — 196 ms of host time, 16 ms
+/// of it actual work (calls.ndjson, 2026-10-09).
 @MainActor
 final class FocusShield {
     static let shared = FocusShield()
+
+    private static let trustAfter = 3
+    /// Clean actions in a row per target pid; reset by any steal.
+    private var cleanRuns: [pid_t: Int] = [:]
 
     struct Ticket {
         let target: pid_t
@@ -540,8 +573,11 @@ final class FocusShield {
     }
 
     func finish(_ t: Ticket) async -> [String: Any] {
-        // Activation lands asynchronously — give a steal a beat to surface.
-        try? await Task.sleep(nanoseconds: 180_000_000)
+        // Activation lands asynchronously — give a steal a beat to surface,
+        // until this app has shown it doesn't steal.
+        if (cleanRuns[t.target] ?? 0) < Self.trustAfter {
+            try? await Task.sleep(nanoseconds: 180_000_000)
+        }
         let now = NSWorkspace.shared.frontmostApplication
         let nowPID = now?.processIdentifier ?? 0
         var r: [String: Any] = ["human_app": t.frontName]
@@ -555,10 +591,15 @@ final class FocusShield {
             r["focus_kept"] = false
             r["stolen_by_target"] = true
             r["restored"] = Self.giveFocus(to: t.frontBefore)
+            cleanRuns[t.target] = 0
         } else {
             r["focus_kept"] = true
             r["front_now"] = now?.localizedName ?? "?"
             r["note"] = "the frontmost app changed during the action, but not to the target — the human switched apps"
+        }
+        if r["stolen_by_target"] == nil, t.frontBefore != t.target {
+            if cleanRuns.count > 64 { cleanRuns.removeAll() }   // pids come and go; keep it small
+            cleanRuns[t.target, default: 0] += 1
         }
         if t.frontBefore != t.target, t.frontBefore != 0 {
             armedUntil = Date().addingTimeInterval(1.5)
@@ -586,6 +627,7 @@ final class FocusShield {
         guard let pid, Date() < armedUntil, pid == armedTarget, armedHuman != 0 else { return }
         armedUntil = .distantPast
         guard !Self.humanClicked(within: 1.0) else { return }   // the human chose it
+        cleanRuns[pid] = 0          // it steals late: wait before checking again
         if Self.giveFocus(to: armedHuman) { lateRestores += 1 }
     }
 

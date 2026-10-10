@@ -127,6 +127,63 @@ an element that advertises no `AXPress` tries `AXPress` on it anyway.
 - **Trace.** `calls.ndjson` records `mode`, `via`, `interference`, `landed`,
   `needs_foreground`.
 
+## Experiment 3 — input speed and trusted page input, 2026-10-09
+
+**Trigger.** An agent played a score on onlinepianist.com in background mode.
+Each note cost 0.35–0.5 s, so the tempo could not be kept. Black keys went to
+the wrong key, and events dispatched from page JavaScript did nothing.
+
+**Where the time went** (agent-measured end to end; host time from
+`calls.ndjson`, n = 815 background clicks, 238 background keys):
+
+| Part | Before | Cause |
+|---|---|---|
+| CLI process start | ~100–150 ms | bash, then 3 `python3` starts, then 1–2 `curl` starts (background added a probe) |
+| Relay round trip | ~1 ms | — |
+| Host: background click / key | 196 / 199 ms | a fixed 180 ms `FocusShield` wait; the real work was ~16 ms |
+| `run` step with no `expect` | +300 ms | a fixed pause |
+| Foreground click / key | 60 / 46 ms | a 40 ms settle in `activate()`, paid even when the target was already in front |
+
+**Changes.**
+- The CLI is one Python process (`-I -S`, raw socket, no `http.client`, whose
+  import alone costs ~14 ms). Same flags and bodies as before (26 parity cases).
+  A call is ~30 ms end to end, of which ~20 ms is Python start.
+- `FocusShield` waits 180 ms only until an app has done 3 clean background
+  actions; then it checks at once. The 1.5 s observer still undoes a late steal
+  (and resets that app's count).
+- `activate()` returns at once when the target is already frontmost.
+- `run`: `--pace MS` / a step's `"pause"` replace the fixed 300 ms;
+  `--no-capture` skips the final PNG.
+- Background `click`: when the AX control at the point does not cover the point
+  (Chromium presses an element at its centre, so a piano's black keys pressed
+  the white key beside them), the host refuses instead of pressing the wrong
+  control.
+- New verb `input` (`CDPInputScript` + `AgentCDPInput`): a timed script of CDP
+  `Input.*` events through the extension or a debug port. The page gets trusted
+  events (`isTrusted: true`). Selectors resolve once, and the timeline runs on a
+  detached task with a continuous clock. Holds are measured from the real press.
+  Anything still down at the end, or after a failure, is released.
+
+**Measured** (headless Chrome, debug port, the real executor compiled into a
+test binary, a page that logs every event):
+
+| Check | Result |
+|---|---|
+| All events trusted | 40 / 40 |
+| Black key under a white key, by selector | correct key |
+| Hover, shift-click, double-click, right-click, wheel, pointer drag, typing, insertText | pass |
+| 24 notes 100 ms apart — page-side spacing error | median 1.1–1.8 ms, max 4–5.6 ms |
+| 3-key chord — spread of the keydowns | 1.7–3.8 ms |
+| Key held 100 ms behind a burst of 20 events | 102 ms |
+| Script ending with a key and a button down | both released, reported |
+
+Not yet measured: the extension path (adds the WebSocket hop and
+`chrome.debugger`; `eval --via-extension` round trips are 2–4 ms host-side), and
+whether `chrome.debugger` key events reach a page whose window is not focused
+(they do over a plain debug port on Electron, Experiment 2). HTML5
+drag-and-drop needs `Input.dragIntercepted` events, which the bridge does not
+forward, so `drag` is a pointer drag only.
+
 ## Status and next steps
 
 - Built and signed. Live verification of the integrated host path (as opposed to
@@ -134,10 +191,9 @@ an element that advertises no `AXPress` tries `AXPress` on it anyway.
   `docs/floaty-test-cases.md` after a relaunch, then B4 (two windows of one app).
 - Not yet measured: whether `AXPress` on a field makes Chrome switch its internal
   key window between two windows (B4 tests this; the guard refuses if it doesn't).
-- Gaps: hover, double-click, wheel scroll and drag are still refused in
-  background mode. Experiment 2 shows CDP input covers them for Chrome
-  (through the extension bridge) and Electron (through a debug port); that
-  path is not built yet. Native apps (Notes, System Settings) are not measured
-  yet. Canvas apps stay foreground-only.
+- Gaps: hover, double-click, wheel scroll and drag are still refused by the
+  pointer verbs in background mode; on web pages `input` covers them
+  (Experiment 3). Native apps (Notes, System Settings) are not measured yet.
+  Native canvas apps stay foreground-only.
 - Possible later work: a visible "agent is driving" frame on the agent's
   display, and assigning a display to each agent.
