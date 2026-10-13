@@ -2,6 +2,24 @@
 (function (root) {
   'use strict';
   const VERSION = 1;
+  // Memory is the reducer's job, not the producer's: cap what a single conversation may retain.
+  const TOOL_OUTPUT_MAX = 256 * 1024;   // the streamed-delta window, applied to final results too
+  const DETAIL_STRING_MAX = 16000;
+  const DETAIL_ITEMS_MAX = 100;
+  const DETAIL_DEPTH_MAX = 8;
+  const SECRET_KEY = /^(accessToken|refreshToken|idToken|apiKey|clientSecret|password|secret|token|authorization|challenge|sdp|deltaBase64)$/i;
+  const SCHEMA_TYPES = ['string', 'number', 'integer', 'boolean', 'array'];
+  const capped = (text, max = TOOL_OUTPUT_MAX) => typeof text === 'string' && text.length > max
+    ? '… (' + (text.length - max) + ' more characters)\n' + text.slice(-max) : text;
+  /** Bounded deep copy for folded payloads, matching the Codex producer's safePayload: surfaces and media may outlive their turn. */
+  function bound(value, depth = 0) {
+    if (depth > DETAIL_DEPTH_MAX) return '[nested details omitted]';
+    if (typeof value === 'string') return value.length > DETAIL_STRING_MAX ? value.slice(0, DETAIL_STRING_MAX) + '\n[Details truncated]' : value;
+    if (Array.isArray(value)) return value.slice(0, DETAIL_ITEMS_MAX).map(v => bound(v, depth + 1));
+    if (value && typeof value === 'object') return Object.fromEntries(Object.entries(value).slice(0, DETAIL_ITEMS_MAX).map(([k, v]) => [k,
+      SECRET_KEY.test(k) && !(v && typeof v === 'object' && SCHEMA_TYPES.includes(v.type)) ? '[not displayed]' : bound(v, depth + 1)]));
+    return value;
+  }
   const factories = new Map();
   const controls = new Set(['capabilities', 'model', 'mode', 'effort', 'git', 'sessions', 'history', 'thinking', 'usage', 'files', 'title', 'rewind', 'btw', 'shell', 'promptHistory', 'catalog', 'permissionProfiles', 'usageHistory', 'import', 'guardian']);
   function envelope(agent, raw, event) {
@@ -35,30 +53,39 @@
     return { sessionId: null, busy: false, status: 'idle', blocks: new Map(), tools: new Map(), approvals: new Map(), turnDiffs: new Map(), plans: new Map(), surfaces: new Map(), media: new Map(), unknown: [] };
   }
   const turnKey = (threadId, turnId) => threadId != null && turnId != null ? JSON.stringify([String(threadId), String(turnId)]) : null;
+  /** A finished turn's folded payloads are already drawn: drop them, except surfaces that span the session. */
+  function pruneTurn(state, threadId, turnId) {
+    if (threadId == null || turnId == null) return;
+    state.turnDiffs.delete(turnKey(threadId, turnId));
+    state.plans.delete(turnKey(threadId, turnId));
+    for (const [id, surface] of state.surfaces) if (surface.placement !== 'session' && surface.threadId === threadId && surface.turnId === turnId) state.surfaces.delete(id);
+    for (const [id, media] of state.media) if (media.threadId === threadId && media.turnId === turnId) state.media.delete(id);
+  }
   function reduce(state, e) {
     if (e.v !== VERSION) throw new Error('Unsupported agent event version: ' + e.v);
     switch (e.type) {
       case 'session': state.sessionId = e.sessionId || state.sessionId; break;
       case 'turn.start': state.busy = true; state.status = 'running'; break;
-      case 'plan.snapshot': state.plans.set(turnKey(e.threadId, e.turnId), e); break;
+      case 'plan.snapshot': { const key = turnKey(e.threadId, e.turnId); if (key) state.plans.set(key, e); break; }
       case 'surface.snapshot': {
         if (e.clear) {
           for (const [key, value] of state.surfaces) if (value.surface === e.surface && value.threadId === e.threadId) state.surfaces.delete(key);
         } else {
           const previous = state.surfaces.get(e.id);
-          state.surfaces.set(e.id, { ...e, data: previous?.method === e.method ? e.data : { ...previous?.data, ...e.data } });
+          const data = bound(e.data);
+          state.surfaces.set(e.id, { ...e, data: previous?.method === e.method ? data : { ...bound(previous?.data), ...data } });
         }
         break;
       }
-      case 'media.snapshot': state.media.set(e.id, e); break;
+      case 'media.snapshot': state.media.set(e.id, { ...e, url: bound(e.url) }); break;
       case 'tool.output.delta': case 'tool.progress': {
         const tool = state.tools.get(e.id) || { id: e.id, name: e.name || 'Tool', state: 'running' };
         if (e.type === 'tool.output.delta') {
           const stream = e.stream || 'stdout';
           tool.streams ||= {};
           const appended = (tool.streams[stream] || '') + (e.text || '');
-          tool.capped = tool.capped || appended.length > 256 * 1024;
-          tool.streams[stream] = appended.slice(-256 * 1024);
+          tool.capped = tool.capped || appended.length > TOOL_OUTPUT_MAX;
+          tool.streams[stream] = appended.slice(-TOOL_OUTPUT_MAX);
           tool.output = Object.entries(tool.streams).map(([name, text]) => name === 'stdout' ? text : '[' + name + ']\n' + text).join('\n');
           tool.capped = tool.capped || !!e.capped;
           if (e.processHandle) tool.processHandle = e.processHandle;
@@ -89,7 +116,7 @@
         if (e.name) tool.name = e.name;
         if (e.input !== undefined) tool.input = e.input;
         if (e.type === 'tool.result') {
-          if (e.output !== undefined) tool.output = e.output;
+          if (e.output !== undefined) tool.output = capped(e.output);
           tool.state = e.isError ? 'error' : 'done';
           for (const [id, request] of state.approvals) if (request.toolUseID === e.id) state.approvals.delete(id);
         }
@@ -101,6 +128,7 @@
       case 'approval.cancel': state.approvals.delete(e.id); break;
       case 'turn.end':
         state.busy = false; state.status = e.status;
+        pruneTurn(state, e.threadId, e.turnId);
         for (const block of state.blocks.values()) block.final = true;
         for (const tool of state.tools.values()) if (tool.state === 'running') tool.state = e.status === 'success' ? 'interrupted' : e.status;
         state.approvals.clear();

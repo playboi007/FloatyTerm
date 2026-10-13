@@ -41,6 +41,18 @@ for existing replay callers. Text snapshots replace previous text, while explici
 deltas append; native tool IDs and per-turn Codex IDs keep activity separate.
 Unknown events appear as folded, bounded JSON details.
 
+**What a conversation retains is the reducer's decision, not the producer's.**
+`reduce` bounds retention for every agent the same way: a final `tool.result` is
+capped to the same 256 KB window as streamed `tool.output.delta`, so a huge
+command output cannot outlive its own paint; `surface.snapshot` and
+`media.snapshot` payloads are copied through a bounded projection (16 KB strings,
+100 items, depth 8) that also redacts token-like keys; and `turn.end` prunes the
+folded payloads of the turn that just finished - `turnDiffs`, `plans`, `media`,
+and any surface carrying that turn's `threadId`/`turnId` - while keeping surfaces
+placed at session scope. A producer that emits more than the renderer draws, or
+that streams a turn nobody can see any more, therefore cannot grow the tab
+without bound. `dev/memcheck.swift` measures the result:
+
 The menu bar's **New Codex Tab** starts the installed `codex` through the
 dependency-free `Resources/CodexSidecar/sidecar.mjs`. It maintains a Codex
 `app-server --listen stdio://` connection and translates JSON-RPC notifications
@@ -64,7 +76,12 @@ Verify the shared path without an account or model call:
 
 ```sh
 node --test Resources/SkimRender/dev/agent-events.test.js Resources/SkimRender/dev/codex-events.test.js
+node --test Resources/SkimRender/dev/event-bounds.test.js                 # reducer caps and turn.end pruning
 node --test Resources/CodexSidecar/sidecar.test.mjs
+# Feed N canonical turns and print reducer retention and page footprint; V1 turns each
+# carry a large tool result, a turn surface, a session surface, media and a diff.
+swiftc -O Resources/SkimRender/dev/memcheck.swift -o /tmp/memcheck
+LABEL=x V1=20 V1OUT=1500000 REPLIES=0 SHOTS=0 OUTS=0 /tmp/memcheck
 ```
 
 `dev/codex-replay.html` is a synthetic Codex fixture. `dev/chat-replay.html` uses
