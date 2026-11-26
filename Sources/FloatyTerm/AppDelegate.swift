@@ -1910,6 +1910,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         statusItem.onNewNote       = { [weak self] in self?.newNoteTabInCurrentWindow() }
         statusItem.onNewClaudeTab  = { [weak self] in self?.newClaudeTabInCurrentWindow() }
         statusItem.onNewCodexTab   = { [weak self] in self?.newCodexTabInCurrentWindow() }
+        statusItem.onNewPiTab      = { [weak self] in self?.newPiTabInCurrentWindow() }
         statusItem.onMirrorWindow  = { [weak self] in self?.newMirrorTabInCurrentWindow() }
         statusItem.onCompareFiles  = { [weak self] in self?.compareFilesInCurrentWindow() }
         statusItem.onShowRuler     = { [weak self] in self?.ruler.toggle() }
@@ -2288,6 +2289,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         } else {
             let wc = makeWindow()
             wc.openNewCodexTab()
+        }
+    }
+
+    private func newPiTabInCurrentWindow() {
+        if let wc = currentWindow() {
+            wc.openNewPiTab()
+            wc.show()
+        } else {
+            let wc = makeWindow()
+            wc.openNewPiTab()
         }
     }
 

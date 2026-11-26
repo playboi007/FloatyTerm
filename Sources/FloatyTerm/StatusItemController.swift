@@ -14,6 +14,7 @@ final class StatusItemController: NSObject, NSMenuDelegate {
     var onNewNote: () -> Void = {}
     var onNewClaudeTab: () -> Void = {}
     var onNewCodexTab: () -> Void = {}
+    var onNewPiTab: () -> Void = {}
     var onMirrorWindow: () -> Void = {}
     var onCompareFiles: () -> Void = {}
     var onNewWindow: () -> Void = {}
@@ -181,6 +182,8 @@ final class StatusItemController: NSObject, NSMenuDelegate {
                               key: "a", mods: [.command, .shift]))
         menu.addItem(makeItem("New Codex Tab", action: #selector(newCodexTab),
                               key: "", mods: []))
+        menu.addItem(makeItem("New Pi Tab", action: #selector(newPiTab),
+                              key: "", mods: []))
         menu.addItem(makeItem("Mirror a Window…", action: #selector(mirrorWindow),
                               key: "m", mods: [.command, .shift]))
         menu.addItem(makeItem("Compare Two Files…", action: #selector(compareFiles),
@@ -257,6 +260,7 @@ final class StatusItemController: NSObject, NSMenuDelegate {
     @objc private func newNote()       { onNewNote()         }
     @objc private func newClaudeTab()  { onNewClaudeTab()    }
     @objc private func newCodexTab()   { onNewCodexTab()     }
+    @objc private func newPiTab()      { onNewPiTab()        }
     @objc private func mirrorWindow()  { onMirrorWindow()    }
     @objc private func compareFiles()  { onCompareFiles()    }
     @objc private func newWindow()     { onNewWindow()       }

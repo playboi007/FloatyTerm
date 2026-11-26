@@ -1033,6 +1033,9 @@ final class TerminalWindowController: NSObject, NSWindowDelegate {
 
     func openNewCodexTab() { addClaudeTab(agent: .codex) }
 
+    /// Public entry for the menu bar's "New Pi Tab".
+    func openNewPiTab() { addClaudeTab(agent: .pi) }
+
     /// Public entry for the menu bar's "Mirror a Window…".
     func openNewMirror() { addMirrorTab() }
 
@@ -1350,8 +1353,14 @@ final class TerminalWindowController: NSObject, NSWindowDelegate {
         insertTab(tab)
         // The pty buffers input, but give the shell a beat to print its prompt.
         let safeID = sessionID.filter { $0.isHexDigit || $0 == "-" }
+        let command: String
+        switch agent {
+        case .claude: command = "claude --resume \(safeID)"
+        case .codex: command = "codex resume \(safeID)"
+        case .pi: command = "pi --session \(safeID)"
+        }
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) { [weak tab] in
-            tab?.run(command: agent == .claude ? "claude --resume \(safeID)" : "codex resume \(safeID)")
+            tab?.run(command: command)
         }
     }
 

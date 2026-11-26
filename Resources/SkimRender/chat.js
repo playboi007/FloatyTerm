@@ -30,7 +30,13 @@
   const CODEX_FEATURES = { approvals: true, fork: true, history: true, models: true, effort: true,
     permissionMode: true, thinking: true, usage: true, git: true, tui: true, slashCommands: true, midTurnInput: true,
     mentions: true, images: true, rename: true, shell: true };
+  // pi has no permission modes and no account-plan API; extension dialogs still arrive as approval requests.
+  const PI_FEATURES = { approvals: true, fork: true, history: true, models: true, effort: true,
+    thinking: true, usage: true, git: true, tui: true, slashCommands: true, midTurnInput: true,
+    images: true, rename: true, shell: true };
+  const AGENT_FEATURES = { claude: CLAUDE_FEATURES, codex: CODEX_FEATURES, pi: PI_FEATURES };
   let agent = 'claude';
+  const agentName = () => ({ codex: 'Codex', pi: 'pi' }[agent] || 'Claude');
   let features = { ...CLAUDE_FEATURES };
   const supports = name => !!features[name];
   const SHARED = {
@@ -1077,7 +1083,7 @@
         h('span', { class: 'ck-card-title', text: title }),
         asker ? agentTag(agentInfo(asker)) : null),
       preview(req),
-      why && h('div', { class: 'ck-why' }, h('span', { class: 'ck-why-k', text: (agent === 'codex' ? 'Codex' : 'Claude') + '\'s reason · ' }), why),
+      why && h('div', { class: 'ck-why' }, h('span', { class: 'ck-why-k', text: (agentName()) + '\'s reason · ' }), why),
       opts);
     const choose = (decision, message) => {
       if (card.dataset.done) return;
@@ -1096,12 +1102,12 @@
       keys['2'] = () => choose('allowAlways');
     }
     const noKey = always ? '3' : '2';
-    const decline = () => agent === 'codex' ? choose('deny') : showNo();
-    const noBtn = btn(noKey, agent === 'codex' ? 'No' : 'No, and tell Claude what to do differently', decline, 'is-no');
+    const decline = () => agent !== 'claude' ? choose('deny') : showNo();
+    const noBtn = btn(noKey, agent !== 'claude' ? 'No' : 'No, and tell Claude what to do differently', decline, 'is-no');
     opts.append(noBtn);
     keys[noKey] = decline;
     const noForm = h('div', { class: 'ck-no', hidden: true });
-    const noInput = h('textarea', { class: 'ck-no-input', rows: '2', placeholder: 'What should ' + (agent === 'codex' ? 'Codex' : 'Claude') + ' do instead? (optional)' });
+    const noInput = h('textarea', { class: 'ck-no-input', rows: '2', placeholder: 'What should ' + (agentName()) + ' do instead? (optional)' });
     const noSend = h('button', { class: 'sk-btn', type: 'button', text: 'Decline' });
     noForm.append(noInput, noSend);
     opts.append(noForm);
@@ -1383,8 +1389,10 @@
     modelEl.hidden = !supports('models');
     modeBtn.hidden = !supports('permissionMode');
     costEl.hidden = !supports('usage');
-    // "Opus 5.5" stays; " · 1M · high" is the part a narrow panel drops.
-    const [name, ...extra] = (modelLabel(S.model) || 'Model').split(' · ');
+    // "Opus 5.5" stays; " · 1M · high" is the part a narrow panel drops. The agent's own
+    // model list names the model when it has one (pi's ids are paths like provider/model).
+    const row = currentModelRow();
+    const [name, ...extra] = (row?.displayName || modelLabel(S.model) || 'Model').split(' · ');
     if (S.effort) extra.push(S.effort);
     modelEl.firstChild.replaceChildren(name, extra.length ? h('span', { class: 'ck-model-x', text: ' · ' + extra.join(' · ') }) : '');
     modeBtn.firstChild.textContent = agent === 'codex' ? (S.permissionProfileActive || CODEX_MODES.find(m => m.mode === S.mode)?.label || S.mode) : MODE_LABEL[S.mode] || S.mode;
@@ -2156,7 +2164,7 @@
     const seen = S.chipSeen || 0;
     for (const c of chips) if (c.seq > seen) play(c.el, POP, M.fast);
     S.chipSeen = Math.max(seen, ...chips.map(c => c.seq));
-    input.placeholder = chips.length ? 'Say what to do with it…  (⌫ removes the last one)' : `Message ${agent === 'codex' ? 'Codex' : 'Claude'}…${supports('slashCommands') ? '  / for commands' : ''} · ⇧↩ new line · ⌥↩ later`;
+    input.placeholder = chips.length ? 'Say what to do with it…  (⌫ removes the last one)' : `Message ${agentName()}…${supports('slashCommands') ? '  / for commands' : ''} · ⇧↩ new line · ⌥↩ later`;
     paintHeld();
     if (!chips.length && talkTarget()) input.placeholder = `Message ${talkTarget().type}…`;
     if (P.kind) placePop();
@@ -3306,7 +3314,7 @@
     sendBtn.title = sendBtn.dataset.mode === 'stop' ? 'Stop (Esc)'
       : S.busy && supports('priority') && !subRow ? 'Send: ↩ joins this turn · ⌘↩ redirect (after this step) · ⌥↩ after this turn' : 'Send (Return)';
     if (!S.refs.length && !S.images.length && !subRow && supports('priority')) {
-      const want = S.busy ? 'Add to this turn…  ⌘↩ redirect · ⌥↩ after this turn' : `Message ${agent === 'codex' ? 'Codex' : 'Claude'}…${supports('slashCommands') ? '  / for commands' : ''} · ⇧↩ new line · ⌥↩ later`;
+      const want = S.busy ? 'Add to this turn…  ⌘↩ redirect · ⌥↩ after this turn' : `Message ${agentName()}…${supports('slashCommands') ? '  / for commands' : ''} · ⇧↩ new line · ⌥↩ later`;
       if (input.placeholder !== want) input.placeholder = want;
     }
     holdBtn.hidden = !input.value.trim() && !S.refs.length && !S.images.length;
@@ -3414,7 +3422,7 @@
     ctxEl = h('button', { class: 'ck-ctx', type: 'button' });
     moreBtn = h('button', { class: 'ck-chip ck-more', type: 'button', title: 'More: folder, git, session, actions' }, h('span', { class: 'ck-more-ic' }));
     usagePanel = h('div', { class: 'ck-usage-panel', hidden: true });
-    input = h('textarea', { class: 'ck-input', rows: '1', placeholder: 'Message Claude…  / for commands · ⇧↩ new line' });
+    input = h('textarea', { class: 'ck-input', rows: '1', placeholder: 'Message ' + agentName() + '…  / for commands · ⇧↩ new line' });
     sendBtn = h('button', { class: 'ck-send', type: 'button' }, h('span', { class: 'ck-send-ic' }));
     micBtn = h('button', { class: 'ck-mic', type: 'button', hidden: !supports('voice') }, icon(ICON_MIC));
     micBtn.onmousedown = e => e.preventDefault();   // the caret stays where the words go
@@ -4178,7 +4186,7 @@
     toEl.hidden = false;
     field.classList.toggle('to-agent', !!to);
     if (to) field.style.setProperty('--c', agentColor(a.type)); else field.style.removeProperty('--c');
-    input.placeholder = to ? `Message ${a.type}…` : `Message ${agent === 'codex' ? 'Codex' : 'Claude'}…`;
+    input.placeholder = to ? `Message ${a.type}…` : `Message ${agentName()}…`;
   }
 
   // What Main reads: who the message is for, and how to pass it on. The user sees only their words.

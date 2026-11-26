@@ -54,7 +54,7 @@ enum SkimAssets {
     private static let chatCSS: String = read("chat.css") ?? ""
     private static let chatScript: String? = read("chat.js")
     private static let agentScripts: [String]? = {
-        let names = ["agent-events.js", "agent-claude.js", "agent-codex.js"]
+        let names = ["agent-events.js", "agent-claude.js", "agent-codex.js", "agent-pi.js"]
         let sources = names.compactMap(read)
         return sources.count == names.count ? sources : nil
     }()
