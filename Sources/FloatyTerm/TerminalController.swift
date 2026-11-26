@@ -215,6 +215,10 @@ final class TerminalController: NSObject, LocalProcessTerminalViewDelegate, TabC
     /// endless stream of near-duplicate lines. Only output that genuinely
     /// scrolls off this screen is committed to the transcript.
     private var mirror: Terminal!
+    /// Bytes fed to the mirror between harvests, and its scrollback: more
+    /// rows than one piece can scroll.
+    private static let mirrorFeedPiece = 1024
+    private static let mirrorScrollback = 2_000
     private let mirrorDelegate = MirrorTerminalDelegate()
     private var mirrorNextRow = 0    // next scroll-invariant row to commit
     private var mirrorProbedEnd = 0  // rows examined so far
@@ -802,10 +806,13 @@ final class TerminalController: NSObject, LocalProcessTerminalViewDelegate, TabC
         if isRestored { restoreTranscriptFromDisk() }
 
         // The transcript mirror: a headless terminal interpreting the same
-        // byte stream, sized to match (sizeChanged keeps it in sync) with a
-        // scrollback matching the transcript cap.
+        // byte stream, sized to match (sizeChanged keeps it in sync). Its
+        // scrollback only has to hold rows not yet committed: it is fed in
+        // pieces small enough that one piece cannot scroll past it, and rows
+        // already committed are never read again. (At 10,000 rows it held
+        // ~20 MB per busy tab of lines the transcript already had.)
         var mirrorOptions = TerminalOptions.default
-        mirrorOptions.scrollback = 10_000
+        mirrorOptions.scrollback = Self.mirrorScrollback
         // Match the real terminal's geometry FROM THE START — sizeChanged only
         // fires on later resizes. A mirror narrower than the real terminal
         // wraps TUI frames onto extra rows the TUI's cursor-up repaint can't
@@ -818,8 +825,15 @@ final class TerminalController: NSObject, LocalProcessTerminalViewDelegate, TabC
 
         terminalView.onOutput = { [weak self] slice in
             guard let self else { return }
-            self.mirror.feed(buffer: slice)
-            self.harvestTranscript()
+            // A piece of N bytes scrolls at most N rows, so each harvest
+            // finds every new row still in the mirror's scrollback.
+            var start = slice.startIndex
+            while start < slice.endIndex {
+                let end = min(start + Self.mirrorFeedPiece, slice.endIndex)
+                self.mirror.feed(buffer: slice[start..<end])
+                self.harvestTranscript()
+                start = end
+            }
             self.ingestOutput(slice)
             self.lastOutputAt = Date()
             if self.notifyWhenDone { self.armedSawOutput = true }
