@@ -15,12 +15,13 @@ protocol AgentSidecar: AnyObject {
 extension ClaudeSidecar: AgentSidecar {}
 
 enum ChatAgent: String {
-    case claude, codex
+    case claude, codex, pi
 
     func runner() -> any AgentSidecar {
         switch self {
         case .claude: ClaudeSidecar()
         case .codex: CodexSidecar()
+        case .pi: PiSidecar()
         }
     }
 }

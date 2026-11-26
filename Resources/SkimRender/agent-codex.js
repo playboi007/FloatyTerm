@@ -8,6 +8,12 @@
     let turnSequence = 0;
     let turnKey = 'turn-0';
     const items = new Map();
+    // A finished item never changes again; only the newest ones need their last snapshot for diffing.
+    const ITEMS_KEPT = 300;
+    function trimItems() {
+      if (items.size <= ITEMS_KEPT) return;
+      for (const [key, item] of items) { if (items.size <= ITEMS_KEPT * 0.8) break; if (item.finished) items.delete(key); }
+    }
     const token = value => encodeURIComponent(String(value));
     const identity = (item, scope) => 'codex:' + token(scope) + ':' + token(item.id);
     const content = (type, id, kind, text, final) => ({ type, id, messageId: id, kind, text, ...(final ? { final: true } : {}) });
@@ -43,7 +49,7 @@
         if (first) out.push(content('content.start', id, kind));
         if (text !== null && (first || text !== previous.text)) out.push(content('content.snapshot', id, kind, text, finished));
         if (phase === 'completed' && (!previous || !previous.finished)) out.push(content('content.end', id, kind));
-        items.set(id, { text: text === null ? previous?.text : text, finished });
+        items.set(id, { text: text === null ? previous?.text : text, finished }); trimItems();
         return out;
       }
       const detail = tool(item);
@@ -51,7 +57,7 @@
       if (first) out.push({ type: 'tool.start', id, name: detail.name, input: detail.input });
       else if (JSON.stringify(detail.input) !== JSON.stringify(previous.input)) out.push({ type: 'tool.input', id, name: detail.name, input: detail.input });
       if (phase === 'completed' && (!previous || !previous.finished)) out.push({ type: 'tool.result', id, name: detail.name, output: detail.output, isError: detail.isError });
-      items.set(id, { input: detail.input, finished });
+      items.set(id, { input: detail.input, finished }); trimItems();
       return out;
     }
     return {

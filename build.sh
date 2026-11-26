@@ -62,6 +62,7 @@ for RESOURCE_BUNDLE in .build/release/*.bundle; do
 done
 rsync -a --exclude 'dev/' "Resources/SkimRender/" "$APP/Contents/Resources/SkimRender/"
 rsync -a --exclude '*.test.mjs' "Resources/CodexSidecar/" "$APP/Contents/Resources/CodexSidecar/"
+rsync -a --exclude 'dev/' --exclude '*.test.mjs' "Resources/PiSidecar/" "$APP/Contents/Resources/PiSidecar/"
 
 # The Claude tab's sidecar (Node + the Claude Agent SDK). The SDK's own Claude
 # Code binaries are optional dependencies and are left out: the sidecar drives

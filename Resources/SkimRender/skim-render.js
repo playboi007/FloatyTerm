@@ -589,6 +589,8 @@
     } else if (text) marks = [{ at: 0, t: now }];
     el._marks = marks;
     wrapFresh(el, marks, now);
+    // Faded in, the words are plain text again: a long reply would otherwise keep a span per piece.
+    if (marks.length) setTimeout(() => { for (const span of el.querySelectorAll('.sk-fresh')) span.replaceWith(...span.childNodes); }, REVEAL_MS + 60);
   }
 
   function render(container, markdown, opts) {

@@ -111,26 +111,48 @@ actor CDPBridge {
     /// the active tab of the focused window). `pinnedTab` forces a specific
     /// tabId (from a prior reply in the same session); the returned tabId is what
     /// the extension actually drove.
+    /// `onDialog`: what the extension does when a JavaScript dialog opens on
+    /// the tab while this command runs — "accept" / "dismiss" (answered in the
+    /// extension's own session, reported back in the result) or nil = stop.
     func call(method: String, params: [String: Any], match: String?,
-              pinnedTab: Int? = nil) async throws -> (result: [String: Any], tabId: Int?) {
+              pinnedTab: Int? = nil, onDialog: String? = nil) async throws -> (result: [String: Any], tabId: Int?) {
         guard !peers.isEmpty else { throw BridgeError.notConnected }
         if method == "Floaty.listTabs", peers.count > 1 {
             return (await mergedTabs(), nil)
         }
         let target = try await route(match: match, pinnedTab: pinnedTab)
         var reply = try await send(to: target, method: method, params: params,
-                                   match: match, pinnedTab: pinnedTab)
+                                   match: match, pinnedTab: pinnedTab, onDialog: onDialog)
         if method == "Floaty.listTabs", let warning = fightWarning() { reply.result["warning"] = warning }
         return reply
     }
 
+    /// Fire one command and don't wait: its reply has no pending entry and is
+    /// dropped on arrival. Frames leave in call order, so a following `call`
+    /// still runs after it.
+    func post(method: String, params: [String: Any], match: String?, pinnedTab: Int?,
+              onDialog: String? = nil) async throws {
+        guard !peers.isEmpty else { throw BridgeError.notConnected }
+        let target = try await route(match: match, pinnedTab: pinnedTab)
+        guard let peer = peers[target] else { throw BridgeError.disconnected }
+        let rid = nextID; nextID += 1
+        var frame: [String: Any] = ["id": rid, "method": method, "params": params]
+        if let match, !match.isEmpty { frame["match"] = match }
+        if let pinnedTab { frame["tabId"] = pinnedTab }
+        if let onDialog { frame["onDialog"] = onDialog }
+        let data = (try? JSONSerialization.data(withJSONObject: frame)) ?? Data("{}".utf8)
+        peer.lastUsed = Date()
+        sendFrame(to: peer, opcode: 0x1, payload: data)
+    }
+
     private func send(to id: PeerID, method: String, params: [String: Any], match: String?,
-                      pinnedTab: Int?) async throws -> (result: [String: Any], tabId: Int?) {
+                      pinnedTab: Int?, onDialog: String? = nil) async throws -> (result: [String: Any], tabId: Int?) {
         guard let peer = peers[id] else { throw BridgeError.disconnected }
         let rid = nextID; nextID += 1
         var frame: [String: Any] = ["id": rid, "method": method, "params": params]
         if let match, !match.isEmpty { frame["match"] = match }
         if let pinnedTab { frame["tabId"] = pinnedTab }
+        if let onDialog { frame["onDialog"] = onDialog }
         let data = (try? JSONSerialization.data(withJSONObject: frame)) ?? Data("{}".utf8)
         peer.lastUsed = Date()
 

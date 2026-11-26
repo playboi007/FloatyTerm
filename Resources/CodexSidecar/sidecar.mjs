@@ -13,8 +13,13 @@ import { eventRoutes, safePayload } from './event-routes.mjs';
 const MAX_LINE_BYTES = 8 * 1024 * 1024;
 const STDERR_BYTES = 4000;
 const REQUEST_TIMEOUT_MS = 30_000;
+// A resumed thread's history, drawn at once in the tab: about the size Claude's tab draws (400
+// messages, output cut at 4000 characters). Each item is a row in the page, and rows cost memory.
 const HISTORY_TURN_LIMIT = 300;
-const HISTORY_ITEM_LIMIT = 5000;
+const HISTORY_ITEM_LIMIT = 1000;
+const HISTORY_OUTPUT_MAX = 4000;
+const clipOutput = s => typeof s === 'string' && s.length > HISTORY_OUTPUT_MAX
+  ? s.slice(0, HISTORY_OUTPUT_MAX) + `\n… (${s.length - HISTORY_OUTPUT_MAX} more characters)` : s;
 const SHELL_MAX = 1 << 20;
 
 const COMMANDS = [
@@ -900,7 +905,7 @@ class CodexBridge {
     if (item.type === 'reasoning') return content('thinking', Array.isArray(item.summary) ? item.summary.join('\n') : '');
     if (item.type === 'commandExecution') return [
       { type: 'tool.start', id, name: 'Bash', input: { command: item.command || '', cwd: item.cwd || '' } },
-      { type: 'tool.result', id, name: 'Bash', output: item.aggregatedOutput || '', isError: item.status === 'failed' || (item.exitCode != null && item.exitCode !== 0) },
+      { type: 'tool.result', id, name: 'Bash', output: clipOutput(item.aggregatedOutput || ''), isError: item.status === 'failed' || (item.exitCode != null && item.exitCode !== 0) },
     ];
     if (item.type === 'fileChange') return [
       { type: 'tool.start', id, name: 'File changes', input: { changes: item.changes || [] } },
@@ -908,18 +913,18 @@ class CodexBridge {
     ];
     if (item.type === 'mcpToolCall') return [
       { type: 'tool.start', id, name: `MCP: ${item.server || ''}/${item.tool || 'tool'}`, input: item.arguments || {} },
-      { type: 'tool.result', id, output: toText(item.result ?? item.error), isError: !!item.error || item.status === 'failed' },
+      { type: 'tool.result', id, output: clipOutput(toText(item.result ?? item.error)), isError: !!item.error || item.status === 'failed' },
     ];
     if (item.type === 'webSearch') return [
       { type: 'tool.start', id, name: 'Web search', input: { query: item.query || '' } },
-      { type: 'tool.result', id, output: toText(item.results || item.result), isError: false },
+      { type: 'tool.result', id, output: clipOutput(toText(item.results || item.result)), isError: false },
     ];
     if (item.type === 'userMessage') return [];
     const details = this.toolDetails(item, { output: '' });
     const route = eventRoutes[item.type];
     const result = details ? [
       { type: 'tool.start', id, name: details.name, input: details.input },
-      { type: 'tool.result', id, name: details.name, output: details.output || '', isError: !!details.isError },
+      { type: 'tool.result', id, name: details.name, output: clipOutput(details.output || ''), isError: !!details.isError },
     ] : [];
     if (route) result.push({ type: 'surface.snapshot', id: 'history:' + id, surface: route.surface, title: route.title, method: item.type,
       threadId, turnId, ownerId: details ? id : null, data: { item: safePayload(item) } });

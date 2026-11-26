@@ -27,6 +27,8 @@ final class SettingsWindowController: NSObject {
     private let retentionPopup = NSPopUpButton()
     private let capPopup = NSPopUpButton()
     private let appearancePopup = NSPopUpButton()
+    private let restPopup = NSPopUpButton()
+    private let unloadPopup = NSPopUpButton()
     private let usageStack = NSStackView()           // per-category usage rows
 
     // Hotkey recording state.
@@ -86,6 +88,28 @@ final class SettingsWindowController: NSObject {
         appearancePopup.action = #selector(appearanceChanged(_:))
         appearancePopup.widthAnchor.constraint(equalToConstant: 200).isActive = true
         stack.addArrangedSubview(row("Rich view colours", appearancePopup))
+
+        // Idle Claude and Codex tabs: stop the agent process after this long hidden (the session resumes on return)
+        for (title, minutes) in [("After 5 minutes", 5), ("After 15 minutes", 15), ("After 30 minutes", 30),
+                                 ("After 1 hour", 60), ("Never", 0)] {
+            restPopup.addItem(withTitle: title)
+            restPopup.lastItem?.tag = minutes
+        }
+        restPopup.target = self
+        restPopup.action = #selector(restChanged(_:))
+        restPopup.widthAnchor.constraint(equalToConstant: 200).isActive = true
+        stack.addArrangedSubview(row("Rest hidden agents", restPopup))
+
+        // Much longer hidden: unload the page as well (drawn again from history when shown)
+        for (title, minutes) in [("After 30 minutes", 30), ("After 1 hour", 60), ("After 2 hours", 120),
+                                 ("After 4 hours", 240), ("Never", 0)] {
+            unloadPopup.addItem(withTitle: title)
+            unloadPopup.lastItem?.tag = minutes
+        }
+        unloadPopup.target = self
+        unloadPopup.action = #selector(unloadChanged(_:))
+        unloadPopup.widthAnchor.constraint(equalToConstant: 200).isActive = true
+        stack.addArrangedSubview(row("Unload hidden pages", unloadPopup))
 
         // Background blur toggle
         blurCheckbox.target = self
@@ -314,6 +338,8 @@ final class SettingsWindowController: NSObject {
 
     private func syncControls() {
         _ = appearancePopup.selectItem(withTag: Settings.shared.rendererAppearance)
+        _ = restPopup.selectItem(withTag: Settings.shared.agentRestMinutes)
+        _ = unloadPopup.selectItem(withTag: Settings.shared.agentUnloadMinutes)
         fontValueLabel.stringValue = "\(Int(Settings.shared.fontSize)) pt"
         blurCheckbox.state = Settings.shared.backgroundBlur ? .on : .off
         focusedSlider.doubleValue = Settings.shared.focusedOpacity
@@ -438,6 +464,14 @@ final class SettingsWindowController: NSObject {
 
     @objc private func appearanceChanged(_ sender: NSPopUpButton) {
         Settings.shared.rendererAppearance = sender.selectedTag()
+    }
+
+    @objc private func restChanged(_ sender: NSPopUpButton) {
+        Settings.shared.agentRestMinutes = sender.selectedTag()
+    }
+
+    @objc private func unloadChanged(_ sender: NSPopUpButton) {
+        Settings.shared.agentUnloadMinutes = sender.selectedTag()
     }
 
     @objc private func retentionChanged(_ sender: NSPopUpButton) {

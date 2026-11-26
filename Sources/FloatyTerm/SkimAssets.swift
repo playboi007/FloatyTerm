@@ -54,7 +54,7 @@ enum SkimAssets {
     private static let chatCSS: String = read("chat.css") ?? ""
     private static let chatScript: String? = read("chat.js")
     private static let agentScripts: [String]? = {
-        let names = ["agent-events.js", "agent-claude.js", "agent-codex.js"]
+        let names = ["agent-events.js", "agent-claude.js", "agent-codex.js", "agent-pi.js"]
         let sources = names.compactMap(read)
         return sources.count == names.count ? sources : nil
     }()
@@ -145,8 +145,10 @@ enum SkimAssets {
 extension SkimAssets {
     /// Shared agent page (chat.js on renderer); AgentChat.boot after parse;
     /// events via AgentChat.receive.
-    static func chatDocument(cwd: String, intro: String? = nil, agent: String = "claude") -> String {
-        let cfg: [String: Any] = ["cwd": cwd, "home": NSHomeDirectory(), "intro": intro ?? "", "agent": agent, "voice": true]
+    /// `restore`: the page is built again after an unload (`sessionId`, `draft`); its history follows.
+    static func chatDocument(cwd: String, intro: String? = nil, agent: String = "claude", restore: [String: Any]? = nil) -> String {
+        var cfg: [String: Any] = ["cwd": cwd, "home": NSHomeDirectory(), "intro": intro ?? "", "agent": agent, "voice": true]
+        if let restore { cfg["restore"] = restore }
         let json = (try? JSONSerialization.data(withJSONObject: cfg)).flatMap { String(data: $0, encoding: .utf8) } ?? "{}"
         return """
         <!DOCTYPE html>
@@ -182,5 +184,16 @@ private final class SkimBridge: NSObject, WKScriptMessageHandlerWithReply {
         default:
             replyHandler(nil, "unknown message \(type)")
         }
+    }
+}
+
+extension WKWebView {
+    /// Ends the page now. A released web view's WebContent process otherwise stays alive, with all of
+    /// the page's memory (100+ MB for a long chat), for WebKit to reuse. `_close` is WebKit's own
+    /// teardown (SPI); without it the page goes when WebKit lets the process go.
+    func closePage() {
+        stopLoading()
+        let close = Selector(("_close"))
+        if responds(to: close) { perform(close) }
     }
 }

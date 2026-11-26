@@ -8,7 +8,8 @@ final class ClaudeChatController: NSObject, TabContent, WKNavigationDelegate {
     let cwd: String
     let agent: ChatAgent
     private let container = NSView()
-    private let webView: DropWebView
+    /// The page; nil while it is unloaded to save memory (the tab hidden a long time).
+    private var webView: DropWebView?
     private var appearanceToken: NSObjectProtocol?
 
     /// One conversation and its sidecar: "main", or a side chat ("side-1", …)
@@ -26,6 +27,10 @@ final class ClaudeChatController: NSObject, TabContent, WKNavigationDelegate {
         /// Thinking summaries on/off, once the user has chosen here; nil follows the settings.
         var thinking: Bool?
         var handedOff = false
+        /// The page says nothing lives in the agent's process now (no turn, task or scheduled work).
+        var mayRest = false
+        /// Its process was stopped to save memory while the tab was hidden; the session resumes on use.
+        var resting = false
         init(id: String, agent: ChatAgent) { self.id = id; sidecar = agent.runner() }
     }
     private var channels: [String: Channel] = [:]
@@ -36,6 +41,12 @@ final class ClaudeChatController: NSObject, TabContent, WKNavigationDelegate {
     private var realtime: (channel: Channel, audio: CodexRealtimeAudio)?
     private var dictation: Dictation?
     private var queued: [(channel: String, line: String)] = []
+    /// Stops idle agents once the tab has been hidden for Settings.agentRestMinutes.
+    private var restTimer: Timer?
+    /// Unloads the page once the tab has been hidden for Settings.agentUnloadMinutes.
+    private var unloadTimer: Timer?
+    /// The composer's text when the page was unloaded, put back when it is built again.
+    private var savedDraft = ""
 
     /// Live state, reported by the page for all conversations; drives the tab's attention dot.
     private(set) var isBusy = false
@@ -50,11 +61,18 @@ final class ClaudeChatController: NSObject, TabContent, WKNavigationDelegate {
         self.cwd = cwd
         self.agent = agent
         main = Channel(id: "main", agent: agent)
-        let config = WKWebViewConfiguration()
-        webView = DropWebView(frame: .zero, configuration: config)
         super.init()
-        webView.onDropFiles = { [weak self] urls in self?.dropFiles(urls) }
         channels[main.id] = main
+        mountPage()
+        start(main, resume: nil)
+    }
+
+    /// Builds the page in a new web view (its own WebContent process). `restore`: after an unload.
+    private func mountPage(restore: [String: Any]? = nil) {
+        let config = WKWebViewConfiguration()
+        let webView = DropWebView(frame: .zero, configuration: config)
+        self.webView = webView
+        webView.onDropFiles = { [weak self] urls in self?.dropFiles(urls) }
         SkimAssets.install(in: config, chat: true) { [weak self] action in self?.handle(action) }
         webView.navigationDelegate = self
         appearanceToken = SkimAssets.followAppearance(webView)
@@ -67,8 +85,23 @@ final class ClaudeChatController: NSObject, TabContent, WKNavigationDelegate {
             webView.leadingAnchor.constraint(equalTo: container.leadingAnchor),
             webView.trailingAnchor.constraint(equalTo: container.trailingAnchor)
         ])
-        webView.loadHTMLString(SkimAssets.chatDocument(cwd: cwd, agent: agent.rawValue), baseURL: URL(fileURLWithPath: cwd, isDirectory: true))
-        start(main, resume: nil)
+        webView.loadHTMLString(SkimAssets.chatDocument(cwd: cwd, agent: agent.rawValue, restore: restore),
+                               baseURL: URL(fileURLWithPath: cwd, isDirectory: true))
+    }
+
+    /// Takes the page down; releasing the web view ends its WebContent process.
+    private func unmountPage() {
+        if let appearanceToken { NotificationCenter.default.removeObserver(appearanceToken) }
+        appearanceToken = nil
+        guard let webView else { return }
+        webView.navigationDelegate = nil
+        webView.onDropFiles = nil
+        SkimAssets.uninstall(from: webView.configuration)
+        webView.closePage()
+        webView.removeFromSuperview()
+        self.webView = nil
+        pageReady = false
+        queued.removeAll()
     }
 
     static var isAvailable: Bool { SkimAssets.isChatAvailable }
@@ -80,11 +113,11 @@ final class ClaudeChatController: NSObject, TabContent, WKNavigationDelegate {
         let s = agent.runner()
         (s as? ClaudeSidecar)?.startExtras = extras
         s.onLines = { [weak self, weak s, weak ch] lines in
-            guard let self, let s, let ch, s === ch.sidecar else { return }
+            guard let self, let s, let ch, s === ch.sidecar, !ch.resting else { return }
             self.receive(lines, on: ch)
         }
         s.onExit = { [weak self, weak s, weak ch] status, stderr in
-            guard let self, let s, let ch, s === ch.sidecar, !ch.handedOff else { return }
+            guard let self, let s, let ch, s === ch.sidecar, !ch.handedOff, !ch.resting else { return }
             if self.realtime?.channel === ch { self.stopRealtime(send: false) }
             let detail = stderr.split(separator: "\n").suffix(3).joined(separator: " · ")
             self.hostNotice(ch.id, status == 0 ? "info" : "error",
@@ -96,11 +129,88 @@ final class ClaudeChatController: NSObject, TabContent, WKNavigationDelegate {
         } catch { hostNotice(ch.id, "error", String(describing: error)) }
     }
 
+    /// Starts the channel's sidecar again: its session resumed, or (none yet) a new or forked one.
+    private func restart(_ ch: Channel) {
+        if let sid = ch.sessionID { start(ch, resume: sid) }
+        else { start(ch, resume: ch.forkOf, fork: ch.forkOf != nil) }
+    }
+
+    // MARK: - Resting (memory)
+
+    // A hidden, idle tab keeps its page but stops the agent's process (Claude Code or Codex, a few
+    // hundred MB each); the session resumes when the tab is shown or the page asks for anything.
+
+    private func canRest(_ ch: Channel) -> Bool {
+        ch.mayRest && !ch.resting && !ch.handedOff && ch.sidecar.isRunning && realtime?.channel !== ch
+    }
+
+    private func scheduleRest() {
+        let minutes = Settings.shared.agentRestMinutes
+        guard !isCurrentlyViewed, restTimer == nil, minutes > 0, channels.values.contains(where: canRest) else { return }
+        restTimer = Timer.scheduledTimer(withTimeInterval: TimeInterval(minutes * 60), repeats: false) { [weak self] _ in
+            guard let self else { return }
+            self.restTimer = nil
+            guard !self.isCurrentlyViewed else { return }
+            for ch in self.channels.values where self.canRest(ch) {
+                ch.resting = true
+                ch.sidecar.stop()
+            }
+        }
+    }
+
+    private func wake(_ ch: Channel) {
+        guard ch.resting else { return }
+        ch.resting = false
+        restart(ch)
+    }
+
+    // A tab hidden much longer also unloads its page (its WebContent process, 100–200 MB), when only
+    // the main conversation is open and the page says nothing would be lost. Shown again, the page is
+    // built anew and draws the session's history, as /resume does.
+
+    private func scheduleUnload() {
+        let minutes = Settings.shared.agentUnloadMinutes
+        guard !isCurrentlyViewed, unloadTimer == nil, webView != nil, minutes > 0 else { return }
+        unloadTimer = Timer.scheduledTimer(withTimeInterval: TimeInterval(minutes * 60), repeats: false) { [weak self] _ in
+            self?.unloadTimer = nil
+            self?.unloadIfIdle()
+        }
+    }
+
+    private func unloadIfIdle() {
+        guard !isCurrentlyViewed, pageReady, let webView, channels.count == 1, !main.handedOff, realtime == nil,
+              main.mayRest || main.resting else { return }
+        webView.evaluateJavaScript("window.AgentChat && AgentChat.hibernation ? JSON.stringify(AgentChat.hibernation()) : 'null'") { [weak self] result, _ in
+            guard let self, !self.isCurrentlyViewed, self.webView === webView,
+                  let data = (result as? String)?.data(using: .utf8),
+                  let keep = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return }
+            if !self.main.resting, self.main.sidecar.isRunning {
+                self.main.resting = true
+                self.main.sidecar.stop()
+            }
+            self.savedDraft = keep["draft"] as? String ?? ""
+            self.unmountPage()
+        }
+    }
+
+    private func reloadPage() {
+        var restore: [String: Any] = ["draft": savedDraft]
+        if let sid = main.sessionID { restore["sessionId"] = sid }
+        savedDraft = ""
+        mountPage(restore: restore)
+        if main.resting { wake(main) } else if !main.sidecar.isRunning { restart(main) }
+        // Lines that come before the page is ready wait in `queued`.
+        if let sid = main.sessionID { main.sidecar.send(["type": "history", "sessionId": sid]) }
+    }
+
     private func receive(_ lines: [String], on ch: Channel) {
         // Every turn starts with init; /clear or fork init changes session ID.
         var pageLines: [String] = []
         for line in lines {
-            if let data = line.data(using: .utf8),
+            // Most lines are streaming deltas. Only these few kinds need to be read here, so the rest
+            // skip the JSON parse. The sidecars write compact JSON, so the markers match as plain text.
+            if Self.needsHostParse(line),
+               let data = line.data(using: .utf8),
                let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
                 if agent == .codex, obj["type"] as? String == "native.realtime" {
                     if let voice = realtime, voice.channel === ch, obj["requestId"] as? String == voice.audio.requestID {
@@ -164,11 +274,17 @@ final class ClaudeChatController: NSObject, TabContent, WKNavigationDelegate {
         ch.sidecar.send(["type": "hostToolResult", "requestId": requestID, "success": success, "text": text])
     }
 
+    private static let hostMarkers = ["native.", "host.tool.request", "\"session\"", "\"init\"", "thread.started"]
+    private static func needsHostParse(_ line: String) -> Bool { hostMarkers.contains { line.contains($0) } }
+
     /// Hands lines to the page, in order, once it has booted.
     private func deliver(_ lines: [String], to channel: String) {
         guard pageReady else { queued.append(contentsOf: lines.map { (channel, $0) }); return }
-        // Each line is one JSON object, so the joined list is a JS array literal.
-        webView.evaluateJavaScript("AgentChat.receive([\(lines.joined(separator: ","))], \"\(channel)\")", completionHandler: nil)
+        // Each line is one JSON object, so the joined list is a JSON array. It goes as a string for
+        // JSON.parse, not as script source: WebKit keeps compiled scripts, with every literal in them.
+        webView?.callAsyncJavaScript("AgentChat.receive(JSON.parse(batch), channel)",
+                                    arguments: ["batch": "[" + lines.joined(separator: ",") + "]", "channel": channel],
+                                    in: nil, in: .page, completionHandler: nil)
     }
 
     /// Session and message IDs from the page: UUIDs only.
@@ -196,14 +312,14 @@ final class ClaudeChatController: NSObject, TabContent, WKNavigationDelegate {
         guard id.allSatisfy({ $0.isLetter || $0.isNumber || $0 == "-" }) else { return }
         if type == "openSide" { openSide(id, action); return }
         guard let ch = channels[id] else { return }
+        if ch.resting && type != "state" { wake(ch) }
         switch type {
         case "send":
             guard let text = action["text"] as? String else { return }
             if ch.handedOff || !ch.sidecar.isRunning {
                 // Take the session back from the TUI (or restart a dead one).
                 ch.handedOff = false
-                if let sid = ch.sessionID { start(ch, resume: sid) }
-                else { start(ch, resume: ch.forkOf, fork: ch.forkOf != nil) }
+                restart(ch)
             }
             var m: [String: Any] = ["type": "user", "text": text]
             if let uuid = action["uuid"] as? String, Self.isID(uuid) { m["uuid"] = uuid }
@@ -242,6 +358,10 @@ final class ClaudeChatController: NSObject, TabContent, WKNavigationDelegate {
         case "stopTask":
             guard let task = action["taskId"] as? String, !task.isEmpty else { return }
             ch.sidecar.send(["type": "stopTask", "taskId": task])
+        case "allowRules":
+            // A blocked subagent call the user allowed: a session-only allow rule.
+            guard let rules = action["rules"] as? [String], !rules.isEmpty else { return }
+            ch.sidecar.send(["type": "allowRules", "rules": Array(rules.prefix(8))])
         case "shell", "shellKill":
             // A ! command: the conversation's own sidecar runs it in the session folder, else any running one.
             guard let sid = action["id"] as? String else { return }
@@ -386,6 +506,13 @@ final class ClaudeChatController: NSObject, TabContent, WKNavigationDelegate {
         case "state":
             isBusy = action["busy"] as? Bool ?? false
             awaitingApproval = action["waiting"] as? Bool ?? false
+            let rest = Set(action["rest"] as? [String] ?? [])
+            for ch in channels.values { ch.mayRest = rest.contains(ch.id) }
+            // Counted from the last change: an agent rests after it has been idle and hidden that long.
+            restTimer?.invalidate(); restTimer = nil
+            scheduleRest()
+            unloadTimer?.invalidate(); unloadTimer = nil
+            scheduleUnload()
             onTitleChanged?()
         default:
             break
@@ -467,7 +594,7 @@ final class ClaudeChatController: NSObject, TabContent, WKNavigationDelegate {
         }
         guard pageReady, let json = try? JSONSerialization.data(withJSONObject: obj),
               let arg = String(data: json, encoding: .utf8) else { return }
-        webView.evaluateJavaScript("window.AgentChat && AgentChat.voice && AgentChat.voice(\(arg))", completionHandler: nil)
+        webView?.evaluateJavaScript("window.AgentChat && AgentChat.voice && AgentChat.voice(\(arg))", completionHandler: nil)
     }
 
     // MARK: - Dropped files
@@ -494,7 +621,7 @@ final class ClaudeChatController: NSObject, TabContent, WKNavigationDelegate {
         }
         guard let json = try? JSONSerialization.data(withJSONObject: items),
               let list = String(data: json, encoding: .utf8) else { return }
-        webView.evaluateJavaScript("window.AgentChat && AgentChat.dropFiles && AgentChat.dropFiles(\(list))", completionHandler: nil)
+        webView?.evaluateJavaScript("window.AgentChat && AgentChat.dropFiles && AgentChat.dropFiles(\(list))", completionHandler: nil)
     }
 
     // MARK: - WKNavigationDelegate
@@ -529,7 +656,20 @@ final class ClaudeChatController: NSObject, TabContent, WKNavigationDelegate {
 
     var hasUnseenOutput = false
     var isCurrentlyViewed: Bool = false {
-        didSet { if isCurrentlyViewed { hasUnseenOutput = false } else { stopRealtime() } }
+        didSet {
+            if isCurrentlyViewed {
+                hasUnseenOutput = false
+                restTimer?.invalidate(); restTimer = nil
+                unloadTimer?.invalidate(); unloadTimer = nil
+                if webView == nil { reloadPage() }
+                // Back in view: resume now, so the agent is ready by the time you type.
+                for ch in channels.values where ch.resting { wake(ch) }
+            } else {
+                stopRealtime()
+                scheduleRest()
+                scheduleUnload()
+            }
+        }
     }
 
     var onTitleChanged: (() -> Void)?
@@ -538,21 +678,21 @@ final class ClaudeChatController: NSObject, TabContent, WKNavigationDelegate {
     var restorableRecord: TabRecord? { nil }
 
     func focus(in panel: NSWindow) {
+        guard let webView else { return }
         panel.makeFirstResponder(webView)
         webView.evaluateJavaScript("window.AgentChat && AgentChat.focus()", completionHandler: nil)
     }
 
     func cleanup() {
-        if let appearanceToken { NotificationCenter.default.removeObserver(appearanceToken) }
+        restTimer?.invalidate(); restTimer = nil
+        unloadTimer?.invalidate(); unloadTimer = nil
         stopRealtime()
         dictation?.cancel()
         for ch in channels.values {
             ch.sidecar.onExit = nil
             ch.sidecar.stop()
         }
-        webView.stopLoading()
-        webView.navigationDelegate = nil
-        SkimAssets.uninstall(from: webView.configuration)
+        unmountPage()
     }
 }
 

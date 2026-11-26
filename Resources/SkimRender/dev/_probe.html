@@ -1,0 +1,13 @@
+<!doctype html><html><head><meta charset="utf-8">
+<link rel="stylesheet" href="../fonts.css"><link rel="stylesheet" href="../skim.css"><link rel="stylesheet" href="../chat.css">
+<script src="../vendor/marked.min.js"></script><script src="../vendor/purify.min.js"></script><script src="../vendor/highlight.min.js"></script>
+<script src="../skim-classify.js"></script><script src="../skim-render.js"></script>
+<script src="../agent-events.js"></script><script src="../agent-claude.js"></script><script src="../agent-codex.js"></script><script src="../agent-pi.js"></script>
+<script src="../chat.js"></script></head><body><script>
+window.__errors = window.__errors || [];
+try {
+  AgentChat.boot({ agent: 'pi', cwd: '/tmp', home: '/tmp' });
+  window.__errors.push('boot ok, agent=' + (window.AgentEvents ? 'events loaded' : 'no events'));
+} catch (e) { window.__errors.push('BOOT THREW: ' + e.message + ' | ' + (e.stack||'').split('\n').slice(0,3).join(' ~ ')); }
+window.__testResults = { passed: 0, failed: 0 };
+</script></body></html>

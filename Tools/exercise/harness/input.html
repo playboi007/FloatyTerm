@@ -1,0 +1,30 @@
+<!doctype html><html><head><title>fltest</title><style>
+body{margin:0;font:12px sans-serif}
+#kb{position:absolute;left:20px;top:20px;width:300px;height:120px}
+.w{position:absolute;top:0;width:40px;height:120px;border:1px solid #000;box-sizing:border-box;background:#fff}
+.b{position:absolute;top:0;width:24px;height:70px;background:#000;z-index:2}
+#ta{position:absolute;left:20px;top:160px;width:200px;height:40px}
+#sc{position:absolute;left:20px;top:220px;width:200px;height:80px;overflow:auto}
+#drag{position:absolute;left:260px;top:220px;width:30px;height:30px;background:red}
+</style></head><body>
+<div id="kb">
+ <div class="w" data-midi="60" style="left:0"></div><div class="w" data-midi="62" style="left:40px"></div>
+ <div class="w" data-midi="64" style="left:80px"></div>
+ <div class="b" data-midi="61" style="left:28px"></div><div class="b" data-midi="63" style="left:68px"></div>
+</div>
+<textarea id="ta"></textarea>
+<div id="sc"><div style="height:1000px">scroll me</div></div>
+<div id="drag"></div>
+<script>
+window.__log=[];
+function L(e,extra){window.__log.push(Object.assign({type:e.type,tr:e.isTrusted,t:performance.now(),
+  midi:(e.target.dataset&&e.target.dataset.midi)||null,id:e.target.id||null},extra||{}));}
+['pointerdown','pointerup','dblclick','contextmenu','mouseover'].forEach(function(t){document.addEventListener(t,function(e){L(e,{b:e.button,d:e.detail,sh:e.shiftKey})},true)});
+['keydown','keyup'].forEach(function(t){window.addEventListener(t,function(e){L(e,{key:e.key,code:e.code,rep:e.repeat})},true)});
+document.getElementById('ta').addEventListener('input',function(e){L(e,{v:e.target.value})});
+document.getElementById('sc').addEventListener('scroll',function(e){L(e,{top:e.target.scrollTop})});
+var d=document.getElementById('drag'),dragging=false;
+d.addEventListener('pointerdown',function(e){dragging=true;d.setPointerCapture(e.pointerId)});
+d.addEventListener('pointermove',function(e){if(dragging){d.style.left=(e.clientX-15)+'px';d.style.top=(e.clientY-15)+'px'}});
+d.addEventListener('pointerup',function(e){dragging=false;L(e,{x:d.style.left,y:d.style.top})});
+</script></body></html>

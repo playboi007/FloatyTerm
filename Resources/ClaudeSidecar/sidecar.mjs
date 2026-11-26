@@ -91,6 +91,8 @@ let session = null;
 let sessionId = null;   // from the latest init (/clear starts a new one)
 let mode = 'default';
 let cwd = process.cwd();   // the last mode Claude Code confirmed, to fall back to when a change fails
+// Allow rules the user granted from a blocked-call card: this session only (the flag-settings layer, never a settings file).
+const sessionAllow = [];
 
 async function canUseTool(toolName, input, opts) {
   const id = opts.requestId || opts.toolUseID;
@@ -428,6 +430,19 @@ rl.on('line', line => {
       case 'stopTask':
         if (session && m.taskId) session.stopTask(String(m.taskId)).catch(e => send({ type: 'error', message: 'Stop: ' + e.message }));
         break;
+      case 'allowRules': {
+        const rules = (Array.isArray(m.rules) ? m.rules : []).filter(r => typeof r === 'string' && r && r.length <= 400 && !sessionAllow.includes(r));
+        if (!session || !rules.length) break;
+        sessionAllow.push(...rules);
+        // The whole list each time: the flag layer is replaced, not appended to.
+        session.applyFlagSettings({ permissions: { allow: [...sessionAllow] } }).then(
+          () => send({ type: 'host', kind: 'info', message: 'Allowed for this session: ' + rules.join(', ') }),
+          e => {
+            for (const r of rules) sessionAllow.splice(sessionAllow.indexOf(r), 1);
+            send({ type: 'host', kind: 'warn', message: 'Could not add the allow rule: ' + e.message });
+          });
+        break;
+      }
       case 'shell': runShell(m); break;
       case 'shellKill': killShell(m.id); break;
       case 'promptHistory': send(promptHistory()); break;

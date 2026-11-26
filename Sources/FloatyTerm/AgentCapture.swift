@@ -158,6 +158,8 @@ enum AgentCapture {
         let name: String
         let rect: CGRect
         let center: CGPoint
+        /// The element's ref (ax_N / ref_N) — stable across reads, see ElementRefs.
+        var ref: String = ""
     }
 
     /// One set-of-mark pass, kept so `click-mark` can resolve an id and refuse
@@ -593,6 +595,8 @@ enum AgentAX {
         let name: String
         let rect: CGRect
         let center: CGPoint
+        /// `ax_N` — names this element in later calls (`query-ax --ref`).
+        var ref: String = ""
     }
 
     /// Resolve a target to a single pid: an explicit `pid` wins; else match
@@ -620,7 +624,54 @@ enum AgentAX {
     /// match caps and a per-call messaging timeout so a huge tree can't hang.
     static func query(app: String?, pid: pid_t?, role: String?, title: String?,
                       max: Int = 100, press: Bool = false) async throws -> (matches: [AXMatch], pressed: AXMatch?) {
+        let r = try await queryAct(app: app, pid: pid, role: role, title: title, max: max,
+                                   act: press ? .press : nil)
+        return (r.matches, r.acted)
+    }
+
+    /// What to do to the FIRST match. `.press` keeps query-ax's historic
+    /// target rule (the element if it's a control, else its nearest pressable
+    /// ancestor); the others act on the matched element itself. All of them
+    /// are element-addressed — no pointer, no keyboard focus of the human's
+    /// app, no activation — which is what makes them background-safe.
+    enum ElementAct {
+        case press
+        case focus                  // AXFocused = true: the app's own focus moves, the app stays inactive
+        case setValue(String)       // AXValue write (plain HTML inputs; Flutter ignores it — press + type there)
+        case scrollTo               // AXScrollToVisible
+        case action(String)         // any advertised action, e.g. AXShowMenu, AXIncrement, AXConfirm
+
+        var label: String {
+            switch self {
+            case .press: return "press"
+            case .focus: return "focus"
+            case .setValue: return "set-value"
+            case .scrollTo: return "scroll-to"
+            case .action(let n): return n
+            }
+        }
+    }
+
+    struct QueryResult {
+        let matches: [AXMatch]
+        let acted: AXMatch?
+        /// The element acted on (for a follow-up re-read, e.g. set-value's value).
+        let element: AXUIElement?
+        /// The AX call's own result; nil when nothing was acted on.
+        let axResult: ApplicationServices.AXError?
+    }
+
+    /// `root` limits the walk to one window — background mode passes the
+    /// agent's window so a match in the human's own window of the same app is
+    /// never acted on.
+    /// `all`: every NAMED element, not only controls (with no role/title filter).
+    static func queryAct(app: String?, pid: pid_t?, role: String?, title: String?,
+                         max: Int = 100, act: ElementAct?, root: AXUIElement? = nil,
+                         all: Bool = false) async throws -> QueryResult {
         guard AXIsProcessTrusted() else { throw AXError.notTrusted }
+        let press = act != nil
+        var pressOnly = false
+        if case .press = act { pressOnly = true }
         let appPID = try resolvePID(app: app, pid: pid)
         let appEl = AXUIElementCreateApplication(appPID)
         // Don't let a busy/hung app block the main thread indefinitely.
@@ -672,13 +723,16 @@ enum AgentAX {
 
                 var isHit: Bool
                 if let wantRole { isHit = (r == wantRole) }
-                else if wantTitle == nil { isHit = interactable.contains(r) }   // default: interactables
+                else if wantTitle == nil {                                       // default: interactables
+                    isHit = interactable.contains(r) || (all && !name(of: el).isEmpty)
+                }
                 else { isHit = true }                                           // title-only → any role
                 if isHit, let wantTitle { isHit = name(of: el).lowercased().contains(wantTitle) }
 
                 if isHit, let rect = rectOf(el), rect.width > 0, rect.height > 0 {
                     let m = AXMatch(role: r, name: name(of: el), rect: rect,
-                                    center: CGPoint(x: rect.midX, y: rect.midY))
+                                    center: CGPoint(x: rect.midX, y: rect.midY),
+                                    ref: AXRefs.ref(for: el, pid: appPID))
                     if out.count < max { out.append(m) }
                     // Resolve the press target for the FIRST match. A `--title` filter
                     // usually lands on the visible LABEL (an AXStaticText), whose
@@ -687,14 +741,15 @@ enum AgentAX {
                     // ancestor that actually supports AXPress. (Previously a label-only
                     // match set no target → "press-fail" even though a click here works.)
                     if press && pressMatch == nil {
-                        if wantRole != nil || interactable.contains(r) {
+                        if !pressOnly || wantRole != nil || interactable.contains(r) {
                             pressTarget = el; pressMatch = m
                         } else if let p = nearestPressable(el) {
                             let prect = rectOf(p) ?? rect
                             pressTarget = p
                             pressMatch = AXMatch(role: copyString(p, kAXRoleAttribute as CFString) ?? r,
                                                  name: name(of: p), rect: prect,
-                                                 center: CGPoint(x: prect.midX, y: prect.midY))
+                                                 center: CGPoint(x: prect.midX, y: prect.midY),
+                                                 ref: AXRefs.ref(for: p, pid: appPID))
                         }
                     }
                 }
@@ -706,7 +761,7 @@ enum AgentAX {
                     }
                 }
             }
-            walk(appEl)
+            walk(root ?? appEl)
             return (out, pressTarget, pressMatch, toggle)
         }
 
@@ -759,10 +814,44 @@ enum AgentAX {
             if !m.name.isEmpty && liveName != m.name {
                 throw AXError.stalePress(was: m.name, now: liveName)
             }
-            AXUIElementPerformAction(t, kAXPressAction as CFString)
-            return (result.matches, m)
+            let code: ApplicationServices.AXError
+            switch act! {
+            case .press:
+                code = AXUIElementPerformAction(t, kAXPressAction as CFString)
+            case .focus:
+                code = AXUIElementSetAttributeValue(t, kAXFocusedAttribute as CFString, kCFBooleanTrue)
+            case .setValue(let text):
+                code = AXUIElementSetAttributeValue(t, kAXValueAttribute as CFString, text as CFString)
+            case .scrollTo:
+                code = AXUIElementPerformAction(t, "AXScrollToVisible" as CFString)
+            case .action(let n):
+                code = AXUIElementPerformAction(t, n as CFString)
+            }
+            return QueryResult(matches: result.matches, acted: m, element: t, axResult: code)
         }
-        return (result.matches, nil)
+        return QueryResult(matches: result.matches, acted: nil, element: nil, axResult: nil)
+    }
+
+    /// Act on ONE element, named by its ref — no tree walk, no title match. The
+    /// element was resolved when the ref was issued; `AXRefs.lookup` has
+    /// already refused a stale one.
+    static func act(_ act: ElementAct, on el: AXUIElement) -> (match: AXMatch, code: ApplicationServices.AXError) {
+        let role = copyString(el, kAXRoleAttribute as CFString) ?? ""
+        var name = ""
+        for attr in [kAXTitleAttribute, kAXDescriptionAttribute, kAXValueAttribute, "AXHelp"] {
+            if let s = copyString(el, attr as CFString), !s.isEmpty { name = String(s.prefix(120)); break }
+        }
+        let rect = rectOf(el) ?? .zero
+        let m = AXMatch(role: role, name: name, rect: rect, center: CGPoint(x: rect.midX, y: rect.midY))
+        let code: ApplicationServices.AXError
+        switch act {
+        case .press: code = AXUIElementPerformAction(el, kAXPressAction as CFString)
+        case .focus: code = AXUIElementSetAttributeValue(el, kAXFocusedAttribute as CFString, kCFBooleanTrue)
+        case .setValue(let text): code = AXUIElementSetAttributeValue(el, kAXValueAttribute as CFString, text as CFString)
+        case .scrollTo: code = AXUIElementPerformAction(el, "AXScrollToVisible" as CFString)
+        case .action(let n): code = AXUIElementPerformAction(el, n as CFString)
+        }
+        return (m, code)
     }
 
     /// What the agent needs to answer "is there a text cursor here before I
@@ -773,6 +862,9 @@ enum AgentAX {
         let name: String
         let value: String
         let editable: Bool      // a text-entry role → typing will land
+        /// Title of the window holding the focused element — the app's KEY
+        /// window, which is where pid-posted (background) keystrokes go.
+        var window: String = ""
     }
 
     /// Read the target app's focused UI element (AXFocusedUIElement). Pairs with
@@ -797,7 +889,30 @@ enum AgentAX {
         }
         let value = String((copyString(el, kAXValueAttribute as CFString) ?? "").prefix(300))
         let editable = ["AXTextField", "AXTextArea", "AXComboBox", "AXSearchField"].contains(role)
-        return FocusedInfo(hasFocus: true, role: role, name: name, value: value, editable: editable)
+        let window = windowOf(el).flatMap { copyString($0, kAXTitleAttribute as CFString) } ?? ""
+        return FocusedInfo(hasFocus: true, role: role, name: name, value: value, editable: editable,
+                           window: window)
+    }
+
+    /// The AXWindow that contains `el` (its AXWindow attribute, else the first
+    /// AXWindow ancestor).
+    static func windowOf(_ el: AXUIElement) -> AXUIElement? {
+        var v: CFTypeRef?
+        if AXUIElementCopyAttributeValue(el, kAXWindowAttribute as CFString, &v) == .success,
+           let v, CFGetTypeID(v) == AXUIElementGetTypeID() {
+            return (v as! AXUIElement)
+        }
+        var cur: AXUIElement? = el
+        var hops = 0
+        while let c = cur, hops < 40 {
+            if copyString(c, kAXRoleAttribute as CFString) == kAXWindowRole as String { return c }
+            var p: CFTypeRef?
+            guard AXUIElementCopyAttributeValue(c, kAXParentAttribute as CFString, &p) == .success,
+                  let p, CFGetTypeID(p) == AXUIElementGetTypeID() else { return nil }
+            cur = (p as! AXUIElement)
+            hops += 1
+        }
+        return nil
     }
 
     struct SetTextResult: Sendable {
@@ -1045,7 +1160,7 @@ enum AgentAX {
     }
 
     /// Actions an element advertises (e.g. AXPress, AXShowMenu).
-    private static func actionNames(_ el: AXUIElement) -> [String] {
+    static func actionNames(_ el: AXUIElement) -> [String] {
         var names: CFArray?
         guard AXUIElementCopyActionNames(el, &names) == .success, let arr = names as? [String] else { return [] }
         return arr
@@ -1056,7 +1171,7 @@ enum AgentAX {
     /// container (row / option / button) when a `--title` filter matched only the
     /// static-text label inside it. Role-agnostic: it asks the element what it can
     /// do rather than guessing from its role, so custom/Electron widgets work too.
-    private static func nearestPressable(_ el: AXUIElement, maxHops: Int = 6) -> AXUIElement? {
+    static func nearestPressable(_ el: AXUIElement, maxHops: Int = 6) -> AXUIElement? {
         var cur: AXUIElement? = el
         var hops = 0
         while let c = cur, hops <= maxHops {
@@ -1080,7 +1195,7 @@ enum AgentAX {
     /// AXManualAccessibility nudge we do for Chromium. Cheap because a collapsed
     /// tree is tiny. Returns true if it pressed one (caller waits + re-sweeps).
     @discardableResult
-    private static func enableEngineSemanticsIfNeeded(_ appEl: AXUIElement) -> Bool {
+    static func enableEngineSemanticsIfNeeded(_ appEl: AXUIElement) -> Bool {
         var visited = 0
         let cap = 1500   // the placeholder is shallow; bound cost on already-rich trees
         var hit: AXUIElement?
@@ -1116,7 +1231,7 @@ enum AgentAX {
         return r?.onScreen ?? false
     }
 
-    private static func mainWindow(of appEl: AXUIElement) -> AXUIElement? {
+    static func mainWindow(of appEl: AXUIElement) -> AXUIElement? {
         var v: CFTypeRef?
         if AXUIElementCopyAttributeValue(appEl, kAXMainWindowAttribute as CFString, &v) == .success,
            let v, CFGetTypeID(v) == AXUIElementGetTypeID() {
@@ -1127,20 +1242,20 @@ enum AgentAX {
 
     // MARK: - AX attribute readers
 
-    private static func copyAXArray(_ el: AXUIElement, _ attr: CFString) -> [AXUIElement]? {
+    static func copyAXArray(_ el: AXUIElement, _ attr: CFString) -> [AXUIElement]? {
         var v: CFTypeRef?
         guard AXUIElementCopyAttributeValue(el, attr, &v) == .success else { return nil }
         return v as? [AXUIElement]
     }
 
-    private static func rectOf(_ el: AXUIElement) -> CGRect? {
+    static func rectOf(_ el: AXUIElement) -> CGRect? {
         guard let p = copyPoint(el, kAXPositionAttribute as CFString),
               let s = copySize(el, kAXSizeAttribute as CFString)
         else { return nil }
         return CGRect(origin: p, size: s)
     }
 
-    private static func copyString(_ el: AXUIElement, _ attr: CFString) -> String? {
+    static func copyString(_ el: AXUIElement, _ attr: CFString) -> String? {
         var v: CFTypeRef?
         guard AXUIElementCopyAttributeValue(el, attr, &v) == .success else { return nil }
         if let s = v as? String { return s }
@@ -1165,7 +1280,7 @@ enum AgentAX {
         return AXValueGetValue(v, .cgSize, &s) ? s : nil
     }
 
-    private static func copyChildren(_ el: AXUIElement) -> [AXUIElement]? {
+    static func copyChildren(_ el: AXUIElement) -> [AXUIElement]? {
         var v: CFTypeRef?
         guard AXUIElementCopyAttributeValue(el, kAXChildrenAttribute as CFString, &v) == .success
         else { return nil }

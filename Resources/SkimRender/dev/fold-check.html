@@ -1,0 +1,58 @@
+<!doctype html>
+<html lang="en"><head>
+<meta charset="utf-8">
+<title>fold check</title>
+<link rel="stylesheet" href="../fonts.css">
+<link rel="stylesheet" href="../skim.css">
+<link rel="stylesheet" href="../chat.css">
+<script src="../vendor/marked.min.js"></script>
+<script src="../vendor/purify.min.js"></script>
+<script src="../vendor/highlight.min.js"></script>
+<script src="../skim-classify.js"></script>
+<script src="../skim-render.js"></script>
+<script src="../agent-events.js"></script>
+<script src="../agent-claude.js"></script>
+<script src="../agent-codex.js"></script>
+<script src="../agent-pi.js"></script>
+<script src="../chat.js"></script>
+</head><body>
+<script>
+  // Old turns fold into one line, and open again as a static copy.
+  window.__pending = true;
+  document.documentElement.classList.add('no-motion');
+  window.webkit = { messageHandlers: { skim: { postMessage: () => Promise.resolve() } } };
+  AgentChat.boot({ agent: 'codex', cwd: '/Users/demo/project', home: '/Users/demo' });
+  const ev = (type, f = {}) => ({ v: 1, agent: 'codex', t: Date.now(), type, ...f });
+  const $$ = s => [...document.querySelectorAll(s)];
+  const frame = () => new Promise(r => setTimeout(r, 5));
+  window.__errors = [];
+  let pass = 0, fail = 0;
+  const check = (name, ok, got) => { if (ok) pass++; else { fail++; window.__errors.push('FAIL ' + name + (got !== undefined ? ' got: ' + JSON.stringify(got) : '')); } };
+  (async () => { try {
+    const TURNS = 30;
+    for (let i = 0; i < TURNS; i++) {
+      AgentChat.receive([
+        ev('session', { sessionId: 's1' }),
+        ev('turn.start', { threadId: 's1', turnId: 't' + i }),
+        ev('content.snapshot', { id: 'c' + i, messageId: 'c' + i, kind: 'text', text: 'Reply number ' + i, final: true }),
+        ev('tool.start', { id: 'tool' + i, name: 'Bash', input: { command: 'echo ' + i } }),
+        ev('tool.result', { id: 'tool' + i, name: 'Bash', output: 'out ' + i, isError: false }),
+        ev('turn.end', { threadId: 's1', turnId: 't' + i, status: 'success' }),
+      ]);
+      await frame();
+    }
+    const folded = $$('.ck-folded');
+    check('old turns fold', folded.length === TURNS - 12, folded.length);
+    check('the newest turns stay drawn', document.querySelector('.ck-log').textContent.includes('Reply number 29') && document.querySelectorAll('.ck-row').length === 12, document.querySelectorAll('.ck-row').length);
+    check('the placeholder names the tool calls', /1 tool call/.test(folded[0].textContent), folded[0].textContent);
+    folded[0].click();
+    await new Promise(r => setTimeout(r, 300));
+    check('a folded turn draws again', document.querySelector('.ck-log').textContent.includes('Reply number 0'), $$('.ck-folded').length);
+    const row = document.querySelector('.ck-row');
+    const detail = row.nextElementSibling;
+    const was = detail.hidden; row.click();
+    check('a drawn-again row still opens', detail.hidden !== was);
+    window.__testResults = { passed: pass, failed: fail };
+  } catch (error) { window.__errors.push('FAIL threw: ' + error.message + ' ' + (error.stack || '').split('\n')[1]); }
+  document.body.innerHTML = '<pre id=out>' + pass + ' pass, ' + fail + ' fail\n' + window.__errors.join('\n').replace(/</g, '&lt;') + '</pre>'; })();
+</script></body></html>

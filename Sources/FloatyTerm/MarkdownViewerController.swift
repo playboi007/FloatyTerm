@@ -272,9 +272,9 @@ final class MarkdownViewerController: NSObject, TabContent, NSTextViewDelegate {
         if let appearanceToken { NotificationCenter.default.removeObserver(appearanceToken) }
         writeToDisk()                 // flush unsaved edits so nothing is lost
         textView.delegate = nil
-        webView.stopLoading()
         webView.navigationDelegate = nil
         SkimAssets.uninstall(from: webView.configuration)
+        webView.closePage()   // its WebContent process ends now, not when WebKit lets it go
         editorScroll.documentView = nil
     }
 

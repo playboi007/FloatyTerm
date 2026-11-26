@@ -30,7 +30,13 @@
   const CODEX_FEATURES = { approvals: true, fork: true, history: true, models: true, effort: true,
     permissionMode: true, thinking: true, usage: true, git: true, tui: true, slashCommands: true, midTurnInput: true,
     mentions: true, images: true, rename: true, shell: true };
+  // pi has no permission modes and no account-plan API; extension dialogs still arrive as approval requests.
+  const PI_FEATURES = { approvals: true, fork: true, history: true, models: true, effort: true,
+    thinking: true, usage: true, git: true, tui: true, slashCommands: true, midTurnInput: true,
+    images: true, rename: true, shell: true };
+  const AGENT_FEATURES = { claude: CLAUDE_FEATURES, codex: CODEX_FEATURES, pi: PI_FEATURES };
   let agent = 'claude';
+  const agentName = () => ({ codex: 'Codex', pi: 'pi' }[agent] || 'Claude');
   let features = { ...CLAUDE_FEATURES };
   const supports = name => !!features[name];
   const SHARED = {
@@ -55,7 +61,7 @@
       normalizer: root.AgentEvents.createNormalizer(agent), eventState: root.AgentEvents.createState(),
       model: '', mode: 'default', sessionId: null, cost: 0,
       busy: false, turn: null, turns: [],
-      eventChildren: new Map(), surfaceViews: new Map(), mediaViews: new Map(), surfaceRoot: null, protocolStatus: null, buffering: false, connectionClosed: false,
+      eventChildren: new Map(), surfaceViews: new Map(), mediaViews: new Map(), blobs: [], surfaceRoot: null, protocolStatus: null, buffering: false, connectionClosed: false,
       turnViews: new Map(),   // thread + turn identity → owning DOM turn (including completed turns)
       rows: new Map(),        // tool_use id → row
       texts: new Map(),       // `${messageId}:${index}` → text item
@@ -362,11 +368,23 @@
 
   function paintText(item, streaming) {
     cancelAnimationFrame(item.raf);
-    item.raf = 0;
+    clearTimeout(item.wait);
+    item.raf = 0; item.wait = 0;
+    item.paintedAt = performance.now();
     root.SkimRender.render(item.el, item.text, { streaming, interactive: true, reveal: item.reveal && motionOn(), onAction: a => { if (a.type === 'reply') sendUser(a.text); } });
     stick();
   }
-  const schedulePaint = item => { if (!item.raf) item.raf = requestAnimationFrame(() => paintText(item, true)); };
+  /**
+   * Each paint parses the whole reply again, so a long reply paints less often: every frame up to
+   * 4000 characters, then at most every 100–250 ms. Fewer full parses, far less garbage while it streams.
+   */
+  const paintGap = length => length < 4000 ? 0 : Math.min(250, length / 80);
+  const schedulePaint = item => {
+    if (item.raf || item.wait) return;
+    const due = paintGap(item.text.length) - (performance.now() - (item.paintedAt || 0));
+    if (due <= 0) item.raf = requestAnimationFrame(() => paintText(item, true));
+    else item.wait = setTimeout(() => { item.wait = 0; item.raf = requestAnimationFrame(() => paintText(item, true)); }, due);
+  };
 
   // ── thinking: a folded line while Claude thinks, the summary on request ──
 
@@ -958,15 +976,106 @@
     return b;
   };
 
+  /** The Agent row a request or a denial came from: its agentID is the agent's task ID; else the agent whose steps hold the call. */
+  function agentRowOfReq(req) {
+    const top = S.root || S;
+    const t = req.agentID && top.agentTasks.get(req.agentID);
+    if (t && t.toolId) { const r = rowAnywhere(t.toolId, top); if (r) return r; }
+    if (req.toolUseID) for (const [toolId, sub] of top.subs) if (sub.rows.has(req.toolUseID)) return rowAnywhere(toolId, top);
+    return null;
+  }
+  /** Who asks: the agent's avatar and type, on its card. */
+  const agentTag = a => h('span', { class: 'ck-card-agent', title: a.desc }, agentAvatar(a.type, 'waiting', true), h('span', { text: a.type }));
+
+  /** The narrowest allow rule for one blocked call, or null when there is no safe one to offer. */
+  function ruleFor(tool, input) {
+    if (!tool || !input) return null;
+    if (tool === 'Bash') { const c = String(input.command || '').trim(); return c && !c.includes('\n') && c.length <= 300 ? `Bash(${c})` : null; }
+    if (tool === 'WebFetch') { try { return `WebFetch(domain:${new URL(input.url).hostname})`; } catch { return null; } }
+    if (tool === 'WebSearch') return 'WebSearch';
+    if (['Read', 'Edit', 'Write', 'NotebookEdit'].includes(tool)) {
+      const p = String(input.file_path || input.notebook_path || '');
+      return p.startsWith('/') ? `${tool}(/${p})` : null;   // "//" marks an absolute path in a rule
+    }
+    if (tool.startsWith('mcp__')) return tool;
+    return null;
+  }
+  const BLOCK_WHY = {
+    asyncAgent: 'A background agent cannot ask for permission, so Claude Code declined the call.',
+    classifier: 'Auto mode’s safety check declined it.', rule: 'A deny rule matches it.',
+    mode: 'The permission mode does not allow it.', hook: 'A hook declined it.', safetyCheck: 'A safety check declined it.',
+  };
+
+  /**
+   * A subagent's call that Claude Code declined without asking (a background agent cannot ask).
+   * The choices: allow exactly that call for the session and have the agent retry, or have Main redo it where you can approve. */
+  function addBlockedCard(d) {
+    if (S.cards.has(d.id)) return;
+    const top = S.root || S;
+    const ar = agentRowOfReq(d), ag = ar ? agentInfo(ar) : null;
+    const row = d.toolUseID ? rowAnywhere(d.toolUseID, top) : null;
+    const input = row && row.input && Object.keys(row.input).length ? row.input : null;
+    const rule = ruleFor(d.toolName, input);
+    const req = { id: d.id, toolName: d.toolName, toolUseID: d.toolUseID, agentID: d.agentID, input: input || {}, blocked: true };
+    closeRun();
+    const who = ag ? `${ag.type} “${clip(ag.desc, 60)}”` : 'a subagent';
+    const agentId = ag && ag.task ? ag.task.id : d.agentID;
+    const opts = h('div', { class: 'ck-opts' });
+    const card = h('div', { class: 'ck-card is-blocked', 'data-risk': 'high' },
+      h('div', { class: 'ck-card-head' },
+        h('span', { class: 'ck-risk' }, h('span', { class: 'ck-risk-dot' }), 'Blocked'),
+        h('span', { class: 'ck-card-title', text: `${ag ? ag.type : 'A subagent'} could not run ${shortName(d.toolName || 'a tool')}` }),
+        ag ? agentTag(ag) : null),
+      input ? preview(req) : h('div', { class: 'ck-why', text: 'The call’s input is not visible here: this agent’s steps are not streamed to this view.' }),
+      h('div', { class: 'ck-why' }, h('span', { class: 'ck-why-k', text: 'Why · ' }), BLOCK_WHY[d.reasonType] || d.reason || d.message || 'Claude Code declined it.'),
+      opts);
+    // Main passes it on: the user sees their choice, Main reads the instruction.
+    const relay = (shown, text) => { const prev = S; S = top; try { sendUser(shown, [], [], { relay: text, to: ag ? ag.type : undefined }); } finally { S = prev; } };
+    const settle = (outcome, label) => { if (card.dataset.done) return; card.dataset.done = '1'; resolveCard(req.id, outcome, null, label); };
+    const keys = {};
+    let n = 0;
+    const add = (label, fn, cls) => { const k = String(++n); opts.append(optBtn(k, label, fn, cls)); keys[k] = fn; };
+    if (rule) add(h('span', null, 'Allow ', h('code', { text: rule }), ' for this session, and retry'), () => {
+      post({ type: 'allowRules', rules: [rule], channel: top.id });
+      relay(`Allow ${rule} for this session, and retry.`,
+        `[FloatyTerm] The user added the allow rule \`${rule}\` for this session. Your subagent ${who} (agent ID: ${agentId}) was blocked running that call. `
+        + `Tell it with SendMessage (to: "${agentId}") to retry the blocked call now. If that agent has finished, the same SendMessage continues it. `
+        + 'Do not run the call yourself; after sending, reply in one short line.');
+      settle('always', ['Allowed for this session · ', h('code', { text: rule }), ' · retry asked']);
+    });
+    add('Redo it where I can approve it', () => {
+      relay(`Redo the blocked ${shortName(d.toolName || 'call')} where I can approve it.`,
+        `[FloatyTerm] Your subagent ${who} (agent ID: ${agentId}) was blocked running ${d.toolName || 'a tool'}`
+        + (d.reason ? ` (${clip(d.reason, 200)})` : '') + '. The user wants to approve it. A background agent cannot ask, so redo that step where '
+        + 'the approval prompt reaches the user: run it yourself in this conversation, or start the agent again with run_in_background: false. '
+        + 'Reply in one short line before you start.');
+      settle('allowed', 'Asked Main to redo it where you can approve');
+    });
+    add('Dismiss', () => settle('denied', 'Dismissed'), 'is-no');
+    registerCard(req, card, keys, opts);
+  }
+
+  /** Leave the agent's view and bring a card into sight. */
+  function reviewCard(c) {
+    closeSub();
+    requestAnimationFrame(() => {
+      c.card.scrollIntoView({ block: 'center', behavior: motionOn() ? 'smooth' : 'auto' });
+      c.card.classList.add('is-flash');
+      setTimeout(() => c.card.classList.remove('is-flash'), 1300);
+    });
+  }
+
   /** Puts a finished card in the flow and books it: its keys, the row waiting on it, the status line. */
   function registerCard(req, card, keys, opts) {
     turn().body.append(card);
     enter(card);
     S.cards.set(req.id, { card, keys, req, opts });
-    const row = req.toolUseID && rowAnywhere(req.toolUseID);
+    const row = !req.blocked && req.toolUseID && rowAnywhere(req.toolUseID);   // a blocked call's row already ended
     if (row) { row.waitStart = clock(); setRowState(row, 'waiting'); }
     updateStatus();
     stick();
+    scheduleAgents();
+    if (subShown()) paintSubPanel(true);
   }
 
   function addCard(req) {
@@ -979,12 +1088,14 @@
     const title = req.title || (req.displayName ? `${req.displayName}${req.description ? ' ' + req.description : ''}` : req.toolName);
     const why = req.input && req.input.description ? String(req.input.description) : req.decisionReason || null;
     const opts = h('div', { class: 'ck-opts' });
+    const asker = agentRowOfReq(req);
     const card = h('div', { class: 'ck-card', 'data-risk': level },
       h('div', { class: 'ck-card-head' },
         h('span', { class: 'ck-risk' }, h('span', { class: 'ck-risk-dot' }), risk),
-        h('span', { class: 'ck-card-title', text: title })),
+        h('span', { class: 'ck-card-title', text: title }),
+        asker ? agentTag(agentInfo(asker)) : null),
       preview(req),
-      why && h('div', { class: 'ck-why' }, h('span', { class: 'ck-why-k', text: (agent === 'codex' ? 'Codex' : 'Claude') + '\'s reason · ' }), why),
+      why && h('div', { class: 'ck-why' }, h('span', { class: 'ck-why-k', text: (agentName()) + '\'s reason · ' }), why),
       opts);
     const choose = (decision, message) => {
       if (card.dataset.done) return;
@@ -1003,12 +1114,12 @@
       keys['2'] = () => choose('allowAlways');
     }
     const noKey = always ? '3' : '2';
-    const decline = () => agent === 'codex' ? choose('deny') : showNo();
-    const noBtn = btn(noKey, agent === 'codex' ? 'No' : 'No, and tell Claude what to do differently', decline, 'is-no');
+    const decline = () => agent !== 'claude' ? choose('deny') : showNo();
+    const noBtn = btn(noKey, agent !== 'claude' ? 'No' : 'No, and tell Claude what to do differently', decline, 'is-no');
     opts.append(noBtn);
     keys[noKey] = decline;
     const noForm = h('div', { class: 'ck-no', hidden: true });
-    const noInput = h('textarea', { class: 'ck-no-input', rows: '2', placeholder: 'What should ' + (agent === 'codex' ? 'Codex' : 'Claude') + ' do instead? (optional)' });
+    const noInput = h('textarea', { class: 'ck-no-input', rows: '2', placeholder: 'What should ' + (agentName()) + ' do instead? (optional)' });
     const noSend = h('button', { class: 'sk-btn', type: 'button', text: 'Decline' });
     noForm.append(noInput, noSend);
     opts.append(noForm);
@@ -1036,9 +1147,11 @@
     c.opts.replaceWith(outcomeEl);
     if (!quiet()) play(outcomeEl, FADE, M.mid);
     c.card.classList.add('is-resolved');
-    const row = c.req.toolUseID && rowAnywhere(c.req.toolUseID);
+    const row = !c.req.blocked && c.req.toolUseID && rowAnywhere(c.req.toolUseID);
     if (row && row.waitStart) { row.waitMs += clock() - row.waitStart; row.waitStart = 0; setRowState(row, outcome === 'denied' || outcome === 'cancelled' ? 'error' : 'running'); }
     updateStatus();
+    scheduleAgents();
+    if (subShown()) paintSubPanel(true);
   }
 
   // ── dialog tools: AskUserQuestion and ExitPlanMode get their own cards ──
@@ -1288,8 +1401,10 @@
     modelEl.hidden = !supports('models');
     modeBtn.hidden = !supports('permissionMode');
     costEl.hidden = !supports('usage');
-    // "Opus 5.5" stays; " · 1M · high" is the part a narrow panel drops.
-    const [name, ...extra] = (modelLabel(S.model) || 'Model').split(' · ');
+    // "Opus 5.5" stays; " · 1M · high" is the part a narrow panel drops. The agent's own
+    // model list names the model when it has one (pi's ids are paths like provider/model).
+    const row = currentModelRow();
+    const [name, ...extra] = (row?.displayName || modelLabel(S.model) || 'Model').split(' · ');
     if (S.effort) extra.push(S.effort);
     modelEl.firstChild.replaceChildren(name, extra.length ? h('span', { class: 'ck-model-x', text: ' · ' + extra.join(' · ') }) : '');
     modeBtn.firstChild.textContent = agent === 'codex' ? (S.permissionProfileActive || CODEX_MODES.find(m => m.mode === S.mode)?.label || S.mode) : MODE_LABEL[S.mode] || S.mode;
@@ -2061,7 +2176,7 @@
     const seen = S.chipSeen || 0;
     for (const c of chips) if (c.seq > seen) play(c.el, POP, M.fast);
     S.chipSeen = Math.max(seen, ...chips.map(c => c.seq));
-    input.placeholder = chips.length ? 'Say what to do with it…  (⌫ removes the last one)' : `Message ${agent === 'codex' ? 'Codex' : 'Claude'}…${supports('slashCommands') ? '  / for commands' : ''} · ⇧↩ new line · ⌥↩ later`;
+    input.placeholder = chips.length ? 'Say what to do with it…  (⌫ removes the last one)' : `Message ${agentName()}…${supports('slashCommands') ? '  / for commands' : ''} · ⇧↩ new line · ⌥↩ later`;
     paintHeld();
     if (!chips.length && talkTarget()) input.placeholder = `Message ${talkTarget().type}…`;
     if (P.kind) placePop();
@@ -2686,6 +2801,7 @@
     if (subShown() && subShown().root === conv) closeSub();
     for (const t of conv.turns) if (t.run) clearInterval(t.run.timer);
     for (const th of conv.thinks.values()) clearInterval(th.timer);
+    for (const url of conv.blobs) URL.revokeObjectURL(url);
     const keep = { model: conv.model, modelChoice: conv.modelChoice, mode: conv.mode, effort: conv.effort, thinkingOn: conv.thinkingOn, thinkingSource: conv.thinkingSource };
     const fresh = newConv(conv.id, conv.label);
     for (const k of Object.keys(fresh)) if (k !== 'log') conv[k] = fresh[k];
@@ -2724,6 +2840,7 @@
     S.replaying = true;   // no motion, no usage or git requests, while hundreds of blocks go in
     S.lastChain = e.omitted ? e.before || undefined : null;   // where a rewind of the first prompt drawn would resume
     try { drawHistory(e.messages); } finally { S.replaying = false; }
+    foldOldTurns();
     evT = 0;
     closeRun();
     for (const th of S.thinks.values()) endThink(th);
@@ -3211,7 +3328,7 @@
     sendBtn.title = sendBtn.dataset.mode === 'stop' ? 'Stop (Esc)'
       : S.busy && supports('priority') && !subRow ? 'Send: ↩ joins this turn · ⌘↩ redirect (after this step) · ⌥↩ after this turn' : 'Send (Return)';
     if (!S.refs.length && !S.images.length && !subRow && supports('priority')) {
-      const want = S.busy ? 'Add to this turn…  ⌘↩ redirect · ⌥↩ after this turn' : `Message ${agent === 'codex' ? 'Codex' : 'Claude'}…${supports('slashCommands') ? '  / for commands' : ''} · ⇧↩ new line · ⌥↩ later`;
+      const want = S.busy ? 'Add to this turn…  ⌘↩ redirect · ⌥↩ after this turn' : `Message ${agentName()}…${supports('slashCommands') ? '  / for commands' : ''} · ⇧↩ new line · ⌥↩ later`;
       if (input.placeholder !== want) input.placeholder = want;
     }
     holdBtn.hidden = !input.value.trim() && !S.refs.length && !S.images.length;
@@ -3221,12 +3338,26 @@
 
   /** The tab's attention dot covers every conversation, main and side. */
   let lastState = '';
+  /**
+   * The host may stop an idle conversation's agent process to save memory, and resume the session later.
+   * Not while anything lives in that process: a turn, a question, a background task or subagent,
+   * a ! command, a side question, or scheduled work (a loop, a wakeup, a monitor).
+   */
+  function canRest(c) {
+    return !c.busy && !c.cards.size && !c.keepAwake && !(c.bgTasks || []).length
+      && ![...c.agentTasks.values()].some(t => t.t0 && !t.t1)
+      && ![...shellRuns.values()].some(r => r.conv === c)
+      && ![btw, ask].some(x => x && x.pending && x.conv === c);
+  }
+
   function postState() {
     const all = [...convs.values()];
     const busy = all.some(c => c.busy), waiting = all.some(c => c.cards.size > 0);
-    if (lastState === busy + '/' + waiting) return;
-    lastState = busy + '/' + waiting;
-    post({ type: 'state', channel: 'main', busy, waiting });
+    const rest = all.filter(canRest).map(c => c.id);
+    const key = busy + '/' + waiting + '/' + rest.join(',');
+    if (lastState === key) return;
+    lastState = key;
+    post({ type: 'state', channel: 'main', busy, waiting, rest });
   }
 
   const priority0 = opts => supports('priority') ? opts.priority : null;
@@ -3319,7 +3450,7 @@
     ctxEl = h('button', { class: 'ck-ctx', type: 'button' });
     moreBtn = h('button', { class: 'ck-chip ck-more', type: 'button', title: 'More: folder, git, session, actions' }, h('span', { class: 'ck-more-ic' }));
     usagePanel = h('div', { class: 'ck-usage-panel', hidden: true });
-    input = h('textarea', { class: 'ck-input', rows: '1', placeholder: 'Message Claude…  / for commands · ⇧↩ new line' });
+    input = h('textarea', { class: 'ck-input', rows: '1', placeholder: 'Message ' + agentName() + '…  / for commands · ⇧↩ new line' });
     sendBtn = h('button', { class: 'ck-send', type: 'button' }, h('span', { class: 'ck-send-ic' }));
     micBtn = h('button', { class: 'ck-mic', type: 'button', hidden: !supports('voice') }, icon(ICON_MIC));
     micBtn.onmousedown = e => e.preventDefault();   // the caret stays where the words go
@@ -3668,6 +3799,7 @@
     if (e.background || e.patch?.is_backgrounded) t.background = true;
     if (e.patch?.description) t.description = e.patch.description;
     if (e.usage) t.usage = e.usage;
+    t.lastAt = clock();   // any sign of life; a long silence shows on the avatar
     if (e.type === 'task.start' && !t.t0) t.t0 = clock();
     if (e.type === 'task.progress') { if (e.summary) t.summary = e.summary; if (e.lastTool) t.lastTool = e.lastTool; }
     if (e.type === 'task.end') { t.endStatus = e.status || 'completed'; t.t1 = clock(); if (e.summary) t.result = e.summary; }
@@ -3727,7 +3859,10 @@
   function toSub(e) {
     const top = S.root || S;
     // Subagent tool result settles its approval card (stays in conversation).
-    if (e.type === 'tool.result') for (const [id, card] of [...top.cards]) if (card.req.toolUseID === e.id) resolveCard(id, e.isError ? 'denied' : 'allowed');
+    // (A blocked card waits for the user's choice: the denied call's error result doesn't settle it.)
+    if (e.type === 'tool.result') for (const [id, card] of [...top.cards]) if (card.req.toolUseID === e.id && !card.req.blocked) resolveCard(id, e.isError ? 'denied' : 'allowed');
+    const task = agentTaskOf(top, e.parentId);
+    if (task) task.lastAt = clock();
     const sub = subConv(top, e.parentId);
     const own = { ...e, parentId: null };
     const prev = S;
@@ -3803,7 +3938,7 @@
       h('span', { class: 'ck-sub-type', text: a ? a.type : inp.subagent_type || (row ? shortName(row.name) : 'Agent') }),
       h('span', { class: 'ck-sub-desc', text: inp.description || '', title: inp.description || '' }),
       h('span', { class: 'ck-sub-state', 'data-state': a ? a.state : state, text: a ? AGENT_WORD[a.state] : state }),
-      h('span', { class: 'ck-sub-stats', text: a ? agentStats(a) : stats }),
+      h('span', { class: 'ck-sub-stats', text: a ? agentStats(a) + (a.quiet ? ' · quiet ' + mins(a.quiet) : '') : stats }),
       going && a.task && !a.task.background ? h('button', { class: 'ck-sub-act', type: 'button', title: 'Send it to the background: the conversation goes on (⌃B)', onclick: () => backgroundAgent(a) }, 'Background', h('kbd', { text: '⌃B' })) : null,
       going && a.task ? h('button', { class: 'ck-sub-act is-stop', type: 'button', title: 'Stop this agent (⌃X)', onclick: () => stopAgent(a) }, 'Stop', h('kbd', { text: '⌃X' })) : null,
       h('button', { class: 'ck-sub-btn ck-sub-x', type: 'button', title: 'Close (Esc)', onclick: closeSub }));
@@ -3822,6 +3957,18 @@
       sc = h('div', { class: 'ck-sub-scroll' }, h('div', { class: 'ck-sub-in' }, prompt, sub.log, h('div', { class: 'ck-sub-foot' })));
       subEl.replaceChildren(head, sc);
     } else subEl.firstChild.replaceWith(head);
+    // The approval this agent waits on lives in the conversation (this view covers it): say so here, and go there.
+    const asks = a ? cardsFor(a.top, a.sub, a.task) : [];
+    const oldAsk = subEl.querySelector(':scope > .ck-sub-ask');
+    if (asks.length) {
+      const c = asks[0];
+      const what = `${shortName(c.req.toolName || 'a tool')} ${clip(argOf(c.req.toolName || '', c.req.input || {}) || '', 80)}`.trim();
+      const bar = h('div', { class: 'ck-sub-ask' }, h('span', { class: 'ck-sub-ask-dot' }),
+        h('span', { class: 'ck-sub-ask-t', text: (c.req.blocked ? 'Blocked, needs your decision: ' : 'Waiting for your approval: ') + what }),
+        asks.length > 1 ? h('span', { class: 'ck-sub-ask-n', text: `+${asks.length - 1} more` }) : null,
+        h('button', { class: 'ck-sub-act', type: 'button', onclick: () => reviewCard(c) }, 'Review'));
+      if (oldAsk) oldAsk.replaceWith(bar); else head.after(bar);
+    } else if (oldAsk) oldAsk.remove();
     // With no transcript (a resumed chat, or it has not started yet): the result, or a line that says why it is empty.
     const foot = sc.querySelector('.ck-sub-foot');
     const empty = !sub.log.childNodes.length;
@@ -3865,18 +4012,26 @@
 
   const agentSteps = sub => sub ? sub.rows.size + sub.texts.size : 0;
 
+  /** The open approval and blocked cards of one agent: matched by its agent ID, or by a call in its steps. */
+  const cardsFor = (top, sub, task) => [...top.cards.values()].filter(c => c.req
+    && ((task && c.req.agentID === task.id) || (sub && c.req.toolUseID && sub.rows.has(c.req.toolUseID))));
+  const QUIET_MS = 3 * 60 * 1000;   // a working agent with no sign of life for this long reads as "quiet"
+  const mins = ms => Math.max(1, Math.round(ms / 60000)) + ' min';
+
   /** All that the page knows of one Agent call: its row, task, transcript and state. */
   function agentInfo(row) {
     const top = row.top || main, sub = top.subs.get(row.id) || null, task = agentTaskOf(top, row.id);
     const inp = row.input || {};
-    const waiting = sub && [...top.cards.values()].some(c => c.req && c.req.toolUseID && sub.rows.has(c.req.toolUseID));
+    const waiting = cardsFor(top, sub, task).length > 0;
     let state;
     if (waiting) state = 'waiting';
     else if (task && task.endStatus) state = task.endStatus === 'completed' ? 'done' : 'error';
     else if (task && !task.endStatus && row.state !== 'error' && row.state !== 'interrupted') state = 'running';   // a background agent's row ends long before it does
     else state = row.state === 'done' ? 'done' : row.state === 'error' || row.state === 'interrupted' ? 'error' : 'running';
     const parentConv = top.rows.has(row.id) ? top : [...top.subs.values()].find(c => c.rows.has(row.id)) || top;
-    return { row, top, sub, task, state, type: inp.subagent_type || shortName(row.name), desc: inp.description || clip(inp.prompt, 60) || 'Agent',
+    const lastAt = task ? task.lastAt || task.t0 : 0;
+    const silent = state === 'running' && lastAt ? clock() - lastAt : 0;
+    return { row, top, sub, task, state, quiet: silent >= QUIET_MS ? silent : 0, type: inp.subagent_type || shortName(row.name), desc: inp.description || clip(inp.prompt, 60) || 'Agent',
       parentConv, parentType: parentConv === top ? (top === main ? 'Main' : top.label || 'Chat') : agentInfo(rowAnywhere(parentConv.toolId, top) || row).type };
   }
 
@@ -3913,6 +4068,8 @@
 
   let agentsRaf = 0, agentsShown = [], agentAvs = new Map(), agentsTop = null;
   function scheduleAgents() { if (!agentsRaf && agentsEl) agentsRaf = requestAnimationFrame(() => { agentsRaf = 0; paintAgents(); }); }
+  // "Quiet" comes from time passing, not from events: look again now and then while an agent works.
+  setInterval(() => { if (agentsShown.some(a => a.state === 'running')) scheduleAgents(); }, 30000);
 
   function paintAgents() {
     const top = active;
@@ -3941,7 +4098,8 @@
       }
       if (el.parentNode !== agentsEl || el !== agentsEl.children[i + 1]) agentsEl.insertBefore(el, agentsEl.children[i + 1] || null);
       paintAvatar(el.firstChild, a.type, a.state);
-      el.setAttribute('aria-label', `${a.type}: ${a.desc}, ${AGENT_WORD[a.state]} (⌥${i + 1})`);
+      el.classList.toggle('is-quiet', !!a.quiet);
+      el.setAttribute('aria-label', `${a.type}: ${a.desc}, ${AGENT_WORD[a.state]}${a.quiet ? ', no new activity for ' + mins(a.quiet) : ''} (⌥${i + 1})`);
       el.classList.toggle('is-here', !!subShown() && subShown().toolId === a.row.id);
       const unread = a.sub && !(subShown() === a.sub) && agentSteps(a.sub) > (a.sub.seen || 0) && a.state !== 'done';
       el.classList.toggle('has-unread', !!unread);
@@ -3968,20 +4126,21 @@
   function fillAgentCard(a, fresh) {
     const steps = a.sub ? [...a.sub.rows.values()].filter(r => r.state === 'done').slice(-3) : [];
     const result = a.state === 'done' || a.state === 'error' ? agentResult(a) : '';
-    const ask = a.state === 'waiting' && a.sub ? [...a.top.cards.values()].find(c => c.req && a.sub.rows.has(c.req.toolUseID)) : null;
+    const ask = a.state === 'waiting' ? cardsFor(a.top, a.sub, a.task)[0] || null : null;
     const n = agentsShown.indexOf(a) + 1;
     const body = h('div', { class: 'ck-ahc-body' },
       h('div', { class: 'ck-ahc-h' }, agentAvatar(a.type, a.state),
         h('div', { class: 'ck-ahc-name' }, h('div', { class: 'ck-ahc-type', text: a.type }),
           h('div', { class: 'ck-ahc-state' }, h('b', { 'data-s': a.state, text: AGENT_WORD[a.state] }), ` · started by ${a.parentType}` + (a.task && a.task.background ? ' · background' : '')))),
       h('div', { class: 'ck-ahc-desc', text: a.desc }),
-      ask ? h('div', { class: 'ck-ahc-ask' }, `Wants to run ${shortName(ask.req.toolName)}`, h('code', { text: clip(argOf(ask.req.toolName, ask.req.input || {}) || '', 120) }))
+      ask ? h('div', { class: 'ck-ahc-ask' }, `${ask.req.blocked ? 'Was blocked running' : 'Wants to run'} ${shortName(ask.req.toolName || 'a tool')}`, h('code', { text: clip(argOf(ask.req.toolName || '', ask.req.input || {}) || '', 120) }))
         : result ? h('div', { class: 'ck-ahc-result', text: clip(result, 260) })
+        : a.quiet ? h('div', { class: 'ck-ahc-now is-quiet' }, h('span', { class: 'k', text: 'quiet' }), h('span', { class: 'v', text: `No new activity for ${mins(a.quiet)}. It may be stuck: Stop ends it.` }))
         : h('div', { class: 'ck-ahc-now' }, h('span', { class: 'k', text: 'now' }), h('span', { class: 'v', text: agentLive(a) || '…' })),
       steps.length && !result ? h('ul', { class: 'ck-ahc-steps' }, steps.map(r => h('li', { text: `${shortName(r.name)} ${r.argEl.textContent}` }))) : null,
       h('div', { class: 'ck-ahc-stats', text: agentStats(a) }),
       h('div', { class: 'ck-ahc-f' },
-        h('button', { class: 'ck-ahc-btn is-main', type: 'button', onclick: () => openAgent(a) }, ask ? 'Review' : a.state === 'done' ? 'Open' : 'Open and talk', n <= 9 ? h('kbd', { text: '⌥' + n }) : null),
+        h('button', { class: 'ck-ahc-btn is-main', type: 'button', onclick: () => { if (ask) { closeAgentCard(true); reviewCard(ask); } else openAgent(a); } }, ask ? 'Review' : a.state === 'done' ? 'Open' : 'Open and talk', n <= 9 ? h('kbd', { text: '⌥' + n }) : null),
         h('span', { class: 'ck-ahc-grow' }),
         (a.state === 'running' || a.state === 'waiting') && a.task && !a.task.background ? h('button', { class: 'ck-ahc-btn', type: 'button', title: 'Send it to the background', onclick: () => backgroundAgent(a) }, h('kbd', { text: '⌃B' })) : null,
         (a.state === 'running' || a.state === 'waiting') && a.task ? h('button', { class: 'ck-ahc-btn is-stop', type: 'button', onclick: () => { closeAgentCard(true); stopAgent(a); } }, 'Stop')
@@ -4055,7 +4214,7 @@
     toEl.hidden = false;
     field.classList.toggle('to-agent', !!to);
     if (to) field.style.setProperty('--c', agentColor(a.type)); else field.style.removeProperty('--c');
-    input.placeholder = to ? `Message ${a.type}…` : `Message ${agent === 'codex' ? 'Codex' : 'Claude'}…`;
+    input.placeholder = to ? `Message ${a.type}…` : `Message ${agentName()}…`;
   }
 
   // What Main reads: who the message is for, and how to pass it on. The user sees only their words.
@@ -4095,7 +4254,8 @@
         setRowState(row, 'interrupted');
       }
     }
-    for (const id of [...S.cards.keys()]) resolveCard(id, 'cancelled');
+    // A subagent's card outlives Main's turn: a background agent still waits on it (Claude Code withdraws it with an explicit cancel).
+    for (const [id, c] of [...S.cards]) if (!c.req.agentID && !c.req.blocked) resolveCard(id, 'cancelled');
     closeRun();
     S.busy = false; S.thinking = false; S.buffering = false; S.progressText = null;
     updateStatus();
@@ -4138,7 +4298,8 @@
     row.t1 = clock();
     for (const [cardId, card] of S.cards) if (card.req.toolUseID === row.id) resolveCard(cardId, e.isError ? 'denied' : 'allowed');
     if (row.waitStart) { row.waitMs += row.t1 - row.waitStart; row.waitStart = 0; }
-    row.output = output;
+    // The detail draws 4000 characters; only an agent row re-renders its whole result (as markdown).
+    row.output = isAgentTool(row.name) ? output : output.slice(0, 4000);
     if (row.stdinForm) row.stdinForm.querySelectorAll('input,button').forEach(el => el.disabled = true);
     row.streamEl = null;
     row.metaEl.textContent = isAgentTool(row.name) && !e.isError ? agentMeta(row) || 'done' : metaOf(row, output, e.isError);
@@ -4149,6 +4310,72 @@
     setRowState(row, e.isError ? 'error' : 'done');
     if (row.run) paintRun(row.run);
     if (subShown() && subShown().toolId === row.id) paintSubPanel();
+  }
+
+  // ── old turns fold into one line, so a long conversation keeps few live nodes and objects ──
+  // A folded turn keeps its prompt and footer. Its body is stored as compressed HTML and the
+  // page's row, text and thinking records for it are dropped. Opening it draws the stored
+  // body back as a static copy: rows still open and close, but nothing else in it is live.
+  const TURNS_LIVE = 12;   // the newest turns are never folded
+  const pack = async html => {
+    if (!root.CompressionStream) return html;
+    try { return new Uint8Array(await new Response(new Blob([html]).stream().pipeThrough(new CompressionStream('gzip'))).arrayBuffer()); }
+    catch (_) { return html; }
+  };
+  const unpack = async packed => typeof packed === 'string' ? packed
+    : new Response(new Blob([packed]).stream().pipeThrough(new DecompressionStream('gzip'))).text();
+
+  /** What a fold takes out of a turn: everything but the prompt and the footer (the tool tray lives outside the body). */
+  const foldParts = t => [...t.el.children].filter(el => !el.matches('.ck-user, .ck-foot, .ck-folded'));
+
+  /** Only a settled turn with nothing live in it: no running tool, open question, subagent or surface. */
+  function foldable(conv, t) {
+    if (t === conv.turn || t.folded || !t.el.isConnected) return false;
+    return !t.el.querySelector('.is-agent, .ck-card, .ck-surface, .ck-media, .ck-think.is-live, .ck-row[data-state="running"], .ck-row[data-state="preparing"], .ck-text:empty');
+  }
+
+  function foldTurn(conv, t) {
+    const parts = foldParts(t), html = parts.map(el => el.outerHTML).join('');
+    const inside = el => !!el && parts.some(part => part.contains(el));
+    for (const [id, row] of conv.rows) if (inside(row.line)) conv.rows.delete(id);
+    for (const [key, item] of conv.texts) if (inside(item.el)) conv.texts.delete(key);
+    for (const [key, item] of conv.thinks) if (inside(item.el)) conv.thinks.delete(key);
+    for (const map of [conv.msgTexts, conv.msgThinks]) {
+      for (const [id, list] of map) { const rest = list.filter(item => !inside(item.el)); if (rest.length) map.set(id, rest); else map.delete(id); }
+    }
+    for (const [key, view] of conv.turnViews) if (view === t) conv.turnViews.delete(key);
+    if (conv.lastTool && inside(conv.lastTool.line)) conv.lastTool = null;
+    const rows = parts.reduce((n, el) => n + el.querySelectorAll('.ck-row').length, 0);
+    t.folded = true; t.run = null; t.packed = html;
+    t.packing = pack(html).then(packed => { t.packed = packed; });
+    const open = h('button', { class: 'ck-folded', type: 'button', title: 'Draw this part of the conversation again' },
+      'Earlier reply' + (rows ? ' · ' + plural(rows, 'tool call') : '') + ' · show');
+    open.onclick = async () => {
+      open.disabled = true;
+      try {
+        await t.packing;
+        const stored = document.createElement('template');
+        stored.innerHTML = await unpack(t.packed);
+        open.replaceWith(stored.content);
+        t.packed = null; t.packing = null;
+        t.el.onclick = ev => {   // the drawn-again parts lost their handlers; one delegate opens and closes them
+          const pill = ev.target.closest && ev.target.closest('.ck-tray-pill');
+          if (pill) { const panel = pill.nextElementSibling; if (panel) { panel.hidden = !panel.hidden; pill.setAttribute('aria-expanded', String(!panel.hidden)); } return; }
+          const line = ev.target.closest && ev.target.closest('.ck-row');
+          const detail = line && line.nextElementSibling;
+          if (detail && detail.classList.contains('ck-detail') && detail.childNodes.length) detail.hidden = !detail.hidden;
+        };
+      } catch (_) { open.disabled = false; open.textContent = 'Could not draw this again'; }
+    };
+    for (const el of parts) el.remove();
+    t.el.insertBefore(open, t.footer && t.footer.parentNode === t.el ? t.footer : null);
+  }
+
+  function foldOldTurns(conv = S) {
+    for (let i = 0; i < conv.turns.length - TURNS_LIVE; i++) {
+      const t = conv.turns[i];
+      if (foldable(conv, t)) foldTurn(conv, t);
+    }
   }
 
   const END_LABEL = { error_max_turns: 'Stopped at the turn limit', error_max_budget_usd: 'Stopped at the budget limit',
@@ -4183,6 +4410,7 @@
     } else if (e.status === 'error' && e.message) notice('error', e.message);
     paintMeta(); stick();
     if (!S.replaying) { requestUsage(!usagePanel.hidden); requestGit(); }
+    foldOldTurns();
     // A stop or an error is yours to look at first: held messages keep waiting.
     if (e.status === 'success') tickHeld('turn');
   }
@@ -4316,6 +4544,19 @@
     S.importView = card; turn().body.append(card); stick();
   }
 
+  /**
+   * A base64 data: URL as a blob: URL. The page would otherwise hold a screenshot's base64 several
+   * times over (the string, the img attribute, its parsed URL); a blob holds the bytes once.
+   */
+  function blobURL(dataURL) {
+    const bin = atob(dataURL.slice(dataURL.indexOf(',') + 1));
+    const bytes = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+    const url = URL.createObjectURL(new Blob([bytes], { type: dataURL.slice(5, dataURL.indexOf(';')) }));
+    S.blobs.push(url);
+    return url;
+  }
+
   function paintMedia(e) {
     let view = S.mediaViews.get(e.id);
     if (!view) {
@@ -4324,6 +4565,7 @@
       (row ? row.detail : turn().body).append(view);
     }
     const valid = typeof e.url === 'string' && /^data:image\/(png|jpeg|gif|webp);base64,[A-Za-z0-9+/=]+$/.test(e.url);
+    if (valid) e.url = blobURL(e.url);   // the store and the buttons keep this event: let them hold a short URL
     const children = [valid ? h('img', { src: e.url, alt: e.caption || 'Image result', loading: 'lazy' }) : h('p', { class: 'ck-surface-muted', text: e.error || 'Image preview unavailable' }), h('figcaption', { text: e.caption || e.path || 'Image' })];
     if (e.path) children.push(h('button', { type: 'button', text: 'Reveal image', onclick: () => post({ type: 'reveal', path: e.path }) }));
     if (valid) children.push(h('button', { type: 'button', text: 'View image', onclick: () => showEventImage({ url: e.url, name: e.path || e.caption || 'Image' }) }));
@@ -4540,7 +4782,18 @@
   }
 
 
+  /**
+   * Draws one event, then lets go of its raw message: the stores and click handlers keep the event,
+   * and a raw message can carry megabytes (a screenshot's base64, a whole tool result).
+   */
   function receiveOne(e) {
+    try { drawEvent(e); } finally { if (e.raw !== undefined) e.raw = undefined; }
+  }
+
+  /** Tools that leave work running inside the agent's process after the turn: it must not be stopped to save memory. */
+  const KEEPS_AWAKE = /^(CronCreate|ScheduleWakeup|Monitor|RemoteTrigger)$/;
+
+  function drawEvent(e) {
     if (e.parentId) {
       if (typeof SUB_EVENTS !== 'undefined' && SUB_EVENTS.has(e.type)) { toSub(e); return; }
       if (typeof SUB_EVENTS === 'undefined' && !e.type.startsWith('approval.')) { routeEventChild(e); return; }
@@ -4573,12 +4826,17 @@
       case 'content.start': case 'content.delta': case 'content.snapshot': case 'content.end':
         settleRetry(); S.busy = true; paintContent(e); updateStatus(); break;
       case 'tool.start': case 'tool.input': case 'tool.result':
+        if (e.type === 'tool.start' && KEEPS_AWAKE.test(e.name || '')) (S.root || S).keepAwake = true;
         settleRetry(); S.busy = e.type === 'tool.result' ? S.busy : true; paintTool(e); trackTasks(e); updateStatus();
         if (e.type === 'tool.result') tickHeld('tool');
         break;
       case 'commands': SHARED.commands = e.commands || []; if (P.kind === 'slash') refreshPop(); break;
       case 'approval.request': if (supports('approvals')) addCard(e.request); else showUnknown(e); break;
       case 'approval.cancel': resolveCard(e.id, 'cancelled'); break;
+      case 'approval.blocked':
+        if (supports('approvals') && !S.replaying) addBlockedCard(e.denial);
+        else notice('warn', 'Blocked ' + (e.denial.toolName || 'a tool') + (e.denial.message ? ': ' + e.denial.message : ''));
+        break;
       case 'notice':
         if (e.terminal) settleRetry();
         notice(e.kind || 'info', e.message || 'Session ended');
@@ -4651,7 +4909,8 @@
   const AgentChat = {
     boot(cfg) {
       agent = cfg.agent || 'claude';
-      features = { ...(agent === 'claude' ? CLAUDE_FEATURES : CODEX_FEATURES) };
+      if (root.CSS && CSS.supports('overflow-anchor', 'auto')) document.documentElement.classList.add('ck-cv');
+      features = { ...(AGENT_FEATURES[agent] || CLAUDE_FEATURES) };
       if (cfg.voice) features.voice = true;   // the host can listen (the mic button)
       main.normalizer = root.AgentEvents.createNormalizer(agent);
       main.eventState = root.AgentEvents.createState();
@@ -4661,6 +4920,21 @@
       paintMeta(); paintView(); paintRefs();
       statusText.textContent = 'Ready';
       if (cfg.intro) notice('info', cfg.intro);
+      // Built again after the host unloaded it (hidden a long time): the history follows, by session.
+      if (cfg.restore) {
+        main.sessionId = cfg.restore.sessionId || null;
+        if (cfg.restore.draft) { input.value = cfg.restore.draft; grow(); }
+        notice('info', 'This tab was unloaded while hidden, to save memory. The conversation is drawn again from its history; pictures and opened rows are not.');
+      }
+    },
+    /**
+     * Whether the host may unload this page to save memory, and what to keep: null while anything
+     * here would be lost (a side chat, held messages, an open panel, attachments) or the agent works.
+     */
+    hibernation() {
+      if (convs.size > 1 || !canRest(main) || main.held.length || main.refs.length || main.images.length) return null;
+      if (btw || ask || subShown() || lightbox || P.kind || V.state !== 'idle') return null;
+      return { draft: input ? input.value : '' };
     },
     /** `channel`: the conversation the events belong to ('main' when omitted). */
     receive(batch, channel) {

@@ -1,5 +1,5 @@
-#!/usr/bin/env bash
-# floaty — thin agent-control client for FloatyTerm.
+#!/usr/bin/env -S python3 -I -S
+# floaty — thin agent-control client for FloatyTerm (one Python process per call).
 #
 # Sibling of `ftdiff` (scripts/floaty-diff.sh): POSTs JSON to FloatyTerm's
 # loopback relay (127.0.0.1:7777, started by the app on launch) and prints the
@@ -31,7 +31,9 @@
 #                  play/pause/stop/speed controls overlaid on the terminal window; the reply
 #                  reports chars actually typed, plus "stopped":true if you hit Stop.
 #                  --no-controls skips the overlay)
-#   floaty key    --key return [--modifiers cmd,shift] [--target Cursor | --pid 8123]
+#   floaty key    --key return [--modifiers cmd,shift] [--repeat N] [--target Cursor | --pid 8123]
+#                 (also chords and sequences, the way computer-use models write them:
+#                  --key cmd+s · --key "Tab Tab Return" · --key ctrl+shift+Page_Up)
 #                 (--pid pins input to ONE exact process — disambiguates two same-named
 #                  apps, e.g. two Chromes, where --target "Google Chrome" is a coin flip)
 #
@@ -89,6 +91,58 @@
 #                 # steps retry:1) and typed text re-read from the focused element's AX value.
 #                 # Unreadable value (canvas) → step passes UNVERIFIED and the reply lists it
 #                 # in unverified_steps — re-check those effects before trusting completed:true.
+#   BACKGROUND MODE — the agent works in its own window while you keep the keyboard:
+#     export FLOATY_MODE=background      # every call in this shell (or --background per call;
+#                                        # --foreground on one call overrides the env)
+#                 # click/click-mark/click-in-frame → AXPress on the element under the point (no
+#                 # cursor move); type/key --pid N → posted to that process (CGEventPostToPid),
+#                 # refused unless the app's key window is the agent's on-screen window; navigate
+#                 # --pid N --url … → the browser's address bar via AX. query-ax element actions:
+#                 # --press / --focus / --set-value "…" / --scroll-to / --action AXShowMenu.
+#                 # Nothing activates or raises the target; move/drag/scroll/right/double clicks,
+#                 # raise, focus, enable-cdp refuse with "needs_foreground":true. A window on
+#                 # another Space is unreachable (AX sees only the active Space) → keep the agent's
+#                 # window on a visible display. Replies carry "interference":{human_app,
+#                 # focus_kept[,stolen_by_target,restored]} — the host hands focus straight back
+#                 # if an action made the target frontmost.
+#                 # Flutter web: press the text field first (opens its edit session), then type;
+#                 # --set-value alone is ignored by Flutter.
+#   INPUT SCRIPTS — trusted page input over CDP, timed by the host (no cursor, no focus change):
+#     floaty input --via-extension --match piano --steps '[
+#       {"t":0,   "down":"[data-midi=\"60\"]", "hold":450},
+#       {"t":0,   "key":"0", "hold":450},
+#       {"t":500, "click":"#save"},
+#       {"wait":200}, {"text":"hello"}, {"key":"Enter"}
+#     ]'                       # or --file steps.json, or --steps - (stdin)
+#                 # Chrome tabs via --via-extension; Electron / debug-port Chrome via --port N.
+#                 # The page sees isTrusted=true events (JS-dispatched events are untrusted, and
+#                 # many pages ignore them). Each step: an optional time — "t" (ms from the
+#                 # start) or "wait" (ms after the previous step) — and ONE action:
+#                 #   click / down / up / move : "css selector" | [x,y] viewport px | {"screen":[x,y]}
+#                 #                              (+ "button":"right"|"middle", "count":2)
+#                 #   drag:{"from":…,"to":…[,"steps":10]}   wheel:<target> + "dx"/"dy" px
+#                 #   key:"Enter"|"a"|"0" (+ "modifiers":["shift"])   keydown / keyup
+#                 #   type:"text" (key events per character)   text:"…" (one insertText)
+#                 # "hold":ms on click/key releases later WITHOUT blocking the next step, so
+#                 # chords and legato overlap. Selectors resolve once, before the clock starts.
+#                 # Reply: events, duration_ms, late_ms {p50,p95,max}. Any failure releases
+#                 # every held key and button. Shorthand: input --click SEL | --key K | --text T.
+#                 # Targets may be REFS (ref_12, from som / query-dom / find): resolved when the
+#                 # script runs; a ref whose element is gone is an error, never a stray click.
+#                 # A target outside the view is scrolled to the centre first. fill:SEL|REF +
+#                 # "value" replaces a field's value (selects, then inserts; <select> by option).
+#                 # Clicks hover first (pointerenter/mouseover fire). key takes "cmd+a" / "Tab Tab".
+#   JAVASCRIPT DIALOGS (alert/confirm/prompt) block their page. Every CDP verb answers one
+#   that opens during the call — --on-dialog dismiss (default) | accept | stop — and lists
+#   it in the reply's `dialogs`. With stop, the call fails with the dialog's text; then:
+#     floaty dialog [--via-extension | --port N] [--match …]     # what is open
+#     floaty dialog --accept [--text "prompt answer"] | --dismiss
+#     floaty dialog --reload    # a dialog no session can answer (over a debug port only the
+#                               # session that saw it can) — reloads the tab, loses page state
+#   floaty find "add to cart button" --pid N | --via-extension [--match …] [--under REF]
+#                 # the best matches by plain words (name, role words like button/field/link,
+#                 # placeholder), each with a ref: act with `query-ax --ref ax_N --press` (AX)
+#                 # or `input --click ref_N` (page). Cheaper than reading the whole tree.
 #   floaty focused --app "Notes" | --pid 8123           # the focused element (role/value/editable):
 #                                                        # confirm a text cursor exists BEFORE typing
 #   floaty set-text --pid 8123 --text "hello"           # write text into the FOCUSED field via the AX API
@@ -173,6 +227,12 @@
 #   floaty move-in-frame  --frame cap_… --x <imgpx> --y <imgpx>   # same transform, hover only
 #   floaty list-windows [--filter Chrome]               # ids+PIDS+titles+bounds you can target
 #   floaty query-ax --app "Notes" [--role button] [--title Save] [--max 100] [--press]
+#   floaty query-ax --ref ax_12 --press | --focus | --set-value "…" | --action AXShowMenu
+#                 # act on THE element a ref names (rows of query-ax / som --pid / find carry refs);
+#                 # stale → an error, never a different element. --under ax_12 reads one subtree;
+#                 # --all lists every named element, not only controls. Replies say `truncated`.
+#   Every actuator reply may carry "changes": windows of the target app that opened,
+#   closed or were renamed since the last report (and the front app, in foreground mode).
 #   floaty query-ax --pid 8123 --title "Sign in" --press # AX tree by PID (disambiguates two Chromes,
 #                 # drives live default-profile Chrome with no debug port). --press = AXPress 1st match.
 #   floaty read-text --app "Google Chrome" | --pid 8123  # read a window's text via AX tree (lossless;
@@ -183,6 +243,8 @@
 #   floaty query-dom --selector "h3 a" [--port 9222] [--match youtube.com]  # ALL matches
 #   floaty eval     --expression "document.title" [--port 9222] [--match docs]  # run JS, get JSON
 #   floaty navigate --url "https://example.com" [--port 9222] [--match console.cloud]  # drive a tab
+#                 # waits until the NEW page is parsed; reply has url + title. http(s) only
+#                 # (javascript:/file:/data: refused unless --allow-scheme); "localhost:3000" → http.
 #   floaty tabs     [--port 9222]                       # list open tabs (id/title/url) to pick --match
 #   floaty focus    --match youtube.com [--port 9222]   # raise that tab's window (then key/type land there)
 #   floaty som      [--port 9222] [--match …] [--max 100]   # Set-of-Mark (DOM): numbered marks →
@@ -211,14 +273,7 @@
 #   Chrome 9222 · VS Code 9223 · Cursor 9224 · Slack 9225
 #   e.g.  cursor --remote-debugging-port=9224
 
-set -euo pipefail
-HOST="127.0.0.1:7777"
-
-cmd="${1:-}"; shift || true
-[ -n "$cmd" ] || { echo "usage: floaty <command> [--flag value ...]   (try: floaty help)" >&2; exit 2; }
-
-case "$cmd" in help|--help|-h) cat <<'HELP'
-floaty — drive the macOS GUI and peek other terminal sessions, via FloatyTerm.
+HELP = r'''floaty — drive the macOS GUI and peek other terminal sessions, via FloatyTerm.
 Every command POSTs to the app (127.0.0.1:7777) and prints a JSON reply on
 stdout. Failure = {"error": "..."} + exit 1. The app must be running.
 
@@ -228,7 +283,10 @@ POINTER / KEYBOARD
   scroll --dx N --dy N [--x N --y N]   # cursor position decides WHAT scrolls
   type   --text "…" [--target App | --pid N] [--human] [--no-controls]   # --human = your recorded
          # rhythm, replayed as a pausable session w/ overlaid play/pause/stop/speed controls
-  key    --key return [--modifiers cmd,shift] [--target App | --pid N]
+  key    --key return [--modifiers cmd,shift] [--repeat N] [--target App | --pid N]
+         # chords and sequences too: --key cmd+s · --key "Tab Tab Return" · Page_Up
+         # type/key with no --target/--pid refuse when the front app is a terminal
+         # ("terminal": true) — keys there run as commands; --allow-terminal overrides
   set-text --pid N --text "…"          # AX write into the FOCUSED field (reliable for Electron)
   focused  --app "…" | --pid N         # confirm a text cursor exists BEFORE typing
 
@@ -249,9 +307,43 @@ RUN A PLAN (linear steps, host-executed — the model only returns on divergence
       # Success → endgame only ({"completed":true,steps,retries_total} + one capture);
       # divergence → {"completed":false,"failed_step":N,reason} + capture of where.
       # Forensics per step: route "run.step" in calls.ndjson. Full schema: script header.
+      # --file plan.json / --steps - read the steps from a file / stdin. --pace MS = the pause
+      # after a step with no expect (default 300); a step's own "pause":MS wins.
+      # --no-capture skips the final capture (verify with read-text / eval instead).
+
+BACKGROUND MODE (agent works in one window while you keep working in another)
+  --background on any call, or export FLOATY_MODE=background for the session
+  (--foreground on one call overrides it). Never activates, raises, or moves
+  the real cursor:
+    click / click-mark / click-in-frame  → AXPress on the element under the point
+    type / key  --pid N                  → posted to that process (CGEventPostToPid),
+                                           only into the agent's own window of the app
+    navigate --pid N --url …             → the browser's address bar via AX
+    query-ax … --press | --focus | --set-value "…" | --scroll-to | --action AXShowMenu
+  Refused with needs_foreground: move, drag, scroll, right/double/modified
+  clicks, raise, focus, enable-cdp. Windows on another Space are unreachable —
+  keep the agent's window on a visible display. Every reply carries
+  "interference": {human_app, focus_kept[, stolen_by_target, restored]}.
+
+INPUT SCRIPTS (web pages — trusted CDP events, host-timed, background-safe)
+  input [--via-extension | --port N] [--match …] --steps '[…]' | --file F | --steps -
+      step = {"t":ms | "wait":ms, <action>, "hold":ms}; actions:
+        click / down / up / move : "selector" | [x,y] viewport px | {"screen":[x,y]}
+        drag:{"from":…,"to":…}  wheel:<target>,"dy":N  key:"Enter" (+"modifiers")
+        keydown / keyup  type:"chars as key events"  text:"insertText"
+      hold = release later without blocking → chords, legato. Reply: late_ms.
+      Shorthand: input --click SEL | --key K | --text "…" | --move SEL
+      Targets: selector | ref_N (from som/query-dom/find) | [x,y] | {"screen":[x,y]}.
+      fill:SEL|REF + "value" replaces a field's value. Off-view targets scroll in.
+      Dialogs: --on-dialog dismiss (default) | accept | stop  → reply lists `dialogs`
+  dialog [--accept [--text …] | --dismiss | --reload]   # read / answer a JS dialog
 
 SEE THE SCREEN (cheapest first — climb only when the previous rung failed)
+  find "words" --pid N | --via-extension [--match …]   # best matches + refs (start here)
+  query-ax  --ref ax_N --press|--focus|--set-value "…"  # act on the element a ref names
   query-ax  --app "…" | --pid N [--role button] [--title Save] [--press] [--diff]
+            [--under REF] [--all]                        # one subtree / every named element
+            [--focus | --set-value "…" | --scroll-to | --action AXShowMenu]   # act on 1st match
   som     --app "…" | --pid N | [--port 9222] [--diff]   # numbered marks: TABLE by default (one
                                                  # element per line); annotated PNG only when marks
                                                  # are poorly named or you pass --image.
@@ -279,6 +371,9 @@ BROWSER / ELECTRON (CDP; app must be launched with a debug port)
 
 HOST
   host --ghost on|off      # make FloatyTerm click-through BEFORE driving another app
+  host --policy            # the user's approval policy (agent-policy.json): which verbs ask,
+                           # which hosts navigate may open. denied_by_user / denied_by_policy
+                           # in a reply = the user said no: don't retry, tell them.
   raise --app "…" | --pid N
 
 NETWORK RECORDING — every request, exportable
@@ -315,79 +410,217 @@ TERMINAL TUNNEL — read another session's command output
       no OSC 133 integration you get the transcript tail + a hint instead.
 
 Full flag detail lives in the comment header of this script (open: command -v floaty).
-HELP
-exit 0;; esac
+'''
 
-args=("$@")
-# Expand the array in a way that's safe when it's EMPTY under `set -u` on the
-# bash 3.2 that ships with macOS (a bare "${args[@]}" trips "unbound variable"
-# for argument-less commands like `list-windows`).
-routed=$(python3 - "$cmd" ${args[@]+"${args[@]}"} <<'PY'
-import sys, json, os
-cmd = sys.argv[1]; toks = sys.argv[2:]
-obj = {}; i = 0
+# ── Implementation ─────────────────────────────────────────────────────────
+# One Python process per call: parse the flags, POST over a raw loopback
+# socket, print the reply. It used to be bash + three python3 starts + one or
+# two curl starts — ~150 ms of process startup on every call, which was most
+# of a background key press. http.client is avoided on purpose: its import
+# alone (email parser) costs ~14 ms.
+
+import json
+import os
+import socket
+import sys
+
+HOST, PORT = "127.0.0.1", 7777
+UNREACHABLE = '{"error":"FloatyTerm not reachable on 127.0.0.1:7777 (is the app running?)"}'
+
 # numeric flags → numbers; --modifiers → array; bare flags (--human/--ocr) → true.
-NUM = {"x","y","port","clicks","dx","dy","duration","from_x","from_y","to_x","to_y","window_id","id","max","pid","since","timeout","max_lines","every","poll","max_body"}
-# `net` takes a bare sub-action ("net start", "net export") before its flags.
-# The relay sees it as {"action": "..."} — one route, several verbs, because
-# they share one piece of state.
-if cmd == "net":
-    if toks and not toks[0].startswith("--"): obj["action"] = toks[0]
-    # The app has no working directory of its own, so `net export` would have
-    # nowhere sensible to put the file. Send ours.
-    obj["cwd"] = os.getcwd()
+NUM = {"x", "y", "port", "clicks", "dx", "dy", "duration", "from_x", "from_y", "to_x", "to_y",
+       "window_id", "id", "max", "pid", "since", "timeout", "max_lines", "every", "poll",
+       "max_body", "pace", "hold", "wait", "repeat", "count"}
 
-while i < len(toks):
-    if not toks[i].startswith("--"): i += 1; continue
-    key = toks[i][2:].replace("-", "_")
-    if i + 1 >= len(toks) or toks[i+1].startswith("--"):
-        obj[key] = True; i += 1; continue
-    val = toks[i+1]
-    if key in NUM:
-        obj[key] = float(val) if "." in val else int(val)
-    elif key == "modifiers":
-        obj[key] = [m for m in val.split(",") if m]
-    else:
-        obj[key] = val
-    i += 2
-paths = {"click":"/agent/click","move":"/agent/move","drag":"/agent/drag",
-         "scroll":"/agent/scroll","type":"/agent/type","key":"/agent/key",
-         "capture":"/agent/capture","query-dom":"/agent/query-dom",
-         "eval":"/agent/eval","navigate":"/agent/navigate",
-         "tabs":"/agent/tabs","focus":"/agent/focus",
-         "list-windows":"/agent/list-windows","mark":"/agent/mark",
-         "click-in-frame":"/agent/click-in-frame","move-in-frame":"/agent/move-in-frame",
-         "som":"/agent/som","click-mark":"/agent/click-mark",
-         "query-ax":"/agent/query-ax","focused":"/agent/focused",
-         "set-text":"/agent/set-text","enable-cdp":"/agent/enable-cdp",
-         "host":"/agent/host","raise":"/agent/raise",
-         "read-text":"/agent/read-text",
-         "sessions":"/agent/sessions","peek":"/agent/peek",
-         "run":"/agent/run","net":"/agent/net"}
-print(json.dumps({"path": paths.get(cmd, "/agent/"+cmd), "body": obj}))
-PY
-)
+PATHS = {"click": "/agent/click", "move": "/agent/move", "drag": "/agent/drag",
+         "scroll": "/agent/scroll", "type": "/agent/type", "key": "/agent/key",
+         "capture": "/agent/capture", "query-dom": "/agent/query-dom",
+         "eval": "/agent/eval", "navigate": "/agent/navigate",
+         "tabs": "/agent/tabs", "focus": "/agent/focus",
+         "list-windows": "/agent/list-windows", "mark": "/agent/mark",
+         "click-in-frame": "/agent/click-in-frame", "move-in-frame": "/agent/move-in-frame",
+         "som": "/agent/som", "click-mark": "/agent/click-mark",
+         "query-ax": "/agent/query-ax", "focused": "/agent/focused",
+         "set-text": "/agent/set-text", "enable-cdp": "/agent/enable-cdp",
+         "host": "/agent/host", "raise": "/agent/raise",
+         "read-text": "/agent/read-text",
+         "sessions": "/agent/sessions", "peek": "/agent/peek",
+         "run": "/agent/run", "net": "/agent/net", "input": "/agent/input",
+         "find": "/agent/find", "dialog": "/agent/dialog"}
 
-path=$(printf '%s' "$routed" | python3 -c "import sys,json;print(json.load(sys.stdin)['path'])")
-body=$(printf '%s' "$routed" | python3 -c "import sys,json;print(json.dumps(json.load(sys.stdin)['body']))")
 
-# Capture the body and the HTTP status separately. The relay returns 400 with a
-# JSON {"error":…} body for legitimate failures (element not found, port closed,
-# missing permission) — those are real answers, not transport faults, so we
-# print the body regardless of status. ONLY a connect-level failure (curl can't
-# reach the relay → status 000) means "the app isn't running". Conflating the
-# two — as a blanket `curl --fail-with-body || echo "not reachable"` would —
-# made every clean error look like a dead app.
-resp=$(curl -s -w '\n%{http_code}' -H "Content-Type: application/json" \
-       -X POST "http://$HOST$path" -d "$body" 2>/dev/null) || true
-code="${resp##*$'\n'}"
-payload="${resp%$'\n'*}"
+def die(msg, code=1, stream=sys.stdout):
+    stream.write(json.dumps({"error": msg}) + "\n")
+    sys.exit(code)
 
-if [ "$code" = "000" ] || [ -z "$code" ]; then
-    echo '{"error":"FloatyTerm not reachable on 127.0.0.1:7777 (is the app running?)"}' >&2
-    exit 1
-fi
-printf '%s\n' "$payload"
-# Non-2xx → non-zero exit so scripting callers can branch, but the JSON error
-# has already been printed to stdout for the agent to read.
-[ "${code#2}" != "$code" ] || exit 1
+
+def parse(cmd, toks):
+    obj = {}
+    # `net` takes a bare sub-action ("net start", "net export") before its flags.
+    # The relay sees it as {"action": "..."} — one route, several verbs, because
+    # they share one piece of state.
+    # `find "add to cart"`: a bare first word is the query.
+    if cmd == "find" and toks and not toks[0].startswith("--"):
+        obj["query"] = toks[0]
+    if cmd == "net":
+        if toks and not toks[0].startswith("--"):
+            obj["action"] = toks[0]
+        # The app has no working directory of its own, so `net export` would have
+        # nowhere sensible to put the file. Send ours.
+        obj["cwd"] = os.getcwd()
+    i = 0
+    while i < len(toks):
+        if not toks[i].startswith("--"):
+            i += 1
+            continue
+        key = toks[i][2:].replace("-", "_")
+        if i + 1 >= len(toks) or toks[i + 1].startswith("--"):
+            obj[key] = True
+            i += 1
+            continue
+        val = toks[i + 1]
+        if key in NUM:
+            try:
+                obj[key] = float(val) if "." in val else int(val)
+            except ValueError:
+                die(f"--{toks[i][2:]} expects a number, got {val!r}")
+        elif key == "modifiers":
+            obj[key] = [m for m in val.split(",") if m]
+        else:
+            obj[key] = val
+        i += 2
+    # Interaction mode. --foreground / --background on the call win; else
+    # FLOATY_MODE (set once for a whole agent session); else the host default
+    # (foreground). Background = AX press + pid-posted keys, never activate.
+    env_mode = os.environ.get("FLOATY_MODE", "").lower()
+    if obj.pop("foreground", None) is True:
+        obj["mode"] = "foreground"
+    elif obj.pop("background", None) is True:
+        obj["mode"] = "background"
+    elif "mode" not in obj and env_mode in ("background", "bg", "foreground", "fg"):
+        obj["mode"] = "background" if env_mode in ("background", "bg") else "foreground"
+    return obj
+
+
+def load_steps(obj):
+    """run / input: --file PATH or --steps - (stdin) → the steps JSON string."""
+    src = None
+    if isinstance(obj.get("file"), str):
+        src = obj.pop("file")
+    elif obj.get("steps") == "-":
+        src = "-"
+    if src is None:
+        return
+    try:
+        text = sys.stdin.read() if src == "-" else open(os.path.expanduser(src), encoding="utf-8").read()
+    except OSError as e:
+        die(f"could not read steps from {src}: {e.strerror}")
+    obj["steps"] = text
+
+
+def input_shorthand(obj):
+    """`input --click SEL` / --key K / --text T / --move SEL / --type T → one step."""
+    if "steps" in obj:
+        return
+    step = {}
+    for k in ("click", "move", "key", "text", "type", "down", "up", "wheel", "fill"):
+        if k in obj:
+            v = obj.pop(k)
+            step[k] = v
+    for k in ("button", "count", "hold", "dx", "dy", "modifiers", "value", "repeat"):
+        if k in obj and step:
+            step[k] = obj.pop(k)
+    if step:
+        obj["steps"] = [step]
+
+
+def post(path, body, timeout=None):
+    """→ (status, payload). status 0 = could not connect."""
+    data = json.dumps(body, separators=(",", ":")).encode()
+    head = (f"POST {path} HTTP/1.1\r\nHost: {HOST}:{PORT}\r\nContent-Type: application/json\r\n"
+            f"Content-Length: {len(data)}\r\nConnection: close\r\n\r\n").encode()
+    try:
+        s = socket.create_connection((HOST, PORT), timeout=3)
+    except OSError:
+        return 0, ""
+    try:
+        s.settimeout(timeout)
+        s.sendall(head + data)
+        chunks = []
+        while True:
+            c = s.recv(1 << 16)
+            if not c:
+                break
+            chunks.append(c)
+    except OSError:
+        return 0, ""
+    finally:
+        s.close()
+    raw = b"".join(chunks)
+    sep = raw.find(b"\r\n\r\n")
+    if sep < 0:
+        return 0, ""
+    try:
+        status = int(raw[:sep].split(b" ", 2)[1])
+    except (IndexError, ValueError):
+        return 0, ""
+    return status, raw[sep + 4:].decode("utf-8", "replace")
+
+
+def main():
+    argv = sys.argv[1:]
+    if not argv:
+        sys.stderr.write("usage: floaty <command> [--flag value ...]   (try: floaty help)\n")
+        sys.exit(2)
+    cmd, toks = argv[0], argv[1:]
+    if cmd in ("help", "--help", "-h"):
+        sys.stdout.write(HELP)
+        return
+    obj = parse(cmd, toks)
+    if cmd in ("run", "input"):
+        load_steps(obj)
+    if cmd == "input":
+        input_shorthand(obj)
+    path = PATHS.get(cmd, "/agent/" + cmd)
+
+    # Background mode needs a host that knows it. An older FloatyTerm ignores
+    # "mode" and would run the call in the FOREGROUND — activating the target and
+    # moving the real cursor — while reporting success. Ask first; stop if not.
+    # (`input` is CDP-only and never touches the real pointer, so it skips this.)
+    if obj.get("mode") == "background" and cmd != "input":
+        status, probe = post("/agent/host", {"probe": "background"}, timeout=3)
+        if status == 0:
+            sys.stderr.write(UNREACHABLE + "\n")
+            sys.exit(1)
+        if '"background_mode":true' not in probe:
+            print(json.dumps({"error": "the running FloatyTerm has no background mode (older build) — it would run "
+                              "this call in the FOREGROUND. Relaunch FloatyTerm, or drop --background / FLOATY_MODE.",
+                              "needs_relaunch": True}))
+            sys.exit(1)
+
+    status, payload = post(path, obj)
+    # The relay returns 400 with a JSON {"error":…} body for legitimate failures
+    # (element not found, port closed, missing permission) — real answers, not
+    # transport faults, so print the body regardless of status. ONLY a
+    # connect-level failure means "the app isn't running".
+    if status == 0:
+        sys.stderr.write(UNREACHABLE + "\n")
+        sys.exit(1)
+    if status == 404:
+        print(json.dumps({"error": f"the running FloatyTerm has no `{cmd}` command (older build, or a typo). "
+                          "If the command is in `floaty help`, relaunch FloatyTerm.", "needs_relaunch": True}))
+        sys.exit(1)
+    sys.stdout.write(payload if payload.endswith("\n") else payload + "\n")
+    # Non-2xx → non-zero exit so scripting callers can branch, but the JSON error
+    # has already been printed to stdout for the agent to read.
+    if not 200 <= status < 300:
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        sys.exit(130)
+    except BrokenPipeError:
+        sys.exit(0)
