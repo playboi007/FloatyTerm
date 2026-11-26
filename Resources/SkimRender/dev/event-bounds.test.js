@@ -82,3 +82,19 @@ test('empty and unidentified snapshots are ignored, not retained under a null ke
   assert.equal(state.plans.size, 0);
   assert.equal(state.turnDiffs.size, 0);
 });
+
+test('finished tools and blocks are evicted oldest-first; running and open ones stay', () => {
+  const state = A.createState();
+  feed(state, at('tool.start', { id: 'running', name: 'Bash' }), at('content.delta', { id: 'open', messageId: 'm', kind: 'text', text: 'x' }));
+  for (let i = 0; i < 1000; i++) {
+    feed(state,
+      at('tool.start', { id: 't' + i, name: 'Bash', input: { command: 'x' } }), at('tool.result', { id: 't' + i, output: 'ok' }),
+      at('content.snapshot', { id: 'b' + i, messageId: 'm' + i, kind: 'text', text: 'hi', final: true }));
+  }
+  assert.ok(state.tools.size <= 200);
+  assert.ok(state.blocks.size <= 400);
+  assert.ok(state.tools.has('running') && state.tools.get('running').state === 'running');
+  assert.ok(state.blocks.has('open') && !state.blocks.get('open').final);
+  assert.ok(state.tools.has('t999') && state.blocks.has('b999'));   // the newest survive
+  assert.ok(!state.tools.has('t0') && !state.blocks.has('b0'));
+});

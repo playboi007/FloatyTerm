@@ -282,7 +282,7 @@ final class BrowserController: NSObject, TabContent, WKNavigationDelegate, WKUID
             DevtoolsLog.shared.drop(url)
             try? FileManager.default.removeItem(at: url)
         }
-        webView.stopLoading()
+        webView.closePage()   // its WebContent process ends now, not when WebKit lets it go
     }
 
     // MARK: - Devtools awareness (console / errors / network → log file)

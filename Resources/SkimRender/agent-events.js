@@ -4,6 +4,9 @@
   const VERSION = 1;
   // Memory is the reducer's job, not the producer's: cap what a single conversation may retain.
   const TOOL_OUTPUT_MAX = 256 * 1024;   // the streamed-delta window, applied to final results too
+  // Finished blocks and tools are already drawn; the reducer keeps only the newest of them.
+  const BLOCKS_MAX = 400;
+  const TOOLS_MAX = 200;
   const DETAIL_STRING_MAX = 16000;
   const DETAIL_ITEMS_MAX = 100;
   const DETAIL_DEPTH_MAX = 8;
@@ -61,6 +64,19 @@
     for (const [id, surface] of state.surfaces) if (surface.placement !== 'session' && surface.threadId === threadId && surface.turnId === turnId) state.surfaces.delete(id);
     for (const [id, media] of state.media) if (media.threadId === threadId && media.turnId === turnId) state.media.delete(id);
   }
+  /** Drops the oldest settled entries once a map outgrows its cap; running tools and open blocks always stay. */
+  function evict(map, max, settled) {
+    if (map.size <= max) return;
+    const target = Math.floor(max * 0.8);   // trim below the cap so the scan is not repeated every event
+    for (const [id, item] of map) {
+      if (map.size <= target) break;
+      if (settled(item)) map.delete(id);
+    }
+  }
+  /** Drops the oldest entries of an insertion-ordered map once it outgrows `max`; normalizers keep state for in-flight items only. */
+  function trimOldest(map, max) {
+    for (const key of map.keys()) { if (map.size <= max) break; map.delete(key); }
+  }
   function reduce(state, e) {
     if (e.v !== VERSION) throw new Error('Unsupported agent event version: ' + e.v);
     switch (e.type) {
@@ -109,6 +125,7 @@
         if (e.type === 'content.start' && e.text && !block.text) block.text = e.text;
         if (e.type === 'content.end' || e.final) block.final = true;
         if (!block.final) state.busy = true;
+        evict(state.blocks, BLOCKS_MAX, item => item.final && item !== block);
         break;
       }
       case 'tool.start': case 'tool.input': case 'tool.result': {
@@ -122,6 +139,7 @@
         }
         else state.busy = true;
         state.tools.set(e.id, tool);
+        evict(state.tools, TOOLS_MAX, item => item.state !== 'running' && item !== tool);
         break;
       }
       case 'approval.request': state.approvals.set(e.request.id, e.request); break;
@@ -146,7 +164,8 @@
     }
     return state;
   }
-  const api = { VERSION, envelope, createNormalizer, createState, reduce, turnKey, register: (name, factory) => factories.set(name, factory) };
+  const api = {
+    trimOldest, VERSION, envelope, createNormalizer, createState, reduce, turnKey, register: (name, factory) => factories.set(name, factory) };
   root.AgentEvents = api;
   if (typeof module !== 'undefined' && module.exports) module.exports = api;
 })(typeof globalThis !== 'undefined' ? globalThis : this);

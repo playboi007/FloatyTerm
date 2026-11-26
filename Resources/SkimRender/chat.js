@@ -61,7 +61,7 @@
       normalizer: root.AgentEvents.createNormalizer(agent), eventState: root.AgentEvents.createState(),
       model: '', mode: 'default', sessionId: null, cost: 0,
       busy: false, turn: null, turns: [],
-      eventChildren: new Map(), surfaceViews: new Map(), mediaViews: new Map(), surfaceRoot: null, protocolStatus: null, buffering: false, connectionClosed: false,
+      eventChildren: new Map(), surfaceViews: new Map(), mediaViews: new Map(), blobs: [], surfaceRoot: null, protocolStatus: null, buffering: false, connectionClosed: false,
       turnViews: new Map(),   // thread + turn identity → owning DOM turn (including completed turns)
       rows: new Map(),        // tool_use id → row
       texts: new Map(),       // `${messageId}:${index}` → text item
@@ -368,11 +368,23 @@
 
   function paintText(item, streaming) {
     cancelAnimationFrame(item.raf);
-    item.raf = 0;
+    clearTimeout(item.wait);
+    item.raf = 0; item.wait = 0;
+    item.paintedAt = performance.now();
     root.SkimRender.render(item.el, item.text, { streaming, interactive: true, reveal: item.reveal && motionOn(), onAction: a => { if (a.type === 'reply') sendUser(a.text); } });
     stick();
   }
-  const schedulePaint = item => { if (!item.raf) item.raf = requestAnimationFrame(() => paintText(item, true)); };
+  /**
+   * Each paint parses the whole reply again, so a long reply paints less often: every frame up to
+   * 4000 characters, then at most every 100–250 ms. Fewer full parses, far less garbage while it streams.
+   */
+  const paintGap = length => length < 4000 ? 0 : Math.min(250, length / 80);
+  const schedulePaint = item => {
+    if (item.raf || item.wait) return;
+    const due = paintGap(item.text.length) - (performance.now() - (item.paintedAt || 0));
+    if (due <= 0) item.raf = requestAnimationFrame(() => paintText(item, true));
+    else item.wait = setTimeout(() => { item.wait = 0; item.raf = requestAnimationFrame(() => paintText(item, true)); }, due);
+  };
 
   // ── thinking: a folded line while Claude thinks, the summary on request ──
 
@@ -2789,6 +2801,7 @@
     if (subShown() && subShown().root === conv) closeSub();
     for (const t of conv.turns) if (t.run) clearInterval(t.run.timer);
     for (const th of conv.thinks.values()) clearInterval(th.timer);
+    for (const url of conv.blobs) URL.revokeObjectURL(url);
     const keep = { model: conv.model, modelChoice: conv.modelChoice, mode: conv.mode, effort: conv.effort, thinkingOn: conv.thinkingOn, thinkingSource: conv.thinkingSource };
     const fresh = newConv(conv.id, conv.label);
     for (const k of Object.keys(fresh)) if (k !== 'log') conv[k] = fresh[k];
@@ -2827,6 +2840,7 @@
     S.replaying = true;   // no motion, no usage or git requests, while hundreds of blocks go in
     S.lastChain = e.omitted ? e.before || undefined : null;   // where a rewind of the first prompt drawn would resume
     try { drawHistory(e.messages); } finally { S.replaying = false; }
+    foldOldTurns();
     evT = 0;
     closeRun();
     for (const th of S.thinks.values()) endThink(th);
@@ -3324,12 +3338,26 @@
 
   /** The tab's attention dot covers every conversation, main and side. */
   let lastState = '';
+  /**
+   * The host may stop an idle conversation's agent process to save memory, and resume the session later.
+   * Not while anything lives in that process: a turn, a question, a background task or subagent,
+   * a ! command, a side question, or scheduled work (a loop, a wakeup, a monitor).
+   */
+  function canRest(c) {
+    return !c.busy && !c.cards.size && !c.keepAwake && !(c.bgTasks || []).length
+      && ![...c.agentTasks.values()].some(t => t.t0 && !t.t1)
+      && ![...shellRuns.values()].some(r => r.conv === c)
+      && ![btw, ask].some(x => x && x.pending && x.conv === c);
+  }
+
   function postState() {
     const all = [...convs.values()];
     const busy = all.some(c => c.busy), waiting = all.some(c => c.cards.size > 0);
-    if (lastState === busy + '/' + waiting) return;
-    lastState = busy + '/' + waiting;
-    post({ type: 'state', channel: 'main', busy, waiting });
+    const rest = all.filter(canRest).map(c => c.id);
+    const key = busy + '/' + waiting + '/' + rest.join(',');
+    if (lastState === key) return;
+    lastState = key;
+    post({ type: 'state', channel: 'main', busy, waiting, rest });
   }
 
   const priority0 = opts => supports('priority') ? opts.priority : null;
@@ -4270,7 +4298,8 @@
     row.t1 = clock();
     for (const [cardId, card] of S.cards) if (card.req.toolUseID === row.id) resolveCard(cardId, e.isError ? 'denied' : 'allowed');
     if (row.waitStart) { row.waitMs += row.t1 - row.waitStart; row.waitStart = 0; }
-    row.output = output;
+    // The detail draws 4000 characters; only an agent row re-renders its whole result (as markdown).
+    row.output = isAgentTool(row.name) ? output : output.slice(0, 4000);
     if (row.stdinForm) row.stdinForm.querySelectorAll('input,button').forEach(el => el.disabled = true);
     row.streamEl = null;
     row.metaEl.textContent = isAgentTool(row.name) && !e.isError ? agentMeta(row) || 'done' : metaOf(row, output, e.isError);
@@ -4281,6 +4310,72 @@
     setRowState(row, e.isError ? 'error' : 'done');
     if (row.run) paintRun(row.run);
     if (subShown() && subShown().toolId === row.id) paintSubPanel();
+  }
+
+  // ── old turns fold into one line, so a long conversation keeps few live nodes and objects ──
+  // A folded turn keeps its prompt and footer. Its body is stored as compressed HTML and the
+  // page's row, text and thinking records for it are dropped. Opening it draws the stored
+  // body back as a static copy: rows still open and close, but nothing else in it is live.
+  const TURNS_LIVE = 12;   // the newest turns are never folded
+  const pack = async html => {
+    if (!root.CompressionStream) return html;
+    try { return new Uint8Array(await new Response(new Blob([html]).stream().pipeThrough(new CompressionStream('gzip'))).arrayBuffer()); }
+    catch (_) { return html; }
+  };
+  const unpack = async packed => typeof packed === 'string' ? packed
+    : new Response(new Blob([packed]).stream().pipeThrough(new DecompressionStream('gzip'))).text();
+
+  /** What a fold takes out of a turn: everything but the prompt and the footer (the tool tray lives outside the body). */
+  const foldParts = t => [...t.el.children].filter(el => !el.matches('.ck-user, .ck-foot, .ck-folded'));
+
+  /** Only a settled turn with nothing live in it: no running tool, open question, subagent or surface. */
+  function foldable(conv, t) {
+    if (t === conv.turn || t.folded || !t.el.isConnected) return false;
+    return !t.el.querySelector('.is-agent, .ck-card, .ck-surface, .ck-media, .ck-think.is-live, .ck-row[data-state="running"], .ck-row[data-state="preparing"], .ck-text:empty');
+  }
+
+  function foldTurn(conv, t) {
+    const parts = foldParts(t), html = parts.map(el => el.outerHTML).join('');
+    const inside = el => !!el && parts.some(part => part.contains(el));
+    for (const [id, row] of conv.rows) if (inside(row.line)) conv.rows.delete(id);
+    for (const [key, item] of conv.texts) if (inside(item.el)) conv.texts.delete(key);
+    for (const [key, item] of conv.thinks) if (inside(item.el)) conv.thinks.delete(key);
+    for (const map of [conv.msgTexts, conv.msgThinks]) {
+      for (const [id, list] of map) { const rest = list.filter(item => !inside(item.el)); if (rest.length) map.set(id, rest); else map.delete(id); }
+    }
+    for (const [key, view] of conv.turnViews) if (view === t) conv.turnViews.delete(key);
+    if (conv.lastTool && inside(conv.lastTool.line)) conv.lastTool = null;
+    const rows = parts.reduce((n, el) => n + el.querySelectorAll('.ck-row').length, 0);
+    t.folded = true; t.run = null; t.packed = html;
+    t.packing = pack(html).then(packed => { t.packed = packed; });
+    const open = h('button', { class: 'ck-folded', type: 'button', title: 'Draw this part of the conversation again' },
+      'Earlier reply' + (rows ? ' · ' + plural(rows, 'tool call') : '') + ' · show');
+    open.onclick = async () => {
+      open.disabled = true;
+      try {
+        await t.packing;
+        const stored = document.createElement('template');
+        stored.innerHTML = await unpack(t.packed);
+        open.replaceWith(stored.content);
+        t.packed = null; t.packing = null;
+        t.el.onclick = ev => {   // the drawn-again parts lost their handlers; one delegate opens and closes them
+          const pill = ev.target.closest && ev.target.closest('.ck-tray-pill');
+          if (pill) { const panel = pill.nextElementSibling; if (panel) { panel.hidden = !panel.hidden; pill.setAttribute('aria-expanded', String(!panel.hidden)); } return; }
+          const line = ev.target.closest && ev.target.closest('.ck-row');
+          const detail = line && line.nextElementSibling;
+          if (detail && detail.classList.contains('ck-detail') && detail.childNodes.length) detail.hidden = !detail.hidden;
+        };
+      } catch (_) { open.disabled = false; open.textContent = 'Could not draw this again'; }
+    };
+    for (const el of parts) el.remove();
+    t.el.insertBefore(open, t.footer && t.footer.parentNode === t.el ? t.footer : null);
+  }
+
+  function foldOldTurns(conv = S) {
+    for (let i = 0; i < conv.turns.length - TURNS_LIVE; i++) {
+      const t = conv.turns[i];
+      if (foldable(conv, t)) foldTurn(conv, t);
+    }
   }
 
   const END_LABEL = { error_max_turns: 'Stopped at the turn limit', error_max_budget_usd: 'Stopped at the budget limit',
@@ -4315,6 +4410,7 @@
     } else if (e.status === 'error' && e.message) notice('error', e.message);
     paintMeta(); stick();
     if (!S.replaying) { requestUsage(!usagePanel.hidden); requestGit(); }
+    foldOldTurns();
     // A stop or an error is yours to look at first: held messages keep waiting.
     if (e.status === 'success') tickHeld('turn');
   }
@@ -4448,6 +4544,19 @@
     S.importView = card; turn().body.append(card); stick();
   }
 
+  /**
+   * A base64 data: URL as a blob: URL. The page would otherwise hold a screenshot's base64 several
+   * times over (the string, the img attribute, its parsed URL); a blob holds the bytes once.
+   */
+  function blobURL(dataURL) {
+    const bin = atob(dataURL.slice(dataURL.indexOf(',') + 1));
+    const bytes = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+    const url = URL.createObjectURL(new Blob([bytes], { type: dataURL.slice(5, dataURL.indexOf(';')) }));
+    S.blobs.push(url);
+    return url;
+  }
+
   function paintMedia(e) {
     let view = S.mediaViews.get(e.id);
     if (!view) {
@@ -4456,6 +4565,7 @@
       (row ? row.detail : turn().body).append(view);
     }
     const valid = typeof e.url === 'string' && /^data:image\/(png|jpeg|gif|webp);base64,[A-Za-z0-9+/=]+$/.test(e.url);
+    if (valid) e.url = blobURL(e.url);   // the store and the buttons keep this event: let them hold a short URL
     const children = [valid ? h('img', { src: e.url, alt: e.caption || 'Image result', loading: 'lazy' }) : h('p', { class: 'ck-surface-muted', text: e.error || 'Image preview unavailable' }), h('figcaption', { text: e.caption || e.path || 'Image' })];
     if (e.path) children.push(h('button', { type: 'button', text: 'Reveal image', onclick: () => post({ type: 'reveal', path: e.path }) }));
     if (valid) children.push(h('button', { type: 'button', text: 'View image', onclick: () => showEventImage({ url: e.url, name: e.path || e.caption || 'Image' }) }));
@@ -4672,7 +4782,18 @@
   }
 
 
+  /**
+   * Draws one event, then lets go of its raw message: the stores and click handlers keep the event,
+   * and a raw message can carry megabytes (a screenshot's base64, a whole tool result).
+   */
   function receiveOne(e) {
+    try { drawEvent(e); } finally { if (e.raw !== undefined) e.raw = undefined; }
+  }
+
+  /** Tools that leave work running inside the agent's process after the turn: it must not be stopped to save memory. */
+  const KEEPS_AWAKE = /^(CronCreate|ScheduleWakeup|Monitor|RemoteTrigger)$/;
+
+  function drawEvent(e) {
     if (e.parentId) {
       if (typeof SUB_EVENTS !== 'undefined' && SUB_EVENTS.has(e.type)) { toSub(e); return; }
       if (typeof SUB_EVENTS === 'undefined' && !e.type.startsWith('approval.')) { routeEventChild(e); return; }
@@ -4705,6 +4826,7 @@
       case 'content.start': case 'content.delta': case 'content.snapshot': case 'content.end':
         settleRetry(); S.busy = true; paintContent(e); updateStatus(); break;
       case 'tool.start': case 'tool.input': case 'tool.result':
+        if (e.type === 'tool.start' && KEEPS_AWAKE.test(e.name || '')) (S.root || S).keepAwake = true;
         settleRetry(); S.busy = e.type === 'tool.result' ? S.busy : true; paintTool(e); trackTasks(e); updateStatus();
         if (e.type === 'tool.result') tickHeld('tool');
         break;
@@ -4787,7 +4909,8 @@
   const AgentChat = {
     boot(cfg) {
       agent = cfg.agent || 'claude';
-      features = { ...(agent === 'claude' ? CLAUDE_FEATURES : CODEX_FEATURES) };
+      if (root.CSS && CSS.supports('overflow-anchor', 'auto')) document.documentElement.classList.add('ck-cv');
+      features = { ...(AGENT_FEATURES[agent] || CLAUDE_FEATURES) };
       if (cfg.voice) features.voice = true;   // the host can listen (the mic button)
       main.normalizer = root.AgentEvents.createNormalizer(agent);
       main.eventState = root.AgentEvents.createState();
@@ -4797,6 +4920,21 @@
       paintMeta(); paintView(); paintRefs();
       statusText.textContent = 'Ready';
       if (cfg.intro) notice('info', cfg.intro);
+      // Built again after the host unloaded it (hidden a long time): the history follows, by session.
+      if (cfg.restore) {
+        main.sessionId = cfg.restore.sessionId || null;
+        if (cfg.restore.draft) { input.value = cfg.restore.draft; grow(); }
+        notice('info', 'This tab was unloaded while hidden, to save memory. The conversation is drawn again from its history; pictures and opened rows are not.');
+      }
+    },
+    /**
+     * Whether the host may unload this page to save memory, and what to keep: null while anything
+     * here would be lost (a side chat, held messages, an open panel, attachments) or the agent works.
+     */
+    hibernation() {
+      if (convs.size > 1 || !canRest(main) || main.held.length || main.refs.length || main.images.length) return null;
+      if (btw || ask || subShown() || lightbox || P.kind || V.state !== 'idle') return null;
+      return { draft: input ? input.value : '' };
     },
     /** `channel`: the conversation the events belong to ('main' when omitted). */
     receive(batch, channel) {

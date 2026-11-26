@@ -20,8 +20,10 @@
     const notice = (kind, message) => message ? [{ type: 'notice', kind, message: String(message) }] : [];
     const identity = (messageId, index, kind, redacted = false) => ({ id: messageId + ':' + index, messageId, kind, redacted });
     const unknown = raw => [{ type: 'unknown', name: raw.msg?.event?.type || raw.msg?.subtype || raw.msg?.type || raw.type }];
+    // Matching a full message to its streamed blocks only reaches back a few messages.
+    const MESSAGES_KEPT = 50, BLOCKS_KEPT = 400, CONFIRMATIONS_KEPT = 200;
     function remember(block) {
-      if (!messageBlocks.has(block.messageId)) messageBlocks.set(block.messageId, []);
+      if (!messageBlocks.has(block.messageId)) { messageBlocks.set(block.messageId, []); A.trimOldest(messageBlocks, MESSAGES_KEPT); }
       messageBlocks.get(block.messageId).push(block);
       return block;
     }
@@ -47,13 +49,13 @@
           const b = e.content_block || {};
           const key = current + ':' + e.index;
           if (b.type === 'tool_use') {
-            blocks.set(key, { toolId: b.id, input: '' });
+            blocks.set(key, { toolId: b.id, input: '' }); A.trimOldest(blocks, BLOCKS_KEPT);
             return [{ type: 'tool.start', id: b.id, name: b.name }];
           }
           const kind = b.type === 'text' ? 'text' : ['thinking', 'redacted_thinking'].includes(b.type) ? 'thinking' : null;
           if (!kind) return unknown(raw);
           const id = remember(identity(current, e.index, kind, b.type === 'redacted_thinking'));
-          blocks.set(key, id);
+          blocks.set(key, id); A.trimOldest(blocks, BLOCKS_KEPT);
           return [{ type: 'content.start', ...id, text: b.text || b.thinking || '' }];
         }
         const block = blocks.get(current + ':' + e.index);
@@ -71,6 +73,7 @@
         }
         if (e.type === 'content_block_stop' && block) {
           if (block.toolId) {
+            blocks.delete(current + ':' + e.index);   // the whole input string has been read; the reducer holds the parsed call
             if (!block.input) return [];
             try { return [{ type: 'tool.input', id: block.toolId, input: JSON.parse(block.input) }]; }
             catch { return unknown(raw); }
@@ -101,7 +104,7 @@
               blocks.set(block.id, block);
             }
             block.confirmed = true; block.snapshot = text;
-            if (confirmation) confirmations.set(confirmation, block);
+            if (confirmation) { confirmations.set(confirmation, block); A.trimOldest(confirmations, CONFIRMATIONS_KEPT); }
             out.push({ type: 'content.snapshot', id: block.id, messageId, kind, redacted: block.redacted, text, final: true });
           } else if (c.type === 'tool_use') {
             out.push({ type: 'tool.start', id: c.id, name: c.name, parentId: msg.parent_tool_use_id || null, input: c.input });

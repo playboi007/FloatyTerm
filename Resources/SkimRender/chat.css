@@ -23,6 +23,9 @@ body.ck { min-height: 100vh; display: flex; flex-direction: column; }
 .ck-turn { display: flex; flex-direction: column; gap: 10px; }
 .ck-body { display: flex; flex-direction: column; gap: 10px; }
 .ck-text.sk-doc { padding: 0; max-width: none; gap: 10px; }
+/* A reply's blocks out of view skip layout and paint: no layers for their tables and code (each
+   scrollable box is a GPU layer). Only where WebKit anchors the scroll, so estimates never jump the view. */
+.ck-cv .ck-text > .sk-block { content-visibility: auto; contain-intrinsic-size: auto 80px; }
 
 /* the user's message: a quiet accent rail, not a chat bubble — the reply is what gets read */
 .ck-user { display: flex; }
@@ -874,7 +877,7 @@ body.tools-inline .ck-tray, body.tools-inline .ck-run-mark { display: none; }
 .ck-ahc-btn.is-main { border-color: var(--accent); color: var(--text); }
 .ck-ahc-btn.is-stop:hover, .ck-sub-act.is-stop:hover { border-color: var(--bad); }
 .ck-ahc-btn kbd, .ck-sub-act kbd { font: 10px var(--mono); color: var(--faint); }
-.ck-ahc.is-in .ck-ahc-body > * { animation: ck-av-rise .28s cubic-bezier(.2, .8, .2, 1) both; }
+.ck-ahc.is-in .ck-ahc-body > * { animation: ck-av-rise .28s cubic-bezier(.2, .8, .2, 1) backwards; }
 .ck-ahc.is-in .ck-ahc-body > :nth-child(2) { animation-delay: .04s; } .ck-ahc.is-in .ck-ahc-body > :nth-child(3) { animation-delay: .08s; }
 .ck-ahc.is-in .ck-ahc-body > :nth-child(4) { animation-delay: .12s; } .ck-ahc.is-in .ck-ahc-body > :nth-child(5) { animation-delay: .16s; }
 @keyframes ck-av-rise { from { opacity: 0; transform: translateY(4px); } }
@@ -928,3 +931,7 @@ body.tools-inline .ck-tray, body.tools-inline .ck-run-mark { display: none; }
 .ck-av-btn.is-quiet .ck-av-ring { animation-play-state: paused; opacity: .45; }
 .ck-ahc-now.is-quiet .k, .ck-ahc-now.is-quiet .v { color: var(--warn); }
 @media (prefers-reduced-motion: reduce) { .ck-card.is-flash { animation: none; } }
+
+.ck-folded { align-self: flex-start; font: 11px var(--mono); color: var(--faint); background: none; border: 1px solid var(--line-2); border-radius: 999px; padding: 3px 10px; cursor: pointer; }
+.ck-folded:hover { color: var(--muted); }
+.ck-folded:disabled { cursor: default; }

@@ -94,6 +94,20 @@ final class Settings {
         set { d.set(newValue, forKey: "rendererAppearance"); notify() }
     }
 
+    /// Minutes a Claude or Codex tab stays hidden and idle before its agent process stops to save
+    /// memory (it resumes the session when the tab is shown or used); 0 never stops it.
+    var agentRestMinutes: Int {
+        get { d.object(forKey: "agentRestMinutes") == nil ? 15 : d.integer(forKey: "agentRestMinutes") }
+        set { d.set(newValue, forKey: "agentRestMinutes"); notify() }
+    }
+
+    /// Minutes a Claude or Codex tab stays hidden and idle before its page is unloaded too (drawn again
+    /// from the session's history when shown); 0 never unloads it.
+    var agentUnloadMinutes: Int {
+        get { d.object(forKey: "agentUnloadMinutes") == nil ? 60 : d.integer(forKey: "agentUnloadMinutes") }
+        set { d.set(newValue, forKey: "agentUnloadMinutes"); notify() }
+    }
+
     var urlBarCollapsed: Bool {
         get { d.bool(forKey: "urlBarCollapsed") }
         set { d.set(newValue, forKey: "urlBarCollapsed"); notify() }

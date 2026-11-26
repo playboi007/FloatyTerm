@@ -181,6 +181,18 @@ func sdk(_ msg: [String: Any]) -> String { j(["type": "sdk", "msg": msg]) }
                     return c }
                 m["message"] = msg
             }
+            // REALTURNS=1: a user's own prompt opens a turn, as sending it does in the app (otherwise a whole transcript lands in one turn).
+            if env["REALTURNS"] == "1", t == "user", let msg = m["message"] as? [String: Any] {
+                var prompt: String? = msg["content"] as? String
+                if prompt == nil, let blocks = msg["content"] as? [[String: Any]], !blocks.contains(where: { $0["type"] as? String == "tool_result" }) {
+                    prompt = blocks.compactMap { $0["text"] as? String }.joined(separator: "\n")
+                }
+                if let p = prompt, !p.isEmpty, let data = try? JSONSerialization.data(withJSONObject: [String(p.prefix(2000))]), let arr = String(data: data, encoding: .utf8) {
+                    if !batch.isEmpty { await h.receive(batch); batch = [] }
+                    await h.js("AgentChat.showUser(\(arr)[0]); 0")
+                    n += 1; continue
+                }
+            }
             batch.append(sdk(m)); n += 1
             if t == "assistant", let msg = o["message"] as? [String: Any], (msg["stop_reason"] as? String) == "end_turn" {
                 batch.append(sdk(["type": "result", "subtype": "success", "num_turns": 1, "duration_ms": 1000]))
@@ -188,6 +200,7 @@ func sdk(_ msg: [String: Any]) -> String { j(["type": "sdk", "msg": msg]) }
             if batch.count >= 20 { await h.receive(batch); batch = [] }
         }
         if !batch.isEmpty { await h.receive(batch) }
+        if env["REALTURNS"] == "1", let c = try? await h.web.evaluateJavaScript("[document.querySelectorAll('.ck-turn').length, document.querySelectorAll('.ck-folded').length, document.querySelectorAll('.ck-row').length, (() => { const sels = ['.is-agent', '.ck-card', '.ck-surface', '.ck-media', '.ck-think.is-live', '.ck-row[data-state=running]', '.ck-row[data-state=preparing]', '.ck-text:empty']; const t = [...document.querySelectorAll('.ck-turn')].slice(0, -12).filter(el => !el.querySelector('.ck-folded')); const c = {}; for (const el of t) for (const q of sels) if (el.querySelector(q)) c[q] = (c[q] || 0) + 1; return 'unfolded old ' + t.length + ' ' + JSON.stringify(c); })()].join(' ')") { print("turns / folded / live rows:", c) }
         await h.report("1b live \(n) msgs")
     }
     // 2. Streamed replies, ~30 characters per delta, one delivery per frame.
